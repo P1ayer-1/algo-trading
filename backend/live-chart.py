@@ -14,7 +14,11 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-SDK_SRC = Path(__file__).resolve().parent / "blofin-sdk-python" / "src"
+# This file lives in backend/, one level below the repo root.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FRONTEND_DIR = REPO_ROOT / "frontend"
+
+SDK_SRC = REPO_ROOT / "blofin-sdk-python" / "src"
 if str(SDK_SRC) not in sys.path:
     sys.path.insert(0, str(SDK_SRC))
 
@@ -26,8 +30,8 @@ try:
 except ModuleNotFoundError as exc:
     missing = exc.name or "a dependency"
     raise SystemExit(
-        f"Missing Python package '{missing}'. Use the crypto env or install dependencies with: "
-        "python -m pip install -r blofin-sdk-python\\requirements.txt"
+        f"Missing Python package '{missing}'. From the repo root, install dependencies with: "
+        "python -m pip install -r requirements.txt -r blofin-sdk-python\\requirements.txt"
     ) from exc
 
 print = partial(builtins.print, flush=True)
@@ -46,7 +50,7 @@ def load_local_env(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-load_local_env(Path(__file__).resolve().parent / ".env")
+load_local_env(REPO_ROOT / ".env")
 
 
 def env_bool(name: str, default: str = "false") -> bool:
@@ -465,8 +469,7 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
-    project_dir = Path(__file__).resolve().parent
-    chart_file = project_dir / "live-chart.html"
+    chart_file = FRONTEND_DIR / "live-chart.html"
     if not chart_file.exists():
         raise SystemExit(f"Missing chart file: {chart_file}")
 
@@ -475,7 +478,7 @@ async def main() -> None:
     state.tick_size = await asyncio.to_thread(fetch_tick_size, market_api)
     await state.set_candles(await asyncio.to_thread(fetch_rest_candles, market_api))
 
-    http_server = start_http_server(project_dir, args.host, args.http_port)
+    http_server = start_http_server(FRONTEND_DIR, args.host, args.http_port)
     ws_server = await websockets.serve(lambda client: ws_handler(client, state), args.host, args.ws_port)
 
     print(f"Live chart: http://{args.host}:{args.http_port}/live-chart.html")
