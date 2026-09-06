@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import builtins
 import json
+import logging
 import os
 import sys
 import threading
@@ -19,7 +20,7 @@ if str(SDK_SRC) not in sys.path:
 
 try:
     import websockets
-    from blofin.client import DemoClient
+    from blofin.client import Client, DemoClient
     from blofin.rest_market import MarketAPI
     from blofin.websocket_client import BlofinWsPublicClient
 except ModuleNotFoundError as exc:
@@ -30,6 +31,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 print = partial(builtins.print, flush=True)
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
 
 
 def load_local_env(path: Path = Path(".env")) -> None:
@@ -46,6 +48,12 @@ def load_local_env(path: Path = Path(".env")) -> None:
 
 load_local_env(Path(__file__).resolve().parent / ".env")
 
+
+def env_bool(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 INST_ID = os.getenv("BLOFIN_INST_ID", "BTC-USDT")
 BAR = os.getenv("BLOFIN_SUPPORT_BAR", "15m")
 CANDLE_LIMIT = os.getenv("BLOFIN_SUPPORT_CANDLE_LIMIT", "500")
@@ -56,9 +64,11 @@ RESISTANCE_DEFAULT_ABOVE = Decimal(os.getenv("BLOFIN_RESISTANCE_DEFAULT_ABOVE", 
 SUPPORT_LEVEL_COUNT = int(os.getenv("BLOFIN_SUPPORT_LEVEL_COUNT", "8"))
 RESISTANCE_LEVEL_COUNT = int(os.getenv("BLOFIN_RESISTANCE_LEVEL_COUNT", str(SUPPORT_LEVEL_COUNT)))
 RECALCULATE_SECONDS = int(os.getenv("BLOFIN_LEVEL_RECALCULATE_SECONDS", "30"))
+TICKER_POLL_SECONDS = float(os.getenv("BLOFIN_TICKER_POLL_SECONDS", "1"))
 HTTP_PORT = int(os.getenv("BLOFIN_CHART_HTTP_PORT", "8765"))
 WS_PORT = int(os.getenv("BLOFIN_CHART_WS_PORT", "8766"))
 HOST = os.getenv("BLOFIN_CHART_HOST", "127.0.0.1")
+USE_DEMO = env_bool("BLOFIN_USE_DEMO", "false")
 
 
 def decimal_from(value: Any, fallback: str = "0") -> Decimal:
@@ -104,6 +114,18 @@ def candle_to_record(candle: Any) -> Optional[Dict[str, Any]]:
         }
     except Exception:
         return None
+
+
+def ticker_to_price(ticker: Any) -> Optional[Decimal]:
+    if not isinstance(ticker, dict):
+        return None
+
+    for key in ("last", "lastPrice", "markPrice", "price"):
+        price = decimal_from(ticker.get(key))
+        if price > 0:
+            return price
+
+    return None
 
 
 def get_range(current_price: Decimal) -> tuple[Decimal, Decimal]:
@@ -270,6 +292,11 @@ class LiveChartState:
             self.candles = sorted(candles, key=lambda item: item["ts"])
             if self.candles and self.current_price is None:
                 self.current_price = self.candles[-1]["close"]
+            elif self.candles and self.current_price is not None:
+                candle = self.candles[-1]
+                candle["close"] = self.current_price
+                candle["high"] = max(candle["high"], self.current_price)
+                candle["low"] = min(candle["low"], self.current_price)
             self._recalculate_locked()
 
     async def upsert_candle(self, candle: Dict[str, Any]) -> None:
@@ -280,11 +307,16 @@ class LiveChartState:
             self.current_price = candle["close"]
             self._recalculate_locked()
 
-    async def set_price(self, price: Decimal) -> None:
+    async def set_price(self, price: Decimal) -> bool:
         async with self.lock:
+            changed = self.current_price != price
             self.current_price = price
             if self.candles:
-                self.candles[-1]["close"] = price
+                candle = self.candles[-1]
+                candle["close"] = price
+                candle["high"] = max(candle["high"], price)
+                candle["low"] = min(candle["low"], price)
+            return changed
 
     async def recalculate(self) -> None:
         async with self.lock:
@@ -336,6 +368,13 @@ def fetch_tick_size(market_api: MarketAPI) -> Decimal:
     return decimal_from(instrument.get("tickSize"), "0.1")
 
 
+def fetch_rest_ticker_price(market_api: MarketAPI) -> Optional[Decimal]:
+    response = market_api.getTickers(instId=INST_ID)
+    data = response.get("data")
+    ticker = data[0] if isinstance(data, list) and data else {}
+    return ticker_to_price(ticker)
+
+
 async def ws_handler(client: Any, state: LiveChartState) -> None:
     state.clients.add(client)
     await client.send(json.dumps(await state.snapshot()))
@@ -353,14 +392,26 @@ async def refresh_candles_loop(state: LiveChartState, market_api: MarketAPI) -> 
         await asyncio.sleep(RECALCULATE_SECONDS)
 
 
+async def poll_ticker_loop(state: LiveChartState, market_api: MarketAPI) -> None:
+    while True:
+        try:
+            price = await asyncio.to_thread(fetch_rest_ticker_price, market_api)
+            if price is not None and await state.set_price(price):
+                await broadcast(state)
+        except Exception as exc:
+            print(f"Ticker poll error: {exc}")
+        await asyncio.sleep(TICKER_POLL_SECONDS)
+
+
 async def blofin_stream_loop(state: LiveChartState) -> None:
     while True:
-        client = BlofinWsPublicClient(isDemo=True)
+        client = BlofinWsPublicClient(isDemo=USE_DEMO)
         try:
             await client.connect()
             await client.subscribeTickers(INST_ID)
             await client.subscribeCandles(INST_ID, BAR)
-            print(f"Connected to BloFin demo public websocket for {INST_ID}.")
+            mode = "demo" if USE_DEMO else "production"
+            print(f"Connected to BloFin {mode} public websocket for {INST_ID}.")
 
             async for message in client.listen():
                 channel = message.get("arg", {}).get("channel")
@@ -369,10 +420,10 @@ async def blofin_stream_loop(state: LiveChartState) -> None:
                     continue
 
                 if channel == "tickers" and isinstance(data, list):
-                    price = decimal_from(data[0].get("last"))
-                    if price > 0:
-                        await state.set_price(price)
-                        await broadcast(state)
+                    price = ticker_to_price(data[0])
+                    if price is not None:
+                        if await state.set_price(price):
+                            await broadcast(state)
 
                 if channel == f"candle{BAR}" and isinstance(data, list):
                     candle = candle_to_record(data[0])
@@ -419,7 +470,7 @@ async def main() -> None:
     if not chart_file.exists():
         raise SystemExit(f"Missing chart file: {chart_file}")
 
-    market_api = MarketAPI(DemoClient())
+    market_api = MarketAPI(DemoClient() if USE_DEMO else Client())
     state = LiveChartState()
     state.tick_size = await asyncio.to_thread(fetch_tick_size, market_api)
     await state.set_candles(await asyncio.to_thread(fetch_rest_candles, market_api))
@@ -434,6 +485,7 @@ async def main() -> None:
     try:
         await asyncio.gather(
             refresh_candles_loop(state, market_api),
+            poll_ticker_loop(state, market_api),
             blofin_stream_loop(state),
         )
     finally:

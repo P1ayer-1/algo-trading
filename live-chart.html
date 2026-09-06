@@ -33,7 +33,7 @@
       display: grid;
       grid-template-columns: minmax(0, 1fr) 320px;
       gap: 16px;
-      min-height: 100vh;
+      height: 100vh;
       padding: 16px;
     }
 
@@ -48,7 +48,7 @@
       display: flex;
       flex-direction: column;
       min-width: 0;
-      min-height: 560px;
+      min-height: 0;
       overflow: hidden;
     }
 
@@ -75,10 +75,10 @@
     }
 
     #chart {
-      display: block;
+      contain: size layout paint;
+      flex: 1 1 0;
+      min-height: 0;
       width: 100%;
-      min-height: 520px;
-      flex: 1;
     }
 
     aside {
@@ -132,13 +132,12 @@
     @media (max-width: 860px) {
       main {
         grid-template-columns: 1fr;
+        height: auto;
+        min-height: 100vh;
       }
 
       .chart-wrap {
-        min-height: 480px;
-      }
-
-      #chart {
+        height: min(70vh, 620px);
         min-height: 440px;
       }
     }
@@ -154,7 +153,7 @@
         </div>
         <div class="status" id="status">connecting</div>
       </header>
-      <canvas id="chart"></canvas>
+      <div id="chart"></div>
     </section>
     <aside>
       <div class="small">Last price</div>
@@ -178,6 +177,7 @@
     </aside>
   </main>
 
+  <script src="node_modules/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
   <script>
     const state = {
       candles: [],
@@ -189,8 +189,7 @@
       updatedAt: null
     };
 
-    const canvas = document.getElementById("chart");
-    const ctx = canvas.getContext("2d");
+    const chartEl = document.getElementById("chart");
     const statusEl = document.getElementById("status");
     const titleEl = document.getElementById("title");
     const subtitleEl = document.getElementById("subtitle");
@@ -198,9 +197,63 @@
     const supportsEl = document.getElementById("supports");
     const resistancesEl = document.getElementById("resistances");
 
-    function cssVar(name) {
-      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-    }
+    const styles = getComputedStyle(document.documentElement);
+    const colors = {
+      bg: styles.getPropertyValue("--panel").trim(),
+      text: styles.getPropertyValue("--text").trim(),
+      muted: styles.getPropertyValue("--muted").trim(),
+      border: styles.getPropertyValue("--border").trim(),
+      support: styles.getPropertyValue("--support").trim(),
+      resistance: styles.getPropertyValue("--resistance").trim(),
+      current: styles.getPropertyValue("--current").trim()
+    };
+
+    const chart = LightweightCharts.createChart(chartEl, {
+      autoSize: true,
+      layout: {
+        background: { color: colors.bg },
+        textColor: colors.muted,
+        attributionLogo: false
+      },
+      grid: {
+        vertLines: { color: colors.border },
+        horzLines: { color: colors.border }
+      },
+      crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal
+      },
+      rightPriceScale: {
+        borderColor: colors.border,
+        scaleMargins: { top: 0.08, bottom: 0.12 }
+      },
+      timeScale: {
+        borderColor: colors.border,
+        timeVisible: true,
+        secondsVisible: false
+      },
+      localization: {
+        priceFormatter: formatPrice
+      }
+    });
+
+    const candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+      upColor: colors.support,
+      downColor: colors.resistance,
+      borderUpColor: colors.support,
+      borderDownColor: colors.resistance,
+      wickUpColor: colors.support,
+      wickDownColor: colors.resistance
+    });
+
+    const priceLines = {
+      supports: [],
+      resistances: [],
+      current: null
+    };
+    let loadedRangeKey = "";
+    let socket = null;
+    let reconnectTimer = null;
+    let shouldReconnect = true;
 
     function formatPrice(value) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
@@ -210,134 +263,81 @@
       });
     }
 
-    function resizeCanvas() {
-      const rect = canvas.getBoundingClientRect();
-      const ratio = window.devicePixelRatio || 1;
-      canvas.width = Math.max(1, Math.floor(rect.width * ratio));
-      canvas.height = Math.max(1, Math.floor(rect.height * ratio));
-      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-      draw();
+    function toChartCandles(candles) {
+      return candles.map((candle) => ({
+        time: Math.floor(candle.ts / 1000),
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close
+      }));
     }
 
-    function priceDomain() {
-      const values = [];
-      for (const candle of state.candles) {
-        values.push(candle.low, candle.high, candle.close);
-      }
-      for (const level of state.supports) values.push(level.level);
-      for (const level of state.resistances) values.push(level.level);
-      if (state.currentPrice) values.push(state.currentPrice);
-      if (!values.length) return [0, 1];
-      let min = Math.min(...values);
-      let max = Math.max(...values);
-      const pad = Math.max((max - min) * 0.08, 1);
-      return [min - pad, max + pad];
+    function toChartCandle(candle) {
+      return {
+        time: Math.floor(candle.ts / 1000),
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close
+      };
     }
 
-    function draw() {
-      const width = canvas.clientWidth;
-      const height = canvas.clientHeight;
-      ctx.clearRect(0, 0, width, height);
-
-      const candles = state.candles;
-      if (!candles.length) {
-        ctx.fillStyle = cssVar("--muted");
-        ctx.fillText("Waiting for candles...", 28, 34);
-        return;
+    function removeLines(lines) {
+      for (const line of lines) {
+        candleSeries.removePriceLine(line);
       }
+    }
 
-      const pad = { left: 72, top: 24, right: 22, bottom: 42 };
-      const plotW = width - pad.left - pad.right;
-      const plotH = height - pad.top - pad.bottom;
-      const [minPrice, maxPrice] = priceDomain();
+    function setPriceLines() {
+      removeLines(priceLines.supports);
+      removeLines(priceLines.resistances);
+      if (priceLines.current) candleSeries.removePriceLine(priceLines.current);
 
-      const xFor = (index) => pad.left + (candles.length === 1 ? plotW / 2 : (index / (candles.length - 1)) * plotW);
-      const yFor = (price) => pad.top + ((maxPrice - price) / (maxPrice - minPrice)) * plotH;
+      priceLines.supports = state.supports.map((level, index) => candleSeries.createPriceLine({
+        price: level.level,
+        color: colors.support,
+        lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `S${index + 1} ${level.touches}x`
+      }));
 
-      ctx.strokeStyle = cssVar("--border");
-      ctx.lineWidth = 1;
-      ctx.strokeRect(pad.left, pad.top, plotW, plotH);
+      priceLines.resistances = state.resistances.map((level, index) => candleSeries.createPriceLine({
+        price: level.level,
+        color: colors.resistance,
+        lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `R${index + 1} ${level.touches}x`
+      }));
 
-      ctx.font = "12px ui-sans-serif, system-ui";
-      ctx.fillStyle = cssVar("--muted");
-      ctx.textAlign = "right";
-      ctx.textBaseline = "middle";
-      for (let i = 0; i <= 5; i++) {
-        const price = maxPrice - ((maxPrice - minPrice) * i / 5);
-        const y = yFor(price);
-        ctx.strokeStyle = cssVar("--border");
-        ctx.beginPath();
-        ctx.moveTo(pad.left, y);
-        ctx.lineTo(width - pad.right, y);
-        ctx.stroke();
-        ctx.fillText(formatPrice(price), pad.left - 8, y);
-      }
-
-      const wickStep = Math.max(1, Math.floor(candles.length / 180));
-      ctx.strokeStyle = cssVar("--muted");
-      ctx.globalAlpha = 0.42;
-      for (let i = 0; i < candles.length; i += wickStep) {
-        const candle = candles[i];
-        const x = xFor(i);
-        ctx.beginPath();
-        ctx.moveTo(x, yFor(candle.high));
-        ctx.lineTo(x, yFor(candle.low));
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-
-      ctx.strokeStyle = cssVar("--price");
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      candles.forEach((candle, index) => {
-        const x = xFor(index);
-        const y = yFor(candle.close);
-        if (index === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
+      priceLines.current = state.currentPrice === null ? null : candleSeries.createPriceLine({
+        price: state.currentPrice,
+        color: colors.current,
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "last"
       });
-      ctx.stroke();
+    }
 
-      function drawLevels(levels, color, prefix, labelSide) {
-        ctx.strokeStyle = color;
-        ctx.fillStyle = color;
-        ctx.lineWidth = 1.5;
-        ctx.font = "12px ui-sans-serif, system-ui";
-        levels.forEach((level, index) => {
-          const y = yFor(level.level);
-          ctx.beginPath();
-          ctx.moveTo(pad.left, y);
-          ctx.lineTo(width - pad.right, y);
-          ctx.stroke();
-          ctx.textAlign = labelSide === "left" ? "left" : "right";
-          const x = labelSide === "left" ? pad.left + 8 : width - pad.right - 8;
-          ctx.fillText(`${prefix}${index + 1} ${formatPrice(level.level)} (${level.touches}x)`, x, y - 8);
-        });
+    function renderChart() {
+      if (!state.candles.length) return;
+
+      const first = state.candles[0];
+      const last = state.candles[state.candles.length - 1];
+      const rangeKey = `${state.candles.length}:${first.ts}:${last.ts}`;
+
+      if (rangeKey !== loadedRangeKey) {
+        candleSeries.setData(toChartCandles(state.candles));
+        if (!loadedRangeKey) chart.timeScale().fitContent();
+        loadedRangeKey = rangeKey;
+      } else {
+        candleSeries.update(toChartCandle(last));
       }
 
-      drawLevels(state.supports, cssVar("--support"), "S", "left");
-      drawLevels(state.resistances, cssVar("--resistance"), "R", "right");
-
-      if (state.currentPrice) {
-        const y = yFor(state.currentPrice);
-        ctx.save();
-        ctx.strokeStyle = cssVar("--current");
-        ctx.setLineDash([7, 5]);
-        ctx.beginPath();
-        ctx.moveTo(pad.left, y);
-        ctx.lineTo(width - pad.right, y);
-        ctx.stroke();
-        ctx.restore();
-        ctx.fillStyle = cssVar("--current");
-        ctx.textAlign = "right";
-        ctx.fillText(`last ${formatPrice(state.currentPrice)}`, width - pad.right - 8, y + 14);
-      }
-
-      ctx.fillStyle = cssVar("--muted");
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
-      const first = new Date(candles[0].ts).toLocaleString();
-      const last = new Date(candles[candles.length - 1].ts).toLocaleString();
-      ctx.fillText(`${first} to ${last}`, pad.left + plotW / 2, height - 26);
+      setPriceLines();
     }
 
     function renderTable(target, levels) {
@@ -369,11 +369,20 @@
       lastPriceEl.textContent = formatPrice(state.currentPrice);
       renderTable(supportsEl, state.supports);
       renderTable(resistancesEl, state.resistances);
-      draw();
+      renderChart();
     }
 
     function connect() {
-      const socket = new WebSocket(`ws://${location.hostname || "127.0.0.1"}:8766`);
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      socket = new WebSocket(`ws://${location.hostname || "127.0.0.1"}:8766`);
       statusEl.textContent = "connecting";
 
       socket.addEventListener("open", () => {
@@ -385,8 +394,10 @@
       });
 
       socket.addEventListener("close", () => {
+        socket = null;
+        if (!shouldReconnect) return;
         statusEl.textContent = "reconnecting";
-        setTimeout(connect, 1500);
+        reconnectTimer = setTimeout(connect, 1500);
       });
 
       socket.addEventListener("error", () => {
@@ -394,8 +405,12 @@
       });
     }
 
-    window.addEventListener("resize", resizeCanvas);
-    resizeCanvas();
+    window.addEventListener("beforeunload", () => {
+      shouldReconnect = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (socket) socket.close();
+    });
+
     connect();
   </script>
 </body>
