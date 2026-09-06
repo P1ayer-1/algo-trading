@@ -26,15 +26,27 @@ foundation the actual trading logic still needs to be built on top of.
 ```
 .
 ├── backend/
-│   └── live-chart.py       # fetches BloFin data, computes S/R levels, serves the chart
+│   ├── live-chart.py        # entrypoint: run this. Wires the pieces below together.
+│   ├── config.py             # all settings: env vars, paths, ports
+│   ├── market_data.py        # fetch/parse BloFin candles & prices
+│   ├── support_resistance.py # swing-detection + clustering (the only "analysis" so far)
+│   ├── state.py               # shared LiveChartState + websocket broadcast
+│   └── server.py              # HTTP/websocket servers + background refresh loops
 ├── frontend/
-│   ├── live-chart.html     # the chart page (lightweight-charts)
+│   ├── live-chart.html     # thin page shell
+│   ├── styles.css          # all page styling
+│   ├── app.js              # chart rendering + websocket client logic
 │   ├── package.json        # npm dep: lightweight-charts
 │   └── node_modules/       # installed by `npm install` in frontend/ (gitignored)
 ├── blofin-sdk-python/      # vendored BloFin API SDK (its own git repo/history)
 ├── .env                    # BloFin API credentials (gitignored, never commit this)
 └── .gitignore
 ```
+
+`backend/live-chart.py` is intentionally thin — it just parses args and calls
+into the other modules. If you're reading this codebase for the first time,
+read the backend files in the order listed above (config → market_data →
+support_resistance → state → server → live-chart.py).
 
 ## Setup
 

@@ -1,0 +1,136 @@
+:root {
+  color-scheme: dark;
+  --bg: #101418;
+  --panel: #171d22;
+  --text: #eef3f6;
+  --muted: #9ba8b2;
+  --border: #2b3640;
+  --price: #6bb8ff;
+  --support: #49c178;
+  --resistance: #ff6b75;
+  --current: #f2d36b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 16px;
+  height: 100vh;
+  padding: 16px;
+}
+
+.chart-wrap,
+aside {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.chart-wrap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.meta,
+.status,
+.small {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+#chart {
+  contain: size layout paint;
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
+}
+
+aside {
+  padding: 14px;
+  overflow: auto;
+}
+
+.price {
+  font-size: 28px;
+  font-variant-numeric: tabular-nums;
+  margin: 4px 0 14px;
+}
+
+h2 {
+  margin: 18px 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+td,
+th {
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+  white-space: nowrap;
+}
+
+td:first-child,
+th:first-child {
+  text-align: left;
+}
+
+.support {
+  color: var(--support);
+}
+
+.resistance {
+  color: var(--resistance);
+}
+
+@media (max-width: 860px) {
+  main {
+    grid-template-columns: 1fr;
+    height: auto;
+    min-height: 100vh;
+  }
+
+  .chart-wrap {
+    height: min(70vh, 620px);
+    min-height: 440px;
+  }
+}
