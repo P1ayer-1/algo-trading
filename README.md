@@ -66,10 +66,11 @@ first. Recording is therefore step one, not step four.
 │   ├── analysis/              # offline tooling (see analysis/README.md)
 │   │   ├── bars_import.py     # free Binance bar/OI/funding history -> dataset
 │   │   ├── check_features.py  # do the features predict anything?
+│   │   ├── train_model.py     # LightGBM + shuffled-label control + paired test
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (203 tests)
+│   └── tests/                 # pytest suite (219 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── features-*.csv         #   labelled features — regenerable
 │   └── raw/                   #   raw events — IRREPLACEABLE
@@ -104,10 +105,13 @@ full path, or activate the env first with
 1. Python deps (from the repo root):
    ```
    python -m pip install -r blofin-sdk-python\requirements.txt
-   python -m pip install numpy          # for backend\analysis
+   python -m pip install numpy                  # for backend\analysis
+   python -m pip install lightgbm scipy         # for backend\analysis\train_model.py
    ```
-   `pyarrow` and `duckdb` are optional — only needed for
-   `backend\analysis\compact.py`, and not until the data gets large.
+   `lightgbm` and `scipy` are only needed to train a model; everything else in
+   `backend\analysis` runs on numpy alone. `pyarrow` and `duckdb` are optional
+   too — only for `backend\analysis\compact.py`, and not until the data gets
+   large.
 2. Frontend deps:
    ```
    cd frontend
@@ -206,7 +210,7 @@ cd backend
 python -m pytest
 ```
 
-203 tests covering the order book's gap handling, the OFI recursion, the
+219 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, and the evaluation statistics. They need
@@ -238,12 +242,32 @@ Next, in order:
    fix that — more model complexity cannot create information that isn't
    there. If it says `NOT TRADEABLE`, the problem is execution cost, not the
    model.
-7. **Prediction model** — LightGBM on the recorded features, validated on a
-   time-ordered split (never a random one — shuffling time-series data leaks
-   the future into training and produces a beautiful, worthless backtest).
-   Only worth starting once step 6 says the information is there.
-8. **Regime detection** — replace the current percentile-based `vol_regime`
-   placeholder with a fitted model.
+7. ~~**Prediction model**~~ — `backend\analysis\train_model.py`. LightGBM on
+   a three-way purged time split, a shuffled-label control, and a paired
+   bootstrap against both the control and the linear baseline.
+
+   **Run, and the answer was no.** On 365 days of bar features, at every
+   horizon tried:
+
+   | horizon | LightGBM top decile | vs shuffled control | vs linear baseline |
+   |---|---|---|---|
+   | 300s | +0.89 bps | +0.37 `[-0.20, +0.88]` | −0.19 `[-0.65, +0.30]` |
+   | 900s | +1.35 bps | +0.60 `[-0.98, +2.58]` | +0.27 `[-0.95, +1.68]` |
+   | 1800s | +1.81 bps | +2.23 `[-1.15, +5.72]` | +0.20 `[-2.46, +3.24]` |
+
+   Every paired interval includes zero. The non-linear model is not separable
+   from the same pipeline trained on shuffled labels, and it does not beat the
+   logistic regression. LightGBM does rank *direction* slightly better (test
+   AUC 0.533 vs 0.528 at 300s) without ranking *returns* better, which says it
+   finds direction on small moves — the ones costs eat first.
+
+   The constraint is the feature set, not the model class. Adding capacity to
+   a model that already cannot separate itself from noise is the one move
+   guaranteed not to help.
+8. **Better features, then regime detection** — the honest next step. The bar
+   feature set is bars, open interest, positioning and carry; it has no
+   cross-asset, no order-flow at the trading horizon, and no event data. Also
+   replace the percentile-based `vol_regime` placeholder with a fitted model.
 9. **Execution engine** — adaptive limit orders, wired to the risk engine's
    `check_order()`. This is where the existing kill switch finally guards
    something real. Demo account only.

@@ -9,3 +9,7 @@ node_modules/
 # 250ms sample interval) and are machine-specific training data, not source.
 data/
 *.csv
+
+# Trained models. Regenerable from data/ with analysis/train_model.py, and the
+# metadata.json alongside each records exactly how (features, params, seed).
+models/

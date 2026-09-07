@@ -297,6 +297,63 @@ wrong dataset.
 
 ---
 
+## train_model.py — LightGBM, and whether it beats nothing
+
+```
+python backend\analysis\train_model.py --data-dir data\bars\BTCUSDT-... --horizon 900
+```
+
+Roadmap step 7. `check_features.py` fits a logistic regression, which is the
+right baseline and the wrong ceiling — it cannot represent an interaction, and
+these features are plausibly conditional on one another. This fits LightGBM on
+the same matrix and asks whether the non-linearity is actually there.
+
+Requires `lightgbm` and `scipy`; everything else here runs on numpy alone.
+
+### Four things it does that a naive `lgb.train()` does not
+
+**A three-way split, purged twice.** Train / validation / test, with a
+horizon-sized gap either side of validation. Early stopping *reads* the
+validation block, so validation is not out-of-sample in any useful sense. Only
+the final block is untouched, and only its numbers are reported.
+
+**The test set is decimated to non-overlapping rows.** At a 900s horizon
+sampled every 300s, three consecutive rows share most of their forward window.
+20,960 test rows are really 6,987 observations, and a mean over the full set
+implies three times the confidence the data supports.
+
+**A shuffled-label control, run five times.** The identical pipeline retrained
+on shuffled labels is the noise floor of this procedure on this data. It is run
+five times rather than once because one control is one draw from a
+distribution: on this repo's own data, four control seeds gave +0.34, +0.32,
+−0.15 and +0.93 bps, and in an earlier single-control run the control *beat*
+the model. A single control had made the same model look like a result.
+
+**A paired bootstrap.** The verdict rests on
+`top_decile(model) − top_decile(control)` resampled on the *same* rows. Both
+are scored on one test set, so most of each interval is the same shared
+uncertainty — which fortnight the test block landed on, which few large moves
+fell in the top decile. Pairing cancels it. Comparing one model's point
+estimate against the other's interval answers a harsher question and would
+reject a real difference whenever the test set is small, which is exactly when
+it matters.
+
+### Reading the verdict
+
+| Verdict | Meaning |
+|---|---|
+| `NOT DISTINGUISHABLE FROM ZERO` | The top-decile interval includes zero. No edge to cost, let alone trade. |
+| `NOT SEPARABLE FROM SHUFFLED LABELS` | There is a number, but the same pipeline produces numbers that size from data with no signal in it. |
+| `REAL BUT NOT TRADEABLE` | Clears zero and clears the control, but not the cheapest round trip. Cheaper execution or a longer horizon. |
+| `PROMISING` | Clears all three. Confirm on a different date range, then paper-trade. Do not size it from the backtest. |
+
+The seed spread printed under the table is worth as much as the verdict: a
+model whose top decile swings from +1.06 to +1.66 across seeds is reporting
+seed noise in its third digit, and any decision that depends on that digit is
+not supported.
+
+---
+
 ## replay.py — rebuild features from the raw archive
 
 ```
