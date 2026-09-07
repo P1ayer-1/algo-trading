@@ -12,15 +12,32 @@ import json
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import websockets
 from blofin.rest_market import MarketAPI
 from blofin.websocket_client import BlofinWsPublicClient
 
-from config import BAR, FRONTEND_DIR, INST_ID, RECALCULATE_SECONDS, TICKER_POLL_SECONDS, USE_DEMO
+from config import (
+    BAR,
+    BOOK_DEPTH,
+    DATA_DIR,
+    FEATURE_SAMPLE_INTERVAL_MS,
+    FRONTEND_DIR,
+    INST_ID,
+    LABEL_HORIZONS,
+    LABEL_THRESHOLD_BPS,
+    RECALCULATE_SECONDS,
+    RECORD_FEATURES,
+    RECORD_RAW,
+    TAPE_WINDOW_SECONDS,
+    TICKER_POLL_SECONDS,
+    USE_DEMO,
+)
 from market_data import candle_to_record, fetch_rest_candles, fetch_rest_ticker_price, ticker_to_price
 from state import LiveChartState, broadcast
+from trading.ingest import MicrostructureFeed
+from trading.recorder import LabelConfig
 
 
 async def ws_handler(client: Any, state: LiveChartState) -> None:
@@ -97,6 +114,47 @@ async def blofin_stream_loop(state: LiveChartState) -> None:
                 pass
 
 
+def build_microstructure_feed() -> MicrostructureFeed:
+    """Construct the order book / trade / feature feed from config."""
+    return MicrostructureFeed(
+        INST_ID,
+        use_demo=USE_DEMO,
+        book_depth=BOOK_DEPTH,
+        data_dir=DATA_DIR,
+        record=RECORD_FEATURES,
+        record_raw=RECORD_RAW,
+        sample_interval_ms=FEATURE_SAMPLE_INTERVAL_MS,
+        tape_window_seconds=TAPE_WINDOW_SECONDS,
+        label_config=LabelConfig(
+            horizons_seconds=LABEL_HORIZONS,
+            threshold_bps=LABEL_THRESHOLD_BPS,
+        ),
+    )
+
+
+async def publish_features_loop(
+    state: LiveChartState,
+    feed: MicrostructureFeed,
+    interval_seconds: float = 0.25,
+) -> None:
+    """Push the latest features to browsers at a fixed, modest cadence.
+
+    The feature engine recomputes on every book and trade event — often 50+
+    times a second. Broadcasting each one would saturate the websocket and the
+    browser for no visual benefit, so we sample `feed.latest` on a timer
+    instead. The engine keeps full resolution internally; only the *display*
+    is downsampled.
+    """
+    while True:
+        try:
+            snapshot = feed.latest
+            await state.set_features(snapshot.to_dict(), feed.status())
+            await broadcast(state)
+        except Exception as exc:
+            print(f"Feature publish error: {exc}")
+        await asyncio.sleep(interval_seconds)
+
+
 def start_http_server(directory: Path, host: str, port: int) -> ThreadingHTTPServer:
     """Serve the frontend/ folder as static files (the chart HTML/JS/CSS and
     its node_modules dependencies) on a background thread."""
@@ -114,23 +172,52 @@ def start_http_server(directory: Path, host: str, port: int) -> ThreadingHTTPSer
     return server
 
 
-async def run_servers(state: LiveChartState, market_api: MarketAPI, host: str, http_port: int, ws_port: int):
+async def run_servers(
+    state: LiveChartState,
+    market_api: MarketAPI,
+    host: str,
+    http_port: int,
+    ws_port: int,
+    feed: Optional[MicrostructureFeed] = None,
+):
     """Start the HTTP + websocket servers and run all background loops until
-    cancelled/interrupted. Returns nothing; runs forever (or until Ctrl+C)."""
+    cancelled/interrupted. Returns nothing; runs forever (or until Ctrl+C).
+
+    `feed` is optional so the chart still runs standalone if the
+    microstructure stack is disabled or fails to construct.
+    """
     http_server = start_http_server(FRONTEND_DIR, host, http_port)
     ws_server = await websockets.serve(lambda client: ws_handler(client, state), host, ws_port)
 
     print(f"Live chart: http://{host}:{http_port}/live-chart.html")
     print(f"Data websocket: ws://{host}:{ws_port}")
+
+    tasks = [
+        refresh_candles_loop(state, market_api),
+        poll_ticker_loop(state, market_api),
+        blofin_stream_loop(state),
+    ]
+    if feed is not None:
+        tasks.append(feed.run())
+        tasks.append(publish_features_loop(state, feed))
+        if RECORD_FEATURES:
+            print(f"Recording labelled features to: {DATA_DIR}")
+        else:
+            print("Feature recording is OFF (BLOFIN_RECORD_FEATURES=false).")
+        if RECORD_RAW:
+            print(f"Archiving raw events to:        {DATA_DIR / 'raw'}")
+        else:
+            print("Raw archiving is OFF (BLOFIN_RECORD_RAW=false) — future "
+                  "features cannot be backfilled.")
+
     print("Press Ctrl+C to stop.")
 
     try:
-        await asyncio.gather(
-            refresh_candles_loop(state, market_api),
-            poll_ticker_loop(state, market_api),
-            blofin_stream_loop(state),
-        )
+        await asyncio.gather(*tasks)
     finally:
+        if feed is not None:
+            # Flush any buffered CSV rows before the process exits.
+            feed.close()
         ws_server.close()
         await ws_server.wait_closed()
         http_server.shutdown()

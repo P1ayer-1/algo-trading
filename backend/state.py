@@ -71,6 +71,13 @@ class LiveChartState:
     clients: Set[Any] = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    # Latest microstructure features + feed health, published by the trading
+    # stack. Plain JSON-ready dicts so the browser can render them directly.
+    # None until the microstructure feed produces its first valid snapshot,
+    # which lets the UI distinguish "not running" from "running, all zeros".
+    features: Optional[Dict[str, Any]] = None
+    feed_status: Optional[Dict[str, Any]] = None
+
     async def snapshot(self) -> Dict[str, Any]:
         async with self.lock:
             return {
@@ -81,8 +88,17 @@ class LiveChartState:
                 "candles": [public_candle(candle) for candle in self.candles],
                 "supports": [public_level(level) for level in self.supports[:SUPPORT_LEVEL_COUNT]],
                 "resistances": [public_level(level) for level in self.resistances[:RESISTANCE_LEVEL_COUNT]],
+                "features": self.features,
+                "feedStatus": self.feed_status,
                 "updatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
+
+    async def set_features(
+        self, features: Dict[str, Any], feed_status: Dict[str, Any]
+    ) -> None:
+        async with self.lock:
+            self.features = features
+            self.feed_status = feed_status
 
     async def set_candles(self, candles: List[Dict[str, Any]]) -> None:
         async with self.lock:

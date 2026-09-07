@@ -21,14 +21,14 @@ import logging
 from functools import partial
 
 import config  # noqa: F401  (import first: sets up sys.path for the SDK, loads .env)
-from config import HOST, HTTP_PORT, USE_DEMO, WS_PORT
+from config import HOST, HTTP_PORT, MICRO_ENABLED, USE_DEMO, WS_PORT
 
 try:
     from blofin.client import Client, DemoClient
     from blofin.rest_market import MarketAPI
 
     from market_data import fetch_rest_candles, fetch_tick_size
-    from server import run_servers
+    from server import build_microstructure_feed, run_servers
     from state import LiveChartState
 except ModuleNotFoundError as exc:
     missing = exc.name or "a dependency"
@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=HOST, help="Local host for HTTP and websocket servers.")
     parser.add_argument("--http-port", type=int, default=HTTP_PORT, help="HTTP chart port.")
     parser.add_argument("--ws-port", type=int, default=WS_PORT, help="Websocket data port.")
+    parser.add_argument(
+        "--no-microstructure",
+        action="store_true",
+        help="Run only the chart, without the order book / feature feed.",
+    )
     return parser.parse_args()
 
 
@@ -58,7 +63,13 @@ async def main() -> None:
     state.tick_size = await asyncio.to_thread(fetch_tick_size, market_api)
     await state.set_candles(await asyncio.to_thread(fetch_rest_candles, market_api))
 
-    await run_servers(state, market_api, args.host, args.http_port, args.ws_port)
+    feed = None
+    if MICRO_ENABLED and not args.no_microstructure:
+        feed = build_microstructure_feed()
+
+    await run_servers(
+        state, market_api, args.host, args.http_port, args.ws_port, feed=feed
+    )
 
 
 if __name__ == "__main__":
