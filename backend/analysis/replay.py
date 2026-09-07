@@ -1,8 +1,8 @@
 """Rebuild a feature file from archived raw events.
 
     python backend/analysis/replay.py --date 2026-09-06
-    python backend/analysis/replay.py --date 2026-09-06 --sample-ms 100 \
-        --horizons 0.5,2,10 --out data/replayed
+    python backend/analysis/replay.py --date 2026-09-06 --sample-ms 1000 \
+        --horizons 300,900,1800 --out data/replayed
 
 This is what makes the raw archive worth keeping. Change a feature, add a new
 one, or relabel at a different horizon, then replay every hour you have ever
@@ -128,10 +128,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--raw-dir", type=Path, default=repo_root / "data" / "raw")
     parser.add_argument("--out", type=Path, default=repo_root / "data" / "replayed")
     parser.add_argument("--date", default=None, help="YYYY-MM-DD; omit for all.")
-    parser.add_argument("--sample-ms", type=int, default=250)
-    parser.add_argument("--horizons", default="1,5,30",
+    parser.add_argument("--sample-ms", type=int, default=1000)
+    parser.add_argument("--horizons", default="300,900,1800",
                         help="Comma-separated forward horizons in seconds.")
-    parser.add_argument("--threshold-bps", type=float, default=3.0)
+    parser.add_argument("--threshold-bps", type=float, default=10.0)
     args = parser.parse_args(argv)
 
     horizons = tuple(float(part) for part in args.horizons.split(",") if part.strip())

@@ -348,3 +348,197 @@ def test_kelly_is_fractional_not_full():
         kelly_fraction=D("0.15"),
     )
     assert result.detail["kellyFraction"] <= D("0.15")
+
+
+# ---------------------------------------------------------------------------
+# Unrealized drawdown
+#
+# The gap these cover: every breaker fed by `on_trade_closed` measures
+# *realized* PnL, so a strategy that holds a loser indefinitely - "the trend is
+# up, we can wait" - never trips one. These assert that an open loss counts.
+# ---------------------------------------------------------------------------
+
+
+def test_unrealized_pnl_signs_are_right_for_both_sides():
+    long_account = AccountState(position_base=D("0.05"), entry_price=D("100000"))
+    assert long_account.unrealized_pnl(D("99000")) == D("-50")
+    assert long_account.unrealized_pnl(D("101000")) == D("50")
+
+    # A short is a negative quantity, so a price rise must be a loss.
+    short_account = AccountState(position_base=D("-0.05"), entry_price=D("100000"))
+    assert short_account.unrealized_pnl(D("101000")) == D("-50")
+    assert short_account.unrealized_pnl(D("99000")) == D("50")
+
+
+def test_flat_account_has_no_unrealized_pnl():
+    assert AccountState().unrealized_pnl(D("100000")) == D("0")
+
+
+def test_holding_a_loser_trips_the_kill_switch_without_ever_closing_it():
+    # The whole point. No call to on_trade_closed anywhere in this test.
+    engine = RiskEngine(RiskLimits(max_unrealized_loss=D("50")))
+    account = AccountState(
+        equity=D("1000"), position_base=D("0.05"), entry_price=D("100000")
+    )
+
+    engine.mark_to_market(account, D("99400"))  # -30, inside the limit
+    assert not engine.kill_switch_active
+    assert account.realized_pnl_today == D("0")
+
+    result = engine.mark_to_market(account, D("98000"))  # -100
+    assert engine.kill_switch_active
+    assert result["unrealizedPnl"] == D("-100")
+    assert any("unrealized loss" in reason for reason in result["breaches"])
+    assert result["actions"][0] == "close_position"
+
+
+def test_daily_loss_limit_counts_realized_and_open_together():
+    engine = RiskEngine(
+        RiskLimits(max_daily_loss=D("100"), max_unrealized_loss=D("1000000"))
+    )
+    account = AccountState(
+        equity=D("1000"),
+        position_base=D("0.05"),
+        entry_price=D("100000"),
+        realized_pnl_today=D("-60"),
+    )
+    # -60 booked, -50 open: neither alone breaches, the sum does.
+    result = engine.mark_to_market(account, D("99000"))
+    assert result["totalPnlToday"] == D("-110")
+    assert engine.kill_switch_active
+
+
+def test_open_position_drifting_toward_liquidation_trips():
+    # entry 100000, 5x, mmr 0.5%, 15bps fee pad:
+    #   P_liq = 100000 * (1 - 1/5) / (1 - 0.005) * 1.0015 = 80522.6
+    # At mark 86000 that is (86000 - 80522.6) / 86000 = 6.37% away, inside the
+    # 8% floor. The loss limits are lifted so only the liquidation guard fires.
+    engine = RiskEngine(
+        RiskLimits(
+            min_open_liquidation_buffer_pct=D("0.08"),
+            max_unrealized_loss=D("1000000"),
+            max_daily_loss=D("1000000"),
+        )
+    )
+    account = AccountState(
+        equity=D("1000"),
+        position_base=D("0.05"),
+        entry_price=D("100000"),
+        leverage=D("5"),
+    )
+    result = engine.mark_to_market(account, D("86000"))
+    assert engine.kill_switch_active
+    assert len(result["breaches"]) == 1
+    assert "liquidation" in result["breaches"][0]
+
+
+def test_mark_to_market_on_a_flat_account_does_nothing():
+    engine = RiskEngine()
+    result = engine.mark_to_market(AccountState(equity=D("1000")), D("100000"))
+    assert not engine.kill_switch_active
+    assert result["breaches"] == []
+    assert result["actions"] == []
+
+
+def test_check_order_refuses_to_add_to_an_open_drawdown():
+    engine = RiskEngine()
+    account = AccountState(
+        equity=D("1000"), position_base=D("0.001"), entry_price=D("200000")
+    )
+    # Marked at 100000 the open position is down 100, past both the 50
+    # unrealized limit and the 100 daily limit, with nothing yet realized.
+    decision = engine.check_order(**_clean_order(account=account))
+    assert not decision.allowed
+    assert any("unrealized loss" in reason for reason in decision.reasons)
+    assert any("mark-to-market" in reason for reason in decision.reasons)
+
+
+def test_status_reports_open_pnl_alongside_realized():
+    engine = RiskEngine()
+    account = AccountState(
+        position_base=D("0.05"),
+        entry_price=D("100000"),
+        leverage=D("5"),
+        realized_pnl_today=D("-20"),
+    )
+    status = engine.status(account, D("99000"))
+    assert status["unrealizedPnl"] == pytest.approx(-50.0)
+    assert status["totalPnlToday"] == pytest.approx(-70.0)
+
+
+# ---------------------------------------------------------------------------
+# reduce_only
+#
+# Without this path the engine deadlocks in the situation it exists for: it
+# trips the switch, says "close_position", then vetoes the closing order.
+# ---------------------------------------------------------------------------
+
+
+def _reduce_order(**overrides):
+    order = dict(
+        account=AccountState(
+            equity=D("1000"), position_base=D("0.01"), entry_price=D("100000")
+        ),
+        side=Side.SHORT,
+        size_base=D("0.01"),
+        price=D("95000"),
+        leverage=D("3"),
+        spread_bps=D("1"),
+        reduce_only=True,
+    )
+    order.update(overrides)
+    return order
+
+
+def test_reduce_only_closes_through_a_tripped_kill_switch():
+    engine = RiskEngine()
+    engine.trip("daily loss limit hit")
+    decision = engine.check_order(**_reduce_order())
+    assert decision.allowed, decision.reasons
+
+
+def test_reduce_only_ignores_the_edge_gate_and_a_blown_out_spread():
+    engine = RiskEngine()
+    decision = engine.check_order(
+        **_reduce_order(spread_bps=D("500"), expected_edge_bps=D("0"))
+    )
+    assert decision.allowed, decision.reasons
+
+
+def test_reduce_only_still_needs_a_connection():
+    engine = RiskEngine()
+    engine.on_disconnect()
+    decision = engine.check_order(**_reduce_order())
+    assert not decision.allowed
+    assert any("not connected" in reason for reason in decision.reasons)
+
+
+def test_reduce_only_rejects_an_order_that_would_add_exposure():
+    engine = RiskEngine()
+    # Long position, and a LONG order claiming to be reduce_only.
+    decision = engine.check_order(**_reduce_order(side=Side.LONG))
+    assert not decision.allowed
+    assert any("reduce_only" in reason for reason in decision.reasons)
+
+
+def test_reduce_only_rejects_a_size_that_would_flip_the_position():
+    engine = RiskEngine()
+    decision = engine.check_order(**_reduce_order(size_base=D("0.02")))
+    assert not decision.allowed
+    assert any("would flip it" in reason for reason in decision.reasons)
+
+
+def test_reduce_only_rejects_when_there_is_nothing_to_close():
+    engine = RiskEngine()
+    decision = engine.check_order(
+        **_reduce_order(account=AccountState(equity=D("1000")))
+    )
+    assert not decision.allowed
+    assert any("no open position" in reason for reason in decision.reasons)
+
+
+def test_reduce_only_partial_close_is_allowed():
+    engine = RiskEngine()
+    engine.trip("test")
+    decision = engine.check_order(**_reduce_order(size_base=D("0.004")))
+    assert decision.allowed, decision.reasons

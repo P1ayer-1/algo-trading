@@ -41,9 +41,15 @@ per UTC day to `data/`:
 data/features-2026-09-06.csv
 ```
 
-Each row is a feature vector plus forward-looking labels at 1s / 5s / 30s:
-`fwd_ret_bps_5s` (the realised move in bps) and `label_5s` (-1/0/+1 against
-`BLOFIN_LABEL_THRESHOLD_BPS`).
+Each row is a feature vector plus forward-looking labels at 300s / 900s /
+1800s: `fwd_ret_bps_900s` (the realised move in bps) and `label_900s` (-1/0/+1
+against `BLOFIN_LABEL_THRESHOLD_BPS`).
+
+Those horizons are minutes rather than seconds because a 30-second BTC move
+has a standard deviation of 2.41bps and a round trip costs 1.2-10bps. See
+`backend/config.py` for the measurement and the sqrt(T) scaling that follows
+from it. The practical consequence: nothing reaches disk for the first 30
+minutes of a run.
 
 **Rows are only written after their forward window has actually elapsed.** A
 row inside its horizon sits in a pending buffer and is never written, so the
@@ -53,12 +59,17 @@ bug produces a model with a wonderful backtest and no live edge.
 
 Two things to know before training on it:
 
-- **Filter on `history_seconds`.** During warmup, returns over a horizon
-  longer than the available history are reported as `0.0`. That is padding,
-  not a measured zero. Drop rows where `history_seconds < max(horizon)`.
-- **Set `threshold_bps` from your real costs.** The 3bps default is a
-  placeholder. If your round-trip taker cost is 6bps, a model trained to
-  predict 3bps moves is being trained to lose money.
+- **Filter on `history_seconds`.** During warmup, returns over a *feature*
+  window longer than the available history are reported as `0.0`. That is
+  padding, not a measured zero. Drop rows where `history_seconds` is below the
+  slowest feature window (`rv_60s`, so 60 seconds). Note this is the backward
+  feature lookback, **not** the forward label horizon — `check_features.py`
+  used to conflate the two and silently discarded every row at any horizon
+  beyond FeatureEngine's 300s of retained history.
+- **Set `threshold_bps` from your real costs.** It now defaults to
+  `config.ROUND_TRIP_COST_BPS` (10bps, taker both sides at VIP 1). A model
+  trained to predict 3bps moves against a 10bps round trip is being trained to
+  lose money.
 
 ## Liquidation math — verify before trusting
 

@@ -227,6 +227,16 @@ class RiskLimits:
     max_daily_loss: Decimal = Decimal("100")
     max_consecutive_losses: int = 4
 
+    # Unrealized-loss limits. Every limit above keys on *realized* PnL, which
+    # a strategy that never closes a loser never touches. These two are what
+    # make an open drawdown visible to the kill switch.
+    max_unrealized_loss: Decimal = Decimal("50")
+    # Trip when an already-open position drifts this close to liquidation.
+    # Looser than min_liquidation_buffer_pct (which gates *opening*): once you
+    # are in, the question is no longer "is this a good entry" but "get out
+    # before the margin engine does it for you".
+    min_open_liquidation_buffer_pct: Decimal = Decimal("0.08")
+
     max_spread_bps: Decimal = Decimal("5")
     max_slippage_bps: Decimal = Decimal("5")
 
@@ -240,8 +250,12 @@ class RiskLimits:
     max_book_age_ms: int = 2000
     max_tape_staleness_s: float = 10.0
 
-    # Round-trip cost floor used by the expected-edge gate, in bps.
-    round_trip_cost_bps: Decimal = Decimal("6")
+    # Round-trip cost floor used by the expected-edge gate, in bps. Mirrors
+    # config.ROUND_TRIP_COST_BPS, which is the single source of truth and is
+    # derived from the real BloFin fee schedule; this default exists only so
+    # the engine is usable standalone, since risk.py imports nothing.
+    # 10bps = taker on both sides at VIP 1 (0.05% per side).
+    round_trip_cost_bps: Decimal = Decimal("10")
 
 
 @dataclass
@@ -261,6 +275,24 @@ class AccountState:
         if self.position_base < 0:
             return Side.SHORT
         return None
+
+    def unrealized_pnl(self, mark_price: Decimal) -> Decimal:
+        """Open PnL on the current position, in quote currency.
+
+        `position_base` is signed, so one expression covers both sides: a
+        short is a negative quantity, and a negative quantity multiplied by a
+        price rise is a loss.
+        """
+        if self.position_base == 0 or self.entry_price <= 0 or mark_price <= 0:
+            return ZERO
+        return self.position_base * (mark_price - self.entry_price)
+
+    def total_pnl_today(self, mark_price: Decimal) -> Decimal:
+        """Realized PnL plus the open position marked to market.
+
+        This, not `realized_pnl_today`, is what a daily loss limit means.
+        """
+        return self.realized_pnl_today + self.unrealized_pnl(mark_price)
 
 
 @dataclass
@@ -351,6 +383,78 @@ class RiskEngine:
                 f"consecutive loss limit hit: {account.consecutive_losses}"
             )
 
+    def mark_to_market(
+        self, account: AccountState, mark_price: Decimal
+    ) -> Dict[str, object]:
+        """Evaluate an OPEN position and trip the kill switch if it has gone
+        too far wrong. Call this on every mark-price update, not only on fills.
+
+        This is the counterpart to `on_trade_closed`, and it exists because of
+        one specific failure mode. Every other breaker in this class is fed by
+        `on_trade_closed`, so a strategy that simply declines to close a losing
+        position - "the trend is up, we can afford to wait" - never trips any
+        of them. Its drawdown stays invisible right up until the exchange
+        closes the position on its behalf. An open loss is a loss.
+
+        Returns what it saw, plus the ordered actions the execution layer must
+        carry out if the switch tripped. As with `on_disconnect`, the actions
+        are returned rather than performed, so this module keeps no exchange
+        dependency.
+        """
+        limits = self.limits
+        unrealized = account.unrealized_pnl(mark_price)
+        total = account.realized_pnl_today + unrealized
+        breaches: List[str] = []
+
+        liq = None
+        distance = None
+        side = account.side
+        if side is not None and account.entry_price > 0 and mark_price > 0:
+            liq = liquidation_price(
+                entry_price=account.entry_price,
+                leverage=account.leverage,
+                side=side,
+                maintenance_margin_rate=limits.maintenance_margin_rate,
+                fee_buffer_bps=limits.fee_buffer_bps,
+            )
+            distance = liquidation_distance_pct(
+                mark_price=mark_price, liq_price=liq
+            )
+            if (
+                distance is not None
+                and distance < limits.min_open_liquidation_buffer_pct
+            ):
+                breaches.append(
+                    f"open position {distance:.2%} from liquidation, need "
+                    f"{limits.min_open_liquidation_buffer_pct:.2%}"
+                )
+
+        if unrealized <= -limits.max_unrealized_loss:
+            breaches.append(
+                f"unrealized loss {unrealized} <= -{limits.max_unrealized_loss}"
+            )
+        if total <= -limits.max_daily_loss:
+            breaches.append(
+                f"daily loss limit hit on a mark-to-market basis: {total} "
+                f"<= -{limits.max_daily_loss}"
+            )
+
+        for reason in breaches:
+            self.trip(reason)
+
+        return {
+            "unrealizedPnl": unrealized,
+            "totalPnlToday": total,
+            "liquidationPrice": liq,
+            "liquidationDistancePct": distance,
+            "breaches": breaches,
+            "actions": (
+                ["close_position", "cancel_all_orders", "alert_operator"]
+                if breaches
+                else []
+            ),
+        }
+
     def start_new_day(self, account: AccountState) -> None:
         account.realized_pnl_today = ZERO
         account.consecutive_losses = 0
@@ -370,15 +474,31 @@ class RiskEngine:
         book_age_ms: int = 0,
         tape_staleness_s: float = 0.0,
         features_valid: bool = True,
+        reduce_only: bool = False,
     ) -> RiskDecision:
         """Approve, shrink, or reject a proposed order.
 
         Collects *every* failing reason rather than short-circuiting on the
         first — when something goes wrong at 3am you want the full list in the
         log, not just whichever check happened to run first.
+
+        `reduce_only` marks an order that strictly shrinks the open position.
+        Those take a much shorter path, because otherwise the engine deadlocks
+        in precisely the situation it exists for: `mark_to_market` trips the
+        kill switch and returns "close_position", and then the full gate below
+        vetoes that closing order - kill switch active, no expected edge, daily
+        loss reached. Every one of those is a reason to stop *opening* risk and
+        none of them is a reason to be unable to get out. The claim is verified
+        rather than trusted: an order tagged reduce_only that would not in fact
+        reduce exposure is rejected.
         """
         limits = self.limits
         reasons: List[str] = []
+
+        if reduce_only:
+            return self._check_reduce_only(
+                account=account, side=side, size_base=size_base, price=price
+            )
 
         if self.kill_switch_active:
             reasons.append(f"kill switch active: {self.kill_switch_reason}")
@@ -438,8 +558,18 @@ class RiskEngine:
                 f"max {limits.max_notional}"
             )
 
-        if account.realized_pnl_today <= -limits.max_daily_loss:
-            reasons.append("daily loss limit reached")
+        # Marked to market at the order price, not realized-only: an open
+        # drawdown spends the day's risk budget just as surely as a booked one.
+        total_pnl = account.total_pnl_today(price)
+        if total_pnl <= -limits.max_daily_loss:
+            reasons.append(
+                f"daily loss limit reached (mark-to-market {total_pnl})"
+            )
+        unrealized = account.unrealized_pnl(price)
+        if unrealized <= -limits.max_unrealized_loss:
+            reasons.append(
+                f"unrealized loss {unrealized} <= -{limits.max_unrealized_loss}"
+            )
         if account.consecutive_losses >= limits.max_consecutive_losses:
             reasons.append("consecutive loss limit reached")
 
@@ -474,6 +604,52 @@ class RiskEngine:
             max_size_base=allowance,
             liq_price=liq,
             liq_distance_pct=distance,
+        )
+
+    def _check_reduce_only(
+        self,
+        *,
+        account: AccountState,
+        side: Side,
+        size_base: Decimal,
+        price: Decimal,
+    ) -> RiskDecision:
+        """The narrow gate for orders that only shrink exposure.
+
+        Deliberately checks almost nothing. A closing order is refused only if
+        it is malformed, if there is nothing to close, if it is not in fact a
+        reduction, or if there is no connection to send it over. A blown-out
+        spread or a stale tape is a reason to close carefully, not a reason to
+        stay in.
+        """
+        reasons: List[str] = []
+        if not self.connected:
+            reasons.append("not connected to exchange")
+        if price <= 0:
+            reasons.append("invalid price")
+        if size_base <= 0:
+            reasons.append("invalid size")
+
+        existing = account.position_base
+        if existing == 0:
+            reasons.append("reduce_only order with no open position")
+        else:
+            closing_side = Side.SHORT if existing > 0 else Side.LONG
+            if side is not closing_side:
+                reasons.append(
+                    f"reduce_only order is {side.value}, but closing a "
+                    f"{account.side.value} position needs {closing_side.value}"
+                )
+            elif size_base > abs(existing):
+                reasons.append(
+                    f"reduce_only size {size_base} exceeds position "
+                    f"{abs(existing)} and would flip it"
+                )
+
+        return RiskDecision(
+            allowed=not reasons,
+            reasons=reasons,
+            max_size_base=abs(existing),
         )
 
     @staticmethod
@@ -587,6 +763,7 @@ class RiskEngine:
                 fee_buffer_bps=self.limits.fee_buffer_bps,
             )
             distance = liquidation_distance_pct(mark_price=mark_price, liq_price=liq)
+        unrealized = account.unrealized_pnl(mark_price)
         return {
             "killSwitch": self.kill_switch_active,
             "killSwitchReason": self.kill_switch_reason,
@@ -597,5 +774,7 @@ class RiskEngine:
             "liquidationPrice": float(liq) if liq is not None else None,
             "liquidationDistancePct": float(distance) if distance is not None else None,
             "realizedPnlToday": float(account.realized_pnl_today),
+            "unrealizedPnl": float(unrealized),
+            "totalPnlToday": float(account.realized_pnl_today + unrealized),
             "consecutiveLosses": account.consecutive_losses,
         }

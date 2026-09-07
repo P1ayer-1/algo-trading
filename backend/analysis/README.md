@@ -18,8 +18,13 @@ Only `numpy` is required. `pyarrow`/`duckdb` are optional and only for
 ## check_features.py — does any of this predict anything?
 
 ```
-python backend\analysis\check_features.py --horizon 5 --cost-bps 6
+python backend\analysis\check_features.py --horizon 900
 ```
+
+`--cost-bps` now defaults to `config.ROUND_TRIP_COST_BPS` (10bps = taker on
+both sides at VIP 1), so it no longer has to be passed by hand. Pass
+`--cost-bps 1.2` to see the maker-only case — but only once a passive
+execution engine exists and its fill rate has been measured.
 
 **This is a gate, not a formality.** Run it before writing a line of model
 code. If the features carry no out-of-sample information, no amount of
@@ -112,10 +117,10 @@ downloading, so a wrong one costs a second rather than a 90 MB transfer.
 ### tardis_import.py — recent data, with real depth
 
 ```
-python backendnalysis	ardis_import.py --date 2026-09-01 --hours 2
-python backendnalysis\check_features.py ^
-    --data-dir data	ardisinance-futures-BTCUSDT-2026-09-01 ^
-    --horizon 5 --cost-bps 6
+python backend\analysis\tardis_import.py --date 2026-09-01 --hours 2
+python backend\analysis\check_features.py ^
+    --data-dir data\tardis\binance-futures-BTCUSDT-2026-09-01 ^
+    --horizon 900
 ```
 
 Two datasets per day: `book_snapshot_25` (25 levels per side, every book
@@ -150,9 +155,9 @@ both directions.
 ### binance_import.py — touch-resolution, but only up to 2024-03-30
 
 ```
-python backendnalysisinance_import.py --date 2024-03-01 --hours 2
-python backendnalysis\check_features.py ^
-    --data-dir datainance\BTCUSDT-2024-03-01 --horizon 5 --cost-bps 6
+python backend\analysis\binance_import.py --date 2024-03-01 --hours 2
+python backend\analysis\check_features.py ^
+    --data-dir data\binance\BTCUSDT-2024-03-01 --horizon 900
 ```
 
 Two datasets per day: `bookTicker` (every change to the best bid/ask, with
@@ -177,7 +182,9 @@ Use `tardis_import.py` if you need those columns.
 Each run writes to its own directory by default:
 
 ```
-data	ardisinance-futures-BTCUSDT-2026-09-01datainance\BTCUSDT-2024-03-01```
+data\tardis\binance-futures-BTCUSDT-2026-09-01
+data\binance\BTCUSDT-2024-03-01
+```
 
 This is not tidiness. `FeatureRecorder` names its file `features-<today>.csv`
 by **wall-clock** date and opens it in **append** mode. That is correct for
@@ -256,8 +263,8 @@ duckdb.sql("SELECT AVG(fwd_ret_bps_5s) FROM 'data/parquet/*.parquet' "
 | What | Per day | Per month | Per year |
 |---|---|---|---|
 | Raw archive (gzipped) | ~100 MB | ~3 GB | ~37 GB |
-| Feature CSV @ 250ms | ~160 MB | ~4.8 GB | ~58 GB |
-| **Combined** | **~260 MB** | **~8 GB** | **~95 GB** |
+| Feature CSV @ 1s (default) | ~40 MB | ~1.2 GB | ~15 GB |
+| **Combined** | **~140 MB** | **~4.2 GB** | **~52 GB** |
 
 Feature CSV scales linearly with sample rate: 100ms ≈ 400 MB/day, 1s ≈ 40
 MB/day. Measured at 461 bytes/row over 40,000 real rows.

@@ -82,6 +82,40 @@ BOOK_DEPTH = os.getenv("BLOFIN_BOOK_DEPTH", "books")
 # Rolling trade-tape window, seconds. Must exceed the longest tfi_* horizon.
 TAPE_WINDOW_SECONDS = float(os.getenv("BLOFIN_TAPE_WINDOW_SECONDS", "60"))
 
+# --- Fees and execution cost ------------------------------------------------
+# THE most load-bearing numbers in this project. Every "is there an edge?"
+# question is really "is the predicted move bigger than these?", so they get
+# defined once, here, and everything else imports them.
+#
+# BloFin futures schedule, VIP 1 (confirmed 2026-09-07). Fractions of
+# notional, per side.
+MAKER_FEE_RATE = Decimal(os.getenv("BLOFIN_MAKER_FEE_RATE", "0.00006"))  # 0.0060%
+TAKER_FEE_RATE = Decimal(os.getenv("BLOFIN_TAKER_FEE_RATE", "0.00050"))  # 0.0500%
+
+
+def _bps(rate: Decimal) -> Decimal:
+    return rate * Decimal("10000")
+
+
+# Round-trip cost in bps for the three ways a position can open and close.
+# The spread is not included: measured median spread on BTC-USDT is 0.013bps,
+# three orders of magnitude below the taker fee, so fees are the whole story.
+MAKER_FEE_BPS = _bps(MAKER_FEE_RATE)                    # 0.6
+TAKER_FEE_BPS = _bps(TAKER_FEE_RATE)                    # 5.0
+COST_MAKER_MAKER_BPS = MAKER_FEE_BPS * 2                # 1.2  passive in, passive out
+COST_MAKER_TAKER_BPS = MAKER_FEE_BPS + TAKER_FEE_BPS    # 5.6  passive in, market out
+COST_TAKER_TAKER_BPS = TAKER_FEE_BPS * 2                # 10.0 crossing both ways
+
+# The cost the risk engine's edge gate and the analysis tooling assume by
+# default. Taker/taker deliberately: it is a *veto* threshold, and the
+# conservative assumption is that you cross the spread on both sides. Set
+# BLOFIN_ROUND_TRIP_COST_BPS to COST_MAKER_MAKER_BPS (1.2) to see what a
+# fully passive execution engine would need to clear -- but only once such an
+# engine exists and its fill rate has been measured, not before.
+ROUND_TRIP_COST_BPS = Decimal(
+    os.getenv("BLOFIN_ROUND_TRIP_COST_BPS", str(COST_TAKER_TAKER_BPS))
+)
+
 # --- Feature recording ------------------------------------------------------
 # Writes labelled feature rows to DATA_DIR for later model training. This is
 # the prerequisite for any ML in the roadmap: no recording, no dataset.
@@ -95,18 +129,46 @@ DATA_DIR = Path(os.getenv("BLOFIN_DATA_DIR", str(REPO_ROOT / "data")))
 RECORD_RAW = env_bool("BLOFIN_RECORD_RAW", "true")
 
 # How often to persist a feature row (ms). The feature engine still computes
-# on every event; this only controls disk volume. 250ms ~= 350k rows/day.
-FEATURE_SAMPLE_INTERVAL_MS = int(os.getenv("BLOFIN_FEATURE_SAMPLE_MS", "250"))
+# on every event; this only controls disk volume. At a 300s minimum horizon,
+# 250ms sampling produced 1,200 near-identical overlapping rows per
+# independent observation — disk volume without information. 1s still leaves
+# 300 rows per window, and anything finer is recoverable from data/raw/ via
+# analysis/replay.py anyway.
+FEATURE_SAMPLE_INTERVAL_MS = int(os.getenv("BLOFIN_FEATURE_SAMPLE_MS", "1000"))
 
 # Forward horizons (seconds) to label, and the move size that counts as a
-# signal. Set the threshold from your real round-trip cost — labelling moves
-# smaller than fees trains a model to chase edges it cannot capture.
+# signal.
+#
+# These were 1/5/30 SECONDS, and that was the reason the bot could not work.
+# Measured on BTC-USDT, the standard deviation of the forward move is 0.45bps
+# at 1s, 0.97bps at 5s and 2.41bps at 30s, against a round-trip cost of
+# 1.2bps (maker) to 10bps (taker). At 30 seconds an oracle with perfect
+# knowledge of the sign, capturing a full standard deviation, still loses
+# money at taker fees. No model fixes that; only a longer horizon does.
+#
+# Price scales as a near-perfect random walk here (measured exponent 0.495),
+# so sigma(T) ~= 2.41bps * sqrt(T/30):
+#
+#     300s  (5 min)   ~7.6bps      900s (15 min)  ~13.2bps
+#    1800s (30 min)  ~18.7bps     3600s (60 min)  ~26.4bps
+#
+# A model that captures ~0.2 sigma (which is what the 5s and 30s runs
+# actually achieved) needs sigma >= 6bps to clear maker fees and >= 50bps to
+# clear taker fees. 300/900/1800 brackets that range.
+#
+# Consequence to know about: the recorder cannot write a row until its
+# forward window has closed, so nothing lands on disk for the first
+# max(horizon) = 30 minutes. That is the lookahead guard, not a hang.
 LABEL_HORIZONS = tuple(
     float(part)
-    for part in os.getenv("BLOFIN_LABEL_HORIZONS", "1,5,30").split(",")
+    for part in os.getenv("BLOFIN_LABEL_HORIZONS", "300,900,1800").split(",")
     if part.strip()
 )
-LABEL_THRESHOLD_BPS = float(os.getenv("BLOFIN_LABEL_THRESHOLD_BPS", "3"))
+# Defaults to the round-trip cost: labelling a move smaller than fees as "up"
+# trains the model to chase edges it cannot capture.
+LABEL_THRESHOLD_BPS = float(
+    os.getenv("BLOFIN_LABEL_THRESHOLD_BPS", str(ROUND_TRIP_COST_BPS))
+)
 
 # --- Risk limits ------------------------------------------------------------
 # Nothing sends orders yet, but these are the values the risk engine will
@@ -132,4 +194,14 @@ MIN_LIQUIDATION_BUFFER_PCT = Decimal(
 # instrument and size you intend to trade — it is tiered, not flat, and the
 # wrong value makes every liquidation estimate optimistic.
 MAINTENANCE_MARGIN_RATE = Decimal(os.getenv("BLOFIN_MMR", "0.005"))
-ROUND_TRIP_COST_BPS = Decimal(os.getenv("BLOFIN_ROUND_TRIP_COST_BPS", "6"))
+
+# Unrealized-loss limits. These exist because every other circuit breaker in
+# risk.py keys on *realized* PnL, which means a strategy that simply refuses
+# to close a loser ("it's an uptrend, we can wait") never trips any of them.
+# An open position is a loss whether or not it has been booked.
+MAX_UNREALIZED_LOSS = Decimal(os.getenv("BLOFIN_MAX_UNREALIZED_LOSS", "50"))
+# Trip if an already-open position drifts this close to liquidation.
+# Deliberately looser than MIN_LIQUIDATION_BUFFER_PCT (which gates *opening*):
+# a position that has moved against you should be closed well before the
+# margin engine does it for you.
+MIN_OPEN_LIQ_BUFFER_PCT = Decimal(os.getenv("BLOFIN_MIN_OPEN_LIQ_BUFFER_PCT", "0.08"))

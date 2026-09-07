@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import os
 import time
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,14 +39,19 @@ from .features import FeatureSnapshot, feature_columns
 class LabelConfig:
     """Forward horizons (seconds) and the move size that counts as a signal.
 
-    `threshold_bps` should be set relative to your actual round-trip cost. If
-    taker fees are 6bps round trip, labelling a 1bps move as "up" trains the
-    model to find moves it cannot profitably capture. The default of 3bps is a
-    starting point, not a recommendation — measure your real fills.
+    `threshold_bps` should be set relative to your actual round-trip cost.
+    Labelling a 1bps move as "up" when a round trip costs 10bps trains the
+    model to find moves it cannot profitably capture.
+
+    The defaults are minutes, not seconds, and that is deliberate: the
+    measured standard deviation of a 30-second BTC move is 2.41bps against a
+    1.2-10bps round trip, so second-scale horizons are unprofitable by
+    arithmetic before any model is involved. See `backend/config.py` for the
+    full calculation. Both values are overridden from config in the live path.
     """
 
-    horizons_seconds: Tuple[float, ...] = (1.0, 5.0, 30.0)
-    threshold_bps: float = 3.0
+    horizons_seconds: Tuple[float, ...] = (300.0, 900.0, 1800.0)
+    threshold_bps: float = 10.0
 
 
 class FeatureRecorder:
@@ -71,8 +77,17 @@ class FeatureRecorder:
 
         # Snapshots waiting for their forward window to close.
         self._pending: Deque[FeatureSnapshot] = deque()
-        # (ts_ms, mid) used to resolve labels. Must outlive the longest horizon.
-        self._mid_history: Deque[Tuple[int, float]] = deque()
+        # Mid prices used to resolve labels, as two parallel ordered lists
+        # rather than a deque of tuples. Must outlive the longest horizon.
+        #
+        # Lists, because label lookup is a `bisect` over `_mid_ts` and a deque
+        # cannot be bisected in better than O(n). That distinction did not
+        # matter at a 30s horizon; at 1800s the buffer holds ~30x more
+        # samples AND every lookup targets its far end, so a linear scan made
+        # importing a single day take hours. Same reasoning as `_Series` in
+        # features.py.
+        self._mid_ts: List[int] = []
+        self._mid_values: List[float] = []
 
         self._last_sample_ms = 0
         self._latest_ts = 0
@@ -80,6 +95,7 @@ class FeatureRecorder:
         self._handle = None
         self._writer: Optional[csv.DictWriter] = None
         self._open_date: Optional[str] = None
+        self._open_path: Optional[Path] = None
 
         self.rows_written = 0
         self.rows_dropped = 0
@@ -108,7 +124,15 @@ class FeatureRecorder:
             return
 
         self._latest_ts = max(self._latest_ts, snapshot.ts)
-        self._mid_history.append((snapshot.ts, snapshot.mid))
+        # Guard the bisect's precondition: out-of-order arrivals would corrupt
+        # every subsequent lookup silently. Book events are sequenced, so this
+        # should never fire, but "should never" is not a guarantee to bet a
+        # training set on.
+        if self._mid_ts and snapshot.ts < self._mid_ts[-1]:
+            self.rows_dropped += 1
+            return
+        self._mid_ts.append(snapshot.ts)
+        self._mid_values.append(snapshot.mid)
         self._trim_mid_history()
 
         if snapshot.ts - self._last_sample_ms >= self.sample_interval_ms:
@@ -117,12 +141,20 @@ class FeatureRecorder:
 
         self._drain()
 
+    # Only compact once there is a worthwhile amount to drop; deleting from
+    # the front of a list is O(n), so doing it per event would reintroduce the
+    # cost this structure exists to avoid.
+    _COMPACT_THRESHOLD = 4096
+
     def _trim_mid_history(self) -> None:
         # Keep a generous margin beyond the longest horizon so label lookups
         # never fall off the front of the buffer.
         cutoff = self._latest_ts - (self.max_horizon_ms * 3)
-        while self._mid_history and self._mid_history[0][0] < cutoff:
-            self._mid_history.popleft()
+        index = bisect_left(self._mid_ts, cutoff)
+        if index < self._COMPACT_THRESHOLD:
+            return
+        del self._mid_ts[:index]
+        del self._mid_values[:index]
 
     def _drain(self) -> None:
         """Write every pending row whose full forward window has elapsed."""
@@ -144,10 +176,10 @@ class FeatureRecorder:
         (a feed gap), we return None and the row is dropped rather than
         labelled from a price that predates the horizon.
         """
-        for sample_ts, mid in self._mid_history:
-            if sample_ts >= target_ts:
-                return mid
-        return None
+        index = bisect_left(self._mid_ts, target_ts)
+        if index >= len(self._mid_ts):
+            return None
+        return self._mid_values[index]
 
     def _label(self, snapshot: FeatureSnapshot) -> Optional[Dict[str, object]]:
         if snapshot.mid is None or snapshot.mid <= 0:
@@ -171,6 +203,37 @@ class FeatureRecorder:
 
     # ---- output ----------------------------------------------------------
 
+    @staticmethod
+    def _existing_header(path: Path) -> Optional[List[str]]:
+        """First line of an existing CSV, split into column names."""
+        try:
+            with open(path, newline="", encoding="utf-8") as handle:
+                first = handle.readline()
+        except OSError:
+            return None
+        if not first.strip():
+            return None
+        return next(csv.reader([first]), None)
+
+    def _resolve_path(self, today: str, columns: List[str]) -> Path:
+        """Today's file, unless its header describes a different schema.
+
+        The recorder appends, and it writes a header only when starting a new
+        file. So a run whose label horizons changed since the last run would
+        otherwise append rows in the NEW column order underneath the OLD
+        header - every value silently filed under the wrong name, in a dataset
+        whose entire purpose is to be trained on. Changing BLOFIN_LABEL_HORIZONS
+        and restarting is a completely ordinary thing to do, so this rolls to a
+        suffixed file instead of corrupting the existing one.
+        """
+        path = self.data_dir / f"features-{today}.csv"
+        for suffix in range(2, 1000):
+            header = self._existing_header(path)
+            if header is None or header == columns:
+                return path
+            path = self.data_dir / f"features-{today}-{suffix}.csv"
+        raise RuntimeError(f"too many schema-mismatched files for {today}")
+
     def _ensure_file(self) -> None:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._handle is not None and self._open_date == today:
@@ -178,16 +241,18 @@ class FeatureRecorder:
 
         self.close()
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        path = self.data_dir / f"features-{today}.csv"
+        columns = self._columns()
+        path = self._resolve_path(today, columns)
         is_new = not path.exists() or path.stat().st_size == 0
 
         self._handle = open(path, "a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(
-            self._handle, fieldnames=self._columns(), extrasaction="ignore"
+            self._handle, fieldnames=columns, extrasaction="ignore"
         )
         if is_new:
             self._writer.writeheader()
         self._open_date = today
+        self._open_path = path
 
     def _write(self, row: Dict[str, object]) -> None:
         self._ensure_file()
@@ -213,6 +278,7 @@ class FeatureRecorder:
         self._handle = None
         self._writer = None
         self._open_date = None
+        self._open_path = None
 
     def stats(self) -> Dict[str, object]:
         return {
@@ -220,5 +286,6 @@ class FeatureRecorder:
             "rowsWritten": self.rows_written,
             "rowsDropped": self.rows_dropped,
             "pending": len(self._pending),
-            "file": f"features-{self._open_date}.csv" if self._open_date else None,
+            "maxHorizonSeconds": self.max_horizon_ms / 1000.0,
+            "file": self._open_path.name if self._open_path else None,
         }

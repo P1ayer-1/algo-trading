@@ -331,9 +331,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--hours", type=float, default=None,
                         help="Only convert the first N hours. Start with 2 — a "
                              "full BTCUSDT day is tens of millions of updates.")
-    parser.add_argument("--sample-ms", type=int, default=250)
-    parser.add_argument("--horizons", default="1,5,30")
-    parser.add_argument("--threshold-bps", type=float, default=3.0)
+    parser.add_argument("--sample-ms", type=int, default=1000)
+    parser.add_argument("--horizons", default="300,900,1800",
+                        help="Forward label horizons in seconds. Minutes, "
+                             "not seconds: see backend/config.py for why "
+                             "second-scale horizons cannot clear fees.")
+    parser.add_argument("--threshold-bps", type=float, default=10.0,
+                        help="Move counted as up/down. Defaults to the "
+                             "taker round-trip cost.")
     parser.add_argument("--force", action="store_true", help="Re-download.")
     args = parser.parse_args(argv)
 

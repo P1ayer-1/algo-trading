@@ -356,9 +356,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Only convert the first N hours. Start with 2.")
     parser.add_argument("--depth", type=int, default=25, choices=(5, 25),
                         help="Book levels per side. 25 makes obi_20 real.")
-    parser.add_argument("--sample-ms", type=int, default=250)
-    parser.add_argument("--horizons", default="1,5,30")
-    parser.add_argument("--threshold-bps", type=float, default=3.0)
+    parser.add_argument("--sample-ms", type=int, default=1000)
+    parser.add_argument("--horizons", default="300,900,1800",
+                        help="Forward label horizons in seconds. Minutes, "
+                             "not seconds: see backend/config.py for why "
+                             "second-scale horizons cannot clear fees.")
+    parser.add_argument("--threshold-bps", type=float, default=10.0,
+                        help="Move counted as up/down. Defaults to the "
+                             "taker round-trip cost.")
     parser.add_argument("--api-key", default=os.environ.get("TARDIS_API_KEY"),
                         help="Paid Tardis key; lifts the 1st-of-month limit. "
                              "Defaults to $TARDIS_API_KEY.")

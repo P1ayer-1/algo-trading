@@ -9,7 +9,7 @@ import math
 
 import pytest
 
-from trading.features import FeatureEngine
+from trading.features import FeatureEngine, FeatureSnapshot
 from trading.orderbook import OrderBook
 from trading.recorder import FeatureRecorder, LabelConfig
 from trading.tape import TradeTape
@@ -544,3 +544,82 @@ def test_incremental_ofi_equals_a_full_rescan():
         assert engine._ofi_sum(ts, seconds) == pytest.approx(
             _naive_ofi_sum(pairs, ts, seconds), abs=1e-9
         )
+
+
+def _read_header(path):
+    import csv as _csv
+    with open(path, newline="", encoding="utf-8") as handle:
+        return next(_csv.reader(handle))
+
+
+def _record_one_row(data_dir, horizons):
+    """Drive a recorder through one complete labelled row."""
+    recorder = FeatureRecorder(
+        data_dir,
+        label_config=LabelConfig(horizons_seconds=horizons, threshold_bps=1.0),
+        sample_interval_ms=0,
+    )
+    span_ms = int(max(horizons) * 1000)
+    base = 1_700_000_000_000
+    for offset in (0, span_ms, span_ms * 2):
+        recorder.observe(
+            FeatureSnapshot(ts=base + offset, mid=100.0, is_valid=True)
+        )
+    recorder.close()
+    return recorder
+
+
+def test_changing_horizons_rolls_to_a_new_file_instead_of_corrupting_the_old(tmp_path):
+    # The recorder appends and only writes a header for a new file. Relabelling
+    # at different horizons changes the columns, so appending would file every
+    # value under the wrong name.
+    first = _record_one_row(tmp_path, (1.0,))
+    assert first.rows_written >= 1
+
+    files = sorted(path.name for path in tmp_path.glob("features-*.csv"))
+    assert len(files) == 1
+    original = tmp_path / files[0]
+    original_header = _read_header(original)
+    assert "fwd_ret_bps_1s" in original_header
+    original_bytes = original.read_bytes()
+
+    second = _record_one_row(tmp_path, (2.0,))
+    assert second.rows_written >= 1
+
+    # The first file is untouched...
+    assert original.read_bytes() == original_bytes
+    # ...and the new schema went somewhere else, with its own header.
+    paths = list(tmp_path.glob("features-*.csv"))
+    assert len(paths) == 2
+    rolled = next(path for path in paths if path != original)
+    rolled_header = _read_header(rolled)
+    assert "fwd_ret_bps_2s" in rolled_header
+    assert "fwd_ret_bps_1s" not in rolled_header
+
+
+def test_same_horizons_keep_appending_to_one_file(tmp_path):
+    _record_one_row(tmp_path, (1.0,))
+    _record_one_row(tmp_path, (1.0,))
+    files = list(tmp_path.glob("features-*.csv"))
+    assert len(files) == 1
+    with open(files[0], newline="", encoding="utf-8") as handle:
+        lines = [line for line in handle if line.strip()]
+    # One header, and more than one data row.
+    assert len(lines) >= 3
+
+
+def test_out_of_order_snapshots_are_dropped_not_mislabelled(tmp_path):
+    # Label lookup is a bisect over an assumed-ordered timestamp list; an
+    # out-of-order arrival would silently corrupt every later lookup.
+    recorder = FeatureRecorder(
+        tmp_path,
+        label_config=LabelConfig(horizons_seconds=(1.0,), threshold_bps=1.0),
+        sample_interval_ms=0,
+    )
+    base = 1_700_000_000_000
+    recorder.observe(FeatureSnapshot(ts=base + 5000, mid=100.0, is_valid=True))
+    recorder.observe(FeatureSnapshot(ts=base, mid=999.0, is_valid=True))
+    assert recorder.rows_dropped >= 1
+    assert recorder._mid_ts == sorted(recorder._mid_ts)
+    assert 999.0 not in recorder._mid_values
+    recorder.close()

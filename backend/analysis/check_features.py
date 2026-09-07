@@ -1,7 +1,7 @@
 """Do these features predict anything? Run this before building any model.
 
     python backend/analysis/check_features.py
-    python backend/analysis/check_features.py --horizon 5 --data-dir data
+    python backend/analysis/check_features.py --horizon 900 --data-dir data
 
 This is step 5 of the roadmap, and it is a gate, not a formality. If the
 features carry no out-of-sample information, no amount of LightGBM, feature
@@ -78,6 +78,25 @@ EXCLUDED_FEATURES = {
 # An out-of-sample IC above this is almost never real at HFT horizons.
 SUSPICIOUS_IC = 0.20
 
+# The longest BACKWARD-looking window any feature uses (rv_60s). A row younger
+# than this reports padded zeros for its slowest features.
+#
+# This is NOT the forward label horizon, and conflating the two was a bug:
+# rows used to be dropped when `history_seconds < horizon`, which silently
+# discarded the entire dataset at any horizon beyond FeatureEngine's 300s of
+# retained mid history. A label's forward window is resolved by the recorder's
+# own mid buffer and needs no feature history at all.
+FEATURE_WARMUP_SECONDS = 60.0
+
+try:  # Single source of truth for fees; see backend/config.py.
+    from config import COST_MAKER_MAKER_BPS, ROUND_TRIP_COST_BPS
+
+    DEFAULT_COST_BPS = float(ROUND_TRIP_COST_BPS)
+    MAKER_ONLY_COST_BPS = float(COST_MAKER_MAKER_BPS)
+except Exception:  # pragma: no cover - keeps the analysis tools standalone
+    DEFAULT_COST_BPS = 10.0
+    MAKER_ONLY_COST_BPS = 1.2
+
 
 def load_rows(data_dir: Path, pattern: str = "features-*.csv") -> List[dict]:
     files = sorted(glob.glob(str(data_dir / pattern)))
@@ -130,10 +149,12 @@ def build_matrix(
         if row.get("is_valid", "True") not in ("True", "true", "1"):
             dropped_invalid += 1
             continue
-        # Warmup rows report 0.0 for horizons longer than the history behind
-        # them. That is padding, not a measurement — training on it teaches the
-        # model that "no history" means "no move".
-        if to_float(row.get("history_seconds", "0")) < horizon:
+        # Warmup rows report 0.0 for FEATURE windows longer than the history
+        # behind them. That is padding, not a measurement — training on it
+        # teaches the model that "no history" means "no move". The bar is the
+        # slowest feature (rv_60s), not the forward horizon; see
+        # FEATURE_WARMUP_SECONDS.
+        if to_float(row.get("history_seconds", "0")) < FEATURE_WARMUP_SECONDS:
             dropped_warmup += 1
             continue
         kept.append(row)
@@ -410,11 +431,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     repo_root = Path(__file__).resolve().parent.parent.parent
     parser.add_argument("--data-dir", type=Path, default=repo_root / "data")
-    parser.add_argument("--horizon", type=float, default=5.0,
+    parser.add_argument("--horizon", type=float, default=900.0,
                         help="Forward horizon in seconds (must exist in the CSV).")
-    parser.add_argument("--cost-bps", type=float, default=6.0,
-                        help="Round-trip cost in bps. Measure yours; do not guess.")
-    parser.add_argument("--threshold-bps", type=float, default=3.0,
+    parser.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS,
+                        help=f"Round-trip cost in bps, from backend/config.py "
+                             f"(default {DEFAULT_COST_BPS:g} = taker both sides). "
+                             f"Pass {MAKER_ONLY_COST_BPS:g} for the maker-only "
+                             f"case, but only once a passive execution engine "
+                             f"exists and its fill rate has been measured.")
+    parser.add_argument("--threshold-bps", type=float, default=DEFAULT_COST_BPS,
                         help="Move size counted as up/down for the balance report.")
     args = parser.parse_args(argv)
 

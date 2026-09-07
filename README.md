@@ -68,7 +68,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (120 tests)
+│   └── tests/                 # pytest suite (181 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── features-*.csv         #   labelled features — regenerable
 │   └── raw/                   #   raw events — IRREPLACEABLE
@@ -141,9 +141,11 @@ Useful environment variables (set in `.env` or the shell):
 | `BLOFIN_MICRO_ENABLED` | Run the order book / feature feed | `true` |
 | `BLOFIN_BOOK_DEPTH` | `books` (200 levels) or `books5` | `books` |
 | `BLOFIN_RECORD_FEATURES` | Write labelled features to `data/` | `true` |
-| `BLOFIN_FEATURE_SAMPLE_MS` | How often to persist a row | `250` |
-| `BLOFIN_LABEL_HORIZONS` | Forward label horizons, seconds | `1,5,30` |
-| `BLOFIN_LABEL_THRESHOLD_BPS` | Move size counted as a signal | `3` |
+| `BLOFIN_FEATURE_SAMPLE_MS` | How often to persist a row | `1000` |
+| `BLOFIN_LABEL_HORIZONS` | Forward label horizons, seconds | `300,900,1800` |
+| `BLOFIN_LABEL_THRESHOLD_BPS` | Move size counted as a signal | `10` |
+| `BLOFIN_MAKER_FEE_RATE` / `BLOFIN_TAKER_FEE_RATE` | Fee schedule, per side | `0.00006` / `0.0005` |
+| `BLOFIN_ROUND_TRIP_COST_BPS` | Cost the edge gate must clear | `10` |
 | `BLOFIN_MAX_LEVERAGE` | Risk engine leverage cap | `5` |
 | `BLOFIN_MIN_LIQ_BUFFER_PCT` | Required distance to liquidation | `0.15` |
 | `BLOFIN_RECORD_RAW` | Archive raw events to `data/raw/` | `true` |
@@ -161,13 +163,24 @@ python backend\live-chart.py
 ```
 
 Startup confirms both writers, and the chart page's Microstructure panel shows
-a live row count. **Nothing is written for the first ~30 seconds** — the
-longest label horizon is 30s, and a row can't be written until its forward
-window has actually elapsed. That's the lookahead guard, not a hang.
+a live row count. **Nothing is written for the first 30 minutes** — the
+longest label horizon is 1800s, and a row can't be written until its forward
+window has actually elapsed. That's the lookahead guard, not a hang. The raw
+archive starts writing immediately, so nothing is lost in the meantime.
 
-Storage, measured: **~260 MB/day** total (~100 MB raw + ~160 MB features),
-about 8 GB/month. See `backend/analysis/README.md` for the full table and the
-reasoning about databases.
+Why 30 minutes and not 30 seconds: measured on BTC-USDT, the standard
+deviation of the forward move is 0.97bps at 5s and 2.41bps at 30s, against a
+round-trip cost of 1.2bps (maker both sides) to 10bps (taker both sides). At a
+30-second horizon a perfect oracle capturing a full standard deviation still
+loses money at taker fees, so second-scale horizons were unprofitable by
+arithmetic before any model was involved. Price scales as a near-perfect random
+walk here (measured exponent 0.495), so the fix is time: sigma grows as
+sqrt(T), reaching ~7.6bps at 5 minutes and ~18.7bps at 30 minutes. The full
+derivation is in `backend/config.py` next to the constants.
+
+Storage, measured: **~140 MB/day** total (~100 MB raw + ~40 MB features at the
+1s sample interval), about 4 GB/month. See `backend/analysis/README.md` for the
+full table and the reasoning about databases.
 
 Collect across **varied conditions** — a model trained only on quiet books
 learns nothing about the regimes that actually hurt you.
@@ -177,7 +190,7 @@ learns nothing about the regimes that actually hurt you.
 After a few days:
 
 ```
-python backend\analysis\check_features.py --horizon 5 --cost-bps 6
+python backend\analysis\check_features.py --horizon 900
 ```
 
 This is the gate before any model work. See `backend/analysis/README.md` for
@@ -192,9 +205,10 @@ cd backend
 python -m pytest
 ```
 
-120 tests covering the order book's gap handling, the OFI recursion, the
+181 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
-values), the raw-archive round trip, and the evaluation statistics. They need
+values), the unrealized-drawdown breakers, the reduce-only close path, the
+raw-archive round trip, and the evaluation statistics. They need
 no network, credentials, or SDK.
 
 ## Roadmap toward the actual bot
