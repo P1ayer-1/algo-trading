@@ -78,6 +78,82 @@ realistic weak edge, and against pure noise — a check that can only ever say
 
 ---
 
+## bars_import.py — the actual training set
+
+```
+python backend\analysis\bars_import.py
+python backend\analysis\bars_import.py --start 2023-01-01 --end 2026-09-06
+python backend\analysis\check_features.py --data-dir data\bars\BTCUSDT-... --horizon 900
+```
+
+The two tick importers below reconstruct an order book, because the features
+they feed operate on a horizon of seconds. This one does not, because the
+horizons this project has to trade are minutes, and at those horizons the tick
+data is both unnecessary and the expensive part: tick-level L2 history is a
+$1k/month product, and the one free source of it (Binance `bookTicker`) stopped
+being published on 2024-03-30.
+
+Everything else on `data.binance.vision` is still current, still free, and
+still needs no API key:
+
+| dataset | files | earliest | per day | what it carries |
+|---|---|---|---|---|
+| `klines/1m` | 2,442 | 2019-12-31 | 0.06 MB | OHLCV, trade count, taker buy volume |
+| `metrics` | 2,197 | 2020-09-01 | 0.01 MB | open interest, long/short ratios, taker ratio |
+| `premiumIndexKlines` | 2,443 | 2019-12-24 | small | premium / basis, i.e. funding |
+| `bookDepth` | 1,342 | 2023-01-01 | 0.49 MB | depth in bands around mid (opt-in) |
+
+Defaults to the last 365 days at one row every five minutes, writing a feature
+CSV in exactly the recorder's format — so `check_features.py`, `stats.py` and
+`compact.py` all work on it unchanged. Monthly archives are used wherever a
+whole calendar month is covered, which turns 2,442 requests into 80.
+
+**What it is worth, in the only unit that matters.** Six hours of live
+recording gives 16 independent observations at a 900s horizon. Forty days from
+this importer gives 3,838. The full archive gives roughly 234,000.
+
+### The lag that is not in Binance's documentation
+
+A `metrics` row timestamped T describes the window **[T, T+5min)** — not the
+window ending at T. Measured over 5,758 paired samples
+(2026-07-01..2026-07-20), `sum_taker_long_short_vol_ratio` has a Spearman of
+**+0.44** against the price move over the *next* five minutes and +0.25 against
+the *previous* five.
+
+An ordinary as-of join at T therefore hands the model five minutes of the
+future. The first run of this importer did exactly that, and it did not look
+like a bug — it looked like a discovery: `check_features.py` reported the
+feature at IC +0.25 and flagged it `SUSPICIOUS`, which is the same thing a real
+edge would look like to someone who wanted one.
+
+Every metrics lookup is now taken as-of `anchor - 5min`, and the lag is applied
+to the whole dataset rather than the one column it was proved on, because all
+eight share a `create_time` and the others cannot be verified independently.
+`test_bars_import.py` pins this.
+
+### bookDepth is opt-in, and should stay that way until someone checks it
+
+Its rows are cumulative depth in percentage bands either side of mid (±0.2, ±1,
+±2, ±3, ±4, ±5), roughly every 30 seconds. On the day sampled while writing
+this, the implied average price of the **positive**-percentage side
+(`notional / depth`) came out *below* the contemporaneous mid — which cannot be
+true of resting asks above the mid.
+
+So `--with-depth` prints that diagnostic on every run, and the features are
+named neutrally (`depth_imb_*` is the negative-percentage side minus the
+positive one) rather than `bid`/`ask`. Read the diagnostic before believing
+anything they tell you.
+
+### What it does not tell you
+
+The same caveat as the tick importers: this is Binance, not BloFin. Different
+venue, different participants, different fee schedule. Binance BTCUSDT perp is
+among the most heavily arbitraged instruments in existence, so an edge visible
+there is quite likely present on a less efficient venue — while an absence
+there is weak evidence either way. Confirm on BloFin data before trading.
+
+---
+
 ## Two importers — test the pipeline today, without waiting
 
 Both download free historical data and run it through the **same** OrderBook /

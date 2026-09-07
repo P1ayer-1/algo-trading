@@ -64,11 +64,12 @@ first. Recording is therefore step one, not step four.
 │   │   ├── rawlog.py          # raw event archive (gzipped JSONL)
 │   │   └── risk.py            # liquidation math, sizing, hard limits
 │   ├── analysis/              # offline tooling (see analysis/README.md)
+│   │   ├── bars_import.py     # free Binance bar/OI/funding history -> dataset
 │   │   ├── check_features.py  # do the features predict anything?
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (181 tests)
+│   └── tests/                 # pytest suite (203 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── features-*.csv         #   labelled features — regenerable
 │   └── raw/                   #   raw events — IRREPLACEABLE
@@ -205,7 +206,7 @@ cd backend
 python -m pytest
 ```
 
-181 tests covering the order book's gap handling, the OFI recursion, the
+203 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, and the evaluation statistics. They need
