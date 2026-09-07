@@ -3,3 +3,9 @@ __pycache__/
 .vscode/
 node_modules/
 *.egg-info/
+.pytest_cache/
+
+# Recorded feature data. These grow fast (~350k rows/day at the default
+# 250ms sample interval) and are machine-specific training data, not source.
+data/
+*.csv
