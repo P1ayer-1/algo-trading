@@ -158,7 +158,7 @@ class MicrostructureFeed:
                     if self.handle_message(message):
                         print(
                             "Order book desync "
-                            f"({self.book.last_gap_reason}) — resyncing."
+                            f"({self.book.last_gap_reason}) - resyncing."
                         )
                         break
 

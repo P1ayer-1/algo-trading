@@ -73,27 +73,123 @@ realistic weak edge, and against pure noise — a check that can only ever say
 
 ---
 
-## binance_import.py — test the pipeline today, without waiting
+## Two importers — test the pipeline today, without waiting
+
+Both download free historical data and run it through the **same** OrderBook /
+TradeTape / FeatureEngine / FeatureRecorder as the live bot, producing a
+feature CSV in the identical format. They share `importer_core.py`, so neither
+can drift from the other or from the live path.
+
+**Reach for `tardis_import.py` first.** It has real depth and current data.
+
+| | `tardis_import.py` | `binance_import.py` |
+|---|---|---|
+| Source | Tardis.dev free samples | data.binance.vision |
+| Venue | binance-futures (or bybit, bitget, okex-swap...) | Binance USDT-M |
+| Dates | **1st of any month**, to the present | **2023-05-16 … 2024-03-30 only** |
+| Book | 25 levels per side | top of book only |
+| Book rate | ~27/sec | ~470/sec |
+| Trades | ~3.6M/day | ~1.5M/day |
+| Full day | ~15–20 min | ~1 hour |
+| Account | none | none |
+
+### Why there are two
+
+Binance **stopped publishing `bookTicker`** after 2024-03-30 — daily and
+monthly both. `aggTrades`, `klines` and `bookDepth` are still current, but
+nothing on `data.binance.vision` carries top of book after that date, and spot
+never had it at all. So `binance_import.py` can only ever run on data that is
+now years stale. It is kept because it is the only free source with
+touch-resolution book updates, which matters for OFI.
+
+Tardis gives the 1st of every month away free, for every exchange and every
+data type, with no account and no API key. Every other day returns 401 unless
+you set `--api-key` / `$TARDIS_API_KEY`. Both importers check the date *before*
+downloading, so a wrong one costs a second rather than a 90 MB transfer.
+
+---
+
+### tardis_import.py — recent data, with real depth
 
 ```
-python backend\analysis\binance_import.py --date 2026-09-01 --hours 2
-python backend\analysis\check_features.py --data-dir data\binance --horizon 5 --cost-bps 6
+python backendnalysis	ardis_import.py --date 2026-09-01 --hours 2
+python backendnalysis\check_features.py ^
+    --data-dir data	ardisinance-futures-BTCUSDT-2026-09-01 ^
+    --horizon 5 --cost-bps 6
 ```
 
-Downloads free historical USDⓈ-M futures data from
-`https://data.binance.vision` (no API key, no account) and runs it through the
-**same** OrderBook / TradeTape / FeatureEngine / FeatureRecorder as the live
-bot, producing a feature CSV in the identical format.
+Two datasets per day: `book_snapshot_25` (25 levels per side, every book
+change) and `trades` (every trade, with the aggressor side).
 
-Two datasets per day:
-- `bookTicker` — every change to the best bid/ask, with sizes
-- `aggTrades` — every trade, with the aggressor side
+**This fixes the degraded columns.** `obi_5`, `obi_20`, `bid_depth_20` and
+`ask_depth_20` are all fully valid here — under `binance_import.py` `obi_5`
+and `obi_20` are literally copies of `obi_1`. Only `funding_rate` is still
+always 0; it is in neither dataset.
 
-**Runtime:** ~6k events/sec, so a full BTCUSDT day (20–40M updates) takes
-roughly an hour. `--hours 2` gives ~30k rows in about five minutes — start
-there.
+**The trade-off is time resolution at the touch.** Binance's archived
+bookTicker fired on every change to the best bid/ask (~470/sec). Tardis
+snapshots come from the depth stream at ~27/sec (median gap 26ms). OFI is
+defined purely on the touch, so it sees less churn here. At 250ms recorder
+sampling that is still ~7 book updates per row, which is workable — but if OFI
+specifically is what you are testing, run both and compare.
 
-### What it does and doesn't tell you
+`--exchange` takes any Tardis venue id, so `--exchange bybit` or
+`--exchange bitget-futures` works with no code change. **BloFin is not on
+Tardis**, so this is still a proxy, not the real thing.
+
+#### The sign convention
+
+Tardis normalises `side` to the **aggressor** (the liquidity taker) — the same
+convention BloFin uses and the same thing `TradeTape` expects, so this importer
+passes it through unchanged. `binance_import.py` must do the opposite, because
+Binance reports `is_buyer_maker`, which is the inverse. There are tests pinning
+both directions.
+
+---
+
+### binance_import.py — touch-resolution, but only up to 2024-03-30
+
+```
+python backendnalysisinance_import.py --date 2024-03-01 --hours 2
+python backendnalysis\check_features.py ^
+    --data-dir datainance\BTCUSDT-2024-03-01 --horizon 5 --cost-bps 6
+```
+
+Two datasets per day: `bookTicker` (every change to the best bid/ask, with
+sizes) and `aggTrades` (every trade). A full BTCUSDT day is 20–40M updates and
+takes roughly an hour; `--hours 2` gives ~30k rows in about five minutes.
+
+#### Degraded columns — bookTicker is top-of-book only
+
+| Column | Status |
+|---|---|
+| `obi_1`, `ofi_*`, `tfi_*`, `microprice`, `spread_bps`, `ret_*`, `rv_*` | fully valid |
+| `obi_5`, `obi_20` | **identical to `obi_1`** — no depth in this feed |
+| `bid_depth_20`, `ask_depth_20` | best-level size only |
+| `funding_rate` | always 0 — not in this dataset |
+
+Use `tardis_import.py` if you need those columns.
+
+---
+
+### One directory per import — and why
+
+Each run writes to its own directory by default:
+
+```
+data	ardisinance-futures-BTCUSDT-2026-09-01datainance\BTCUSDT-2024-03-01```
+
+This is not tidiness. `FeatureRecorder` names its file `features-<today>.csv`
+by **wall-clock** date and opens it in **append** mode. That is correct for
+live recording, where wall clock and market time are the same thing, and wrong
+for importing, where they are not — two imports run on the same afternoon
+would land in one file, ordered by when you ran them rather than by market
+time. `check_features.py` would then do a time-ordered, purged split on rows
+that are not in time order and report a number that means nothing, without
+complaining. Both importers refuse to start if the output directory already
+holds a feature CSV.
+
+### What these do and don't tell you
 
 Answers: does the pipeline work end to end on real data? Do OBI / OFI /
 trade-flow carry predictive information at all? How large is it, and does it
@@ -108,32 +204,13 @@ are competed down hard. A smaller venue like BloFin is generally *less*
 efficient — so a signal visible on Binance is quite likely present on BloFin
 too, while a signal absent on Binance is weak evidence either way.
 
-### Degraded columns — bookTicker is top-of-book only
+### If a format ever changes
 
-| Column | Status |
-|---|---|
-| `obi_1`, `ofi_*`, `tfi_*`, `microprice`, `spread_bps`, `ret_*`, `rv_*` | fully valid |
-| `obi_5`, `obi_20` | **identical to `obi_1`** — no depth in this feed |
-| `bid_depth_20`, `ask_depth_20` | best-level size only |
-| `funding_rate` | always 0 — not in this dataset |
-
-OFI is unaffected, which matters: it's defined purely on the touch and has the
-strongest theoretical basis of the features here. The importer prints this
-warning on every run.
-
-### If the format ever changes
-
-The parser reads column names from the header when present, falls back to
-documented positions when absent, auto-detects millisecond vs microsecond
-timestamps, and hard-validates the first 50 rows (bid < ask, plausible prices,
-plausible epoch). A layout change raises `SchemaError` with a clear message
-rather than producing a plausible-looking, wrong dataset.
-
-One convention worth knowing, since getting it backwards inverts every flow
-signal: Binance reports `is_buyer_maker`, which is the **inverse** of BloFin's
-`side`. `is_buyer_maker=true` means the buyer was passive, so the *aggressor
-was a seller*. The importer inverts it; there are tests pinning both
-directions.
+Both parsers read column names from the header, hard-validate the first 50
+rows (bid < ask, levels correctly sorted, plausible prices, plausible epoch),
+and auto-detect millisecond vs microsecond timestamps. A layout change raises
+`SchemaError` with a clear message rather than producing a plausible-looking,
+wrong dataset.
 
 ---
 

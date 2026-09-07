@@ -207,7 +207,7 @@ async def run_servers(
         if RECORD_RAW:
             print(f"Archiving raw events to:        {DATA_DIR / 'raw'}")
         else:
-            print("Raw archiving is OFF (BLOFIN_RECORD_RAW=false) — future "
+            print("Raw archiving is OFF (BLOFIN_RECORD_RAW=false) - future "
                   "features cannot be backfilled.")
 
     print("Press Ctrl+C to stop.")

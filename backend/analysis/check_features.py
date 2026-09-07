@@ -146,7 +146,7 @@ def build_matrix(
     if len(kept) < 500:
         raise SystemExit(
             f"Only {len(kept)} usable rows. Collect more data before drawing "
-            "any conclusion — a few minutes of recording proves nothing."
+            "any conclusion - a few minutes of recording proves nothing."
         )
 
     X = np.array(
@@ -202,7 +202,7 @@ def describe(
     if span_seconds < 6 * 3600:
         print(
             "\n  WARNING: under 6 hours of data. Results here are indicative at "
-            "best —\n  a single market session is not evidence of a persistent edge."
+            "best -\n  a single market session is not evidence of a persistent edge."
         )
     return interval, eff_n
 
@@ -290,7 +290,7 @@ def evaluate(
     train, test = purged_split(len(y), train_fraction=0.7, purge_rows=purge)
 
     print("\n" + "=" * 72)
-    print("OUT-OF-SAMPLE TEST  (time-ordered, purged — never shuffled)")
+    print("OUT-OF-SAMPLE TEST  (time-ordered, purged - never shuffled)")
     print("=" * 72)
     print(f"  train rows   {train.stop - train.start:,}")
     print(f"  purge gap    {purge:,} rows (~{horizon:g}s, so train labels cannot")
@@ -373,13 +373,13 @@ def economic_test(
         print("  NO SIGNAL. AUC is indistinguishable from a coin flip.")
         print("  Do not build a model on this. Options: collect more data across")
         print("  varied conditions, try a shorter horizon, or add features (queue")
-        print("  position, book slope, cross-venue) — the current set is not enough.")
+        print("  position, book slope, cross-venue) - the current set is not enough.")
     elif not tradeable:
         print("  STATISTICAL SIGNAL, BUT NOT TRADEABLE.")
         print(f"  The model predicts direction (AUC {model_auc:.3f}) but the moves it")
         print(f"  finds ({max(long_edge, short_edge):.3f} bps) are smaller than costs")
         print(f"  ({cost_bps:.3f} bps). This is the most common outcome, and it is a")
-        print("  real result — the edge exists but the fee schedule eats it.")
+        print("  real result - the edge exists but the fee schedule eats it.")
         print("  Next: maker-only execution to cut costs, or a longer horizon where")
         print("  moves are larger. Do NOT proceed to live trading.")
     else:
@@ -393,7 +393,7 @@ def economic_test(
     print(
         "\n  Remember this is a linear model on mid-price moves with no slippage,\n"
         "  no queue position, and no adverse selection. Live results will be\n"
-        "  worse than this — the only question is by how much."
+        "  worse than this - the only question is by how much."
     )
     return {
         "auc": model_auc,

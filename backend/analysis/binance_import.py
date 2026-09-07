@@ -1,8 +1,12 @@
 """Test the whole pipeline today, using free Binance historical data.
 
-    python backend\\analysis\\binance_import.py --date 2026-09-01 --hours 2
-    python backend\\analysis\\binance_import.py --date 2026-09-01
-    python backend\\analysis\\binance_import.py --symbol ETHUSDT --date 2026-09-01
+    python backend\\analysis\\binance_import.py --date 2024-03-01 --hours 2
+    python backend\\analysis\\binance_import.py --date 2024-03-01
+    python backend\\analysis\\binance_import.py --symbol ETHUSDT --date 2024-03-01
+
+**The date must be between 2023-05-16 and 2024-03-30.** Binance discontinued
+the bookTicker dataset after that; no free top-of-book feed exists for later
+dates. See BOOK_TICKER_LAST_DATE below.
 
 **Start with `--hours 2`.** A full BTCUSDT day is 20-40M book updates, and the
 feature engine processes ~6k events/sec, so a whole day takes roughly an hour.
@@ -23,7 +27,7 @@ Why this exists
 ---------------
 Waiting three days to find out whether the recorder, the feature engine and the
 evaluation all work end-to-end is a poor feedback loop. Binance publishes
-historical USDⓈ-M futures data publicly, free, with no API key, at
+historical USDT-M futures data publicly, free, with no API key, at
 https://data.binance.vision — so the pipeline can be exercised against real
 market data in about ten minutes.
 
@@ -76,21 +80,34 @@ import argparse
 import csv
 import io
 import sys
-import time
-import urllib.error
-import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from trading.features import FeatureEngine  # noqa: E402
-from trading.orderbook import OrderBook  # noqa: E402
-from trading.recorder import FeatureRecorder, LabelConfig  # noqa: E402
-from trading.tape import TradeTape  # noqa: E402
+from analysis.importer_core import (  # noqa: E402
+    Event,
+    SchemaError,
+    book_message,
+    build_features,
+    check_epoch_ms,
+    download,
+    ensure_clean_output,
+    print_summary,
+    trade_message,
+)
+from analysis.importer_core import normalise_timestamp as _normalise_timestamp  # noqa: E402
 
 BASE_URL = "https://data.binance.vision/data/futures/um/daily"
+
+# Binance STOPPED publishing bookTicker. The last daily file is 2024-03-30 (the
+# last monthly is 2024-04). aggTrades, klines and bookDepth are still current,
+# but there is no top-of-book feed after that date anywhere on the archive —
+# spot never had bookTicker at all. So this importer can only ever run inside
+# the window below. Verified against the bucket listing on 2026-09-07.
+BOOK_TICKER_FIRST_DATE = "2023-05-16"
+BOOK_TICKER_LAST_DATE = "2024-03-30"
 
 # Expected columns. Binance added header rows to these files at different
 # times, so the parser reads the header when present and falls back to these
@@ -103,73 +120,6 @@ AGG_TRADE_COLUMNS = [
     "agg_trade_id", "price", "quantity", "first_trade_id", "last_trade_id",
     "transact_time", "is_buyer_maker",
 ]
-
-
-class SchemaError(RuntimeError):
-    """Raised when a downloaded file doesn't look like what we expect.
-
-    Failing loudly matters more than usual here: a silently mis-parsed column
-    produces a feature file that looks perfectly normal and is entirely wrong.
-    """
-
-
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
-
-
-def download(url: str, destination: Path, *, force: bool = False) -> Path:
-    """Fetch a file unless it's already on disk. Streams to a .part file so an
-    interrupted download can never be mistaken for a complete one."""
-    if destination.exists() and destination.stat().st_size > 0 and not force:
-        print(f"  cached  {destination.name} "
-              f"({destination.stat().st_size / 1e6:.1f} MB)")
-        return destination
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    partial = destination.with_suffix(destination.suffix + ".part")
-    print(f"  fetching {url}")
-
-    started = time.time()
-    try:
-        with urllib.request.urlopen(url, timeout=120) as response:
-            total = int(response.headers.get("Content-Length", 0))
-            downloaded = 0
-            with partial.open("wb") as handle:
-                while True:
-                    chunk = response.read(1 << 20)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        percent = downloaded / total * 100
-                        print(f"\r    {downloaded/1e6:7.1f} / {total/1e6:.1f} MB "
-                              f"({percent:5.1f}%)", end="", flush=True)
-            print()
-    except urllib.error.HTTPError as exc:
-        partial.unlink(missing_ok=True)
-        if exc.code == 404:
-            raise SystemExit(
-                f"\nNot found: {url}\n"
-                "Binance publishes a day's file after that day closes (UTC), and\n"
-                "only for symbols that existed then. Try an earlier date, or check\n"
-                "the symbol spelling (BTCUSDT, not BTC-USDT)."
-            ) from exc
-        raise SystemExit(f"\nHTTP {exc.code} fetching {url}") from exc
-    except urllib.error.URLError as exc:
-        partial.unlink(missing_ok=True)
-        raise SystemExit(
-            f"\nCould not reach {url}: {exc.reason}\n"
-            "This needs plain internet access. If you are behind a proxy or VPN "
-            "that blocks it, download the file manually in a browser and place "
-            f"it at {destination}."
-        ) from exc
-
-    partial.replace(destination)
-    print(f"  saved   {destination.name} "
-          f"({destination.stat().st_size / 1e6:.1f} MB in {time.time() - started:.0f}s)")
-    return destination
 
 
 # ---------------------------------------------------------------------------
@@ -208,19 +158,6 @@ def _column_index(header: Optional[List[str]], expected: List[str]) -> Dict[str,
     return mapping
 
 
-def _normalise_timestamp(value: int) -> int:
-    """Return milliseconds.
-
-    Binance has used both milliseconds and microseconds across datasets and
-    eras. A millisecond timestamp for any plausible date is ~1.7e12; anything
-    at ~1.7e15 is microseconds. Guessing wrong here would silently scale every
-    horizon by 1000, so it is detected rather than assumed.
-    """
-    if value > 1e14:
-        return value // 1000
-    return value
-
-
 def read_zip_rows(path: Path, expected: List[str]) -> Iterator[Dict[str, str]]:
     """Yield dict rows from the single CSV inside a Binance daily zip."""
     with zipfile.ZipFile(path) as archive:
@@ -252,14 +189,14 @@ def read_zip_rows(path: Path, expected: List[str]) -> Iterator[Dict[str, str]]:
                 yield {name: row[position] for name, position in index.items()}
 
 
-def book_events(path: Path, limit_ms: Optional[int]) -> List[Tuple[int, int, dict]]:
+def book_events(path: Path, limit_ms: Optional[int]) -> List[Event]:
     """Convert bookTicker rows into book snapshot messages.
 
     Each row is emitted as a full `snapshot` with one level per side. That is
     honest about what the data contains — there is no depth to invent — and it
     sidesteps sequence handling entirely, since every row is self-contained.
     """
-    events: List[Tuple[int, int, dict]] = []
+    events: List[Event] = []
     first_ts: Optional[int] = None
     checked = 0
 
@@ -289,33 +226,20 @@ def book_events(path: Path, limit_ms: Optional[int]) -> List[Tuple[int, int, dic
                     f"{path.name}: bid {bid} >= ask {ask} on row {checked}. "
                     "best_bid_price and best_ask_price are likely swapped."
                 )
-            if not (1_000_000_000_000 < ts < 4_000_000_000_000):
-                raise SchemaError(
-                    f"{path.name}: timestamp {ts} is not a plausible "
-                    "millisecond epoch. Check the transaction_time column."
-                )
+            check_epoch_ms(ts, f"{path.name} row {checked}")
 
         if first_ts is None:
             first_ts = ts
         if limit_ms is not None and ts - first_ts > limit_ms:
             break
 
-        events.append((ts, len(events), {
-            "arg": {"channel": "books", "instId": "BINANCE"},
-            "action": "snapshot",
-            "data": {
-                "bids": [[bid, bid_qty]],
-                "asks": [[ask, ask_qty]],
-                "ts": str(ts),
-                "seqId": str(len(events) + 1),
-                "prevSeqId": "0",
-            },
-        }))
+        events.append((ts, len(events), book_message(
+            [[bid, bid_qty]], [[ask, ask_qty]], ts, len(events) + 1)))
 
     return events
 
 
-def trade_events(path: Path, limit_ms: Optional[int]) -> List[Tuple[int, int, dict]]:
+def trade_events(path: Path, limit_ms: Optional[int]) -> List[Event]:
     """Convert aggTrades rows into trade messages.
 
     THE SIGN CONVENTION, because getting it wrong inverts every flow signal:
@@ -330,7 +254,7 @@ def trade_events(path: Path, limit_ms: Optional[int]) -> List[Tuple[int, int, di
 
     So the mapping inverts. `TradeTape` expects the aggressor, matching BloFin.
     """
-    events: List[Tuple[int, int, dict]] = []
+    events: List[Event] = []
     first_ts: Optional[int] = None
 
     for row in read_zip_rows(path, AGG_TRADE_COLUMNS):
@@ -354,16 +278,9 @@ def trade_events(path: Path, limit_ms: Optional[int]) -> List[Tuple[int, int, di
         if limit_ms is not None and ts - first_ts > limit_ms:
             break
 
-        events.append((ts, len(events), {
-            "arg": {"channel": "trades", "instId": "BINANCE"},
-            "data": [{
-                "price": str(price),
-                "size": str(quantity),
-                # The inversion described above.
-                "side": "sell" if buyer_was_maker else "buy",
-                "ts": str(ts),
-            }],
-        }))
+        # The inversion described above.
+        side = "sell" if buyer_was_maker else "buy"
+        events.append((ts, len(events), trade_message(price, quantity, side, ts)))
 
     return events
 
@@ -393,45 +310,10 @@ def convert(
     trades = trade_events(trade_path, limit_ms)
     print(f"  {len(trades):,} trades")
 
-    if not books:
-        raise SystemExit("No usable book updates were parsed.")
-
-    # Interleave by (timestamp, per-stream order). Both streams are already
-    # sorted, so this restores true event order across them.
-    print("Merging and computing features...")
-    merged = sorted(books + trades, key=lambda item: (item[0], item[1]))
-
-    book, tape, engine = OrderBook(), TradeTape(), FeatureEngine()
-    recorder = FeatureRecorder(
-        out_dir,
-        label_config=LabelConfig(horizons_seconds=horizons, threshold_bps=threshold_bps),
-        sample_interval_ms=sample_ms,
+    return build_features(
+        books, trades, out_dir,
+        sample_ms=sample_ms, horizons=horizons, threshold_bps=threshold_bps,
     )
-
-    processed = 0
-    try:
-        for _, _, message in merged:
-            channel = message["arg"]["channel"]
-            if channel == "books":
-                book.apply(message)
-                if book.is_ready and not book.is_crossed():
-                    engine.on_book_event(book)
-                    recorder.observe(engine.compute(book, tape))
-            else:
-                if tape.add_message(message["data"]):
-                    recorder.observe(engine.compute(book, tape))
-            processed += 1
-            if processed % 500_000 == 0:
-                print(f"  {processed:,} / {len(merged):,} events "
-                      f"({recorder.rows_written:,} rows written)")
-    finally:
-        recorder.close()
-
-    stats = dict(recorder.stats())
-    stats["events"] = processed
-    stats["books"] = len(books)
-    stats["trades"] = len(trades)
-    return stats
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -441,7 +323,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Binance symbol, e.g. BTCUSDT (no dash).")
     parser.add_argument("--date", required=True, help="YYYY-MM-DD (UTC).")
     parser.add_argument("--out", type=Path, default=None,
-                        help="Output dir (default data/binance).")
+                        help="Output dir (default data/binance/<symbol>-<date>). "
+                             "One directory per import, because the recorder "
+                             "names files by today's date and appends.")
     parser.add_argument("--cache", type=Path, default=None,
                         help="Where to keep downloaded zips (default data/binance/zips).")
     parser.add_argument("--hours", type=float, default=None,
@@ -453,19 +337,48 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--force", action="store_true", help="Re-download.")
     args = parser.parse_args(argv)
 
-    out_dir = args.out or repo_root / "data" / "binance"
-    cache = args.cache or out_dir / "zips"
+    out_dir = args.out or repo_root / "data" / "binance" / f"{args.symbol}-{args.date}"
+    cache = args.cache or repo_root / "data" / "binance" / "zips"
     horizons = tuple(float(part) for part in args.horizons.split(",") if part.strip())
 
-    print(f"Binance {args.symbol} {args.date} (USDⓈ-M futures)")
+    print(f"Binance {args.symbol} {args.date} (USDT-M futures)")
     print("=" * 66)
+
+    # Fail before downloading a few hundred MB of aggTrades that can't be
+    # paired with a book. See BOOK_TICKER_LAST_DATE above for why the window
+    # is closed at both ends.
+    if not BOOK_TICKER_FIRST_DATE <= args.date <= BOOK_TICKER_LAST_DATE:
+        raise SystemExit(
+            f"\n{args.date} is outside the range this importer can use.\n\n"
+            f"Binance only published bookTicker between {BOOK_TICKER_FIRST_DATE} "
+            f"and {BOOK_TICKER_LAST_DATE}.\n"
+            "It was discontinued after that, and nothing else on "
+            "data.binance.vision\ncarries top of book - aggTrades still runs to "
+            "the present, but trades\nalone give no book, so OBI, OFI, spread and "
+            "microprice cannot be computed.\n\n"
+            "Pick a date inside the window:\n"
+            "  python backend\\analysis\\binance_import.py --date 2024-03-01 "
+            "--hours 2\n\n"
+            "For recent data you need your own depth source: the BloFin recorder, "
+            "or\na paid archive such as Tardis."
+        )
+
+    ensure_clean_output(out_dir)
 
     book_url = (f"{BASE_URL}/bookTicker/{args.symbol}/"
                 f"{args.symbol}-bookTicker-{args.date}.zip")
     trade_url = (f"{BASE_URL}/aggTrades/{args.symbol}/"
                  f"{args.symbol}-aggTrades-{args.date}.zip")
 
-    book_path = download(book_url, cache / Path(book_url).name, force=args.force)
+    book_path = download(
+        book_url, cache / Path(book_url).name, force=args.force,
+        not_found_hint=(
+            f"{args.symbol} has no bookTicker file for {args.date}. The dataset "
+            f"only exists\nbetween {BOOK_TICKER_FIRST_DATE} and "
+            f"{BOOK_TICKER_LAST_DATE}, and only for symbols listed at the time.\n"
+            "Check the spelling (BTCUSDT, not BTC-USDT)."
+        ),
+    )
     trade_path = download(trade_url, cache / Path(trade_url).name, force=args.force)
 
     stats = convert(
@@ -474,14 +387,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         horizons=horizons, threshold_bps=args.threshold_bps,
     )
 
-    print("\n" + "=" * 66)
-    print(f"  events processed  {stats['events']:,}")
-    print(f"  rows written      {stats['rowsWritten']:,}")
-    print(f"  rows dropped      {stats['rowsDropped']:,} (no observable future)")
-    print(f"  output            {out_dir}")
+    print_summary(stats, out_dir)
 
     print("\n" + "!" * 66)
-    print("  DEGRADED COLUMNS — bookTicker is top-of-book only:")
+    print("  DEGRADED COLUMNS - bookTicker is top-of-book only:")
     print("    obi_5, obi_20            identical to obi_1 (no depth available)")
     print("    bid_depth_20/ask_depth_20  best-level size only")
     print("    funding_rate             always 0 (not in this dataset)")

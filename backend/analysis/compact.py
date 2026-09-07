@@ -145,7 +145,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ImportError:
         print("pyarrow is not installed, so nothing was converted.\n"
               "  pip install pyarrow\n"
-              "Your CSVs are untouched. Note you probably don't need this yet — "
+              "Your CSVs are untouched. Note you probably don't need this yet - "
               "see the module docstring.")
         report(args.data_dir)
         return 1
@@ -166,7 +166,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"    removed {path.name}")
         except Exception as exc:
             # Never delete a CSV whose conversion failed.
-            print(f"  {path.name}: FAILED ({exc}) — left in place")
+            print(f"  {path.name}: FAILED ({exc}) - left in place")
 
     print(f"\nConverted {converted}/{len(files)} file(s).\n")
     report(args.data_dir)
