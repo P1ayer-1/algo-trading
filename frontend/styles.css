@@ -122,6 +122,119 @@ th:first-child {
   color: var(--resistance);
 }
 
+/* --- Microstructure panel -------------------------------------------------
+   The imbalance bars are centred on zero: the fill grows right for buy-side
+   pressure and left for sell-side, so direction is readable at a glance
+   without reading the number. */
+
+.feed-state {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+
+.feed-state.ok {
+  color: var(--support);
+  border-color: color-mix(in srgb, var(--support) 40%, var(--border));
+}
+
+.feed-state.warn {
+  color: var(--current);
+  border-color: color-mix(in srgb, var(--current) 40%, var(--border));
+}
+
+.feed-state.bad {
+  color: var(--resistance);
+  border-color: color-mix(in srgb, var(--resistance) 40%, var(--border));
+}
+
+.signal {
+  margin-bottom: 10px;
+}
+
+.signal-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 3px;
+}
+
+.signal-head .label {
+  color: var(--muted);
+}
+
+.signal-head .value {
+  font-variant-numeric: tabular-nums;
+}
+
+.bar {
+  position: relative;
+  height: 6px;
+  background: #0d1216;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+/* The zero marker sits dead centre; fills grow outward from it. */
+.bar::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.bar .fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--support);
+}
+
+.bar .fill.negative {
+  background: var(--resistance);
+}
+
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-row .label {
+  color: var(--muted);
+}
+
+.regime {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.regime.high_vol {
+  color: var(--resistance);
+}
+
+.regime.low_vol {
+  color: var(--support);
+}
+
+.regime.normal_vol {
+  color: var(--price);
+}
+
 @media (max-width: 860px) {
   main {
     grid-template-columns: 1fr;
