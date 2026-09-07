@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import math
 import time
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -99,13 +100,81 @@ class FeatureSnapshot:
         return asdict(self)
 
 
+class _Series:
+    """Time-ordered samples supporting O(log n) windowed sums.
+
+    Exists for one reason: performance. The obvious implementation of these
+    features rescans the whole history on every event — `sum(x for ts, x in
+    history if ts >= cutoff)`. With a 300-second window that is fine at
+    BloFin's ~10 book updates/second, but it is quadratic in the event rate,
+    and on a fast feed (Binance bookTicker runs at 200-400 updates/second, so
+    the window holds ~100k samples) `compute()` degrades to ~1000 events/sec —
+    slow enough that replaying one day takes hours.
+
+    Instead: timestamps are appended in order, so `bisect` finds a window
+    boundary in O(log n), and a running cumulative sum turns a windowed sum
+    into one subtraction. Old samples are dropped in batches, because deleting
+    from the front of a list one element at a time is itself O(n).
+    """
+
+    __slots__ = ("ts", "values", "_cumulative")
+
+    # Only compact once there is a worthwhile amount to drop; each compaction
+    # is O(n) and doing it per event would reintroduce the original problem.
+    _COMPACT_THRESHOLD = 4096
+
+    def __init__(self) -> None:
+        self.ts: List[int] = []
+        self.values: List[float] = []
+        # _cumulative[i] == sum(values[:i]), so it is always one longer.
+        self._cumulative: List[float] = [0.0]
+
+    def __len__(self) -> int:
+        return len(self.ts)
+
+    def append(self, ts: int, value: float) -> None:
+        self.ts.append(ts)
+        self.values.append(value)
+        self._cumulative.append(self._cumulative[-1] + value)
+
+    def sum_since(self, cutoff_ts: int) -> float:
+        """Sum of values with ts >= cutoff_ts."""
+        index = bisect_left(self.ts, cutoff_ts)
+        return self._cumulative[-1] - self._cumulative[index]
+
+    def index_since(self, cutoff_ts: int) -> int:
+        return bisect_left(self.ts, cutoff_ts)
+
+    def value_at_or_before(self, target_ts: int) -> Optional[float]:
+        """Most recent value at or before target_ts, or None if the history
+        does not reach back that far."""
+        index = bisect_right(self.ts, target_ts) - 1
+        if index < 0:
+            return None
+        return self.values[index]
+
+    def compact(self, cutoff_ts: int) -> None:
+        index = bisect_left(self.ts, cutoff_ts)
+        if index < self._COMPACT_THRESHOLD:
+            return
+        del self.ts[:index]
+        del self.values[:index]
+        base = self._cumulative[index]
+        self._cumulative = [value - base for value in self._cumulative[index:]]
+
+    def pairs(self) -> List[Tuple[int, float]]:
+        """(ts, value) tuples. O(n) — for diagnostics and tests, not the hot
+        path."""
+        return list(zip(self.ts, self.values))
+
+
 class FeatureEngine:
     """Stateful feature calculator.
 
     Call `on_book_event()` / `on_trade_event()` as messages arrive, then
-    `compute()` to get a snapshot. Keeping the rolling state here (rather than
-    recomputing from raw history) is what makes this cheap enough to run on
-    every one of the ~10 book updates per second.
+    `compute()` to get a snapshot. Rolling state is kept incrementally, and
+    every windowed query is O(log n) via `_Series` — so `compute()` costs the
+    same whether the feed delivers 10 or 1000 updates per second.
     """
 
     def __init__(
@@ -117,12 +186,14 @@ class FeatureEngine:
     ):
         self.history_ms = int(history_seconds * 1000)
 
-        # (ts_ms, mid) — drives returns and realized volatility.
-        self.mid_history: Deque[Tuple[int, float]] = deque()
-
-        # (ts_ms, ofi_increment) — OFI is an accumulating quantity, so we keep
-        # the increments and sum over whatever window the caller wants.
-        self.ofi_history: Deque[Tuple[int, float]] = deque()
+        # Mid prices, driving returns and realized volatility.
+        self._mid = _Series()
+        # Squared log returns between consecutive mids, kept alongside so that
+        # realized variance over a window is a single cumulative subtraction
+        # rather than a rescan.
+        self._squared_returns = _Series()
+        # OFI increments; OFI over a window is their sum.
+        self._ofi = _Series()
         self.ofi_window_ms = int(ofi_window_seconds * 1000)
 
         # Previous top-of-book, needed for the OFI recursion.
@@ -137,6 +208,18 @@ class FeatureEngine:
         self.funding_rate: float = 0.0
         self.funding_time_ms: int = 0
         self.last_book_ts: int = 0
+
+    # ---- compatibility views --------------------------------------------
+    # Both are O(n) and exist for tests and diagnostics. Never call them per
+    # event — that is exactly the pattern `_Series` was written to remove.
+
+    @property
+    def mid_history(self) -> List[Tuple[int, float]]:
+        return self._mid.pairs()
+
+    @property
+    def ofi_history(self) -> List[Tuple[int, float]]:
+        return self._ofi.pairs()
 
     # ---- event handlers --------------------------------------------------
 
@@ -153,12 +236,20 @@ class FeatureEngine:
         self.last_book_ts = ts
 
         increment = self._ofi_increment(bid, bid_size, ask, ask_size)
-        self.ofi_history.append((ts, increment))
+        self._ofi.append(ts, increment)
 
         self._prev_bid, self._prev_bid_size = bid, bid_size
         self._prev_ask, self._prev_ask_size = ask, ask_size
 
-        self.mid_history.append((ts, (bid + ask) / 2.0))
+        mid = (bid + ask) / 2.0
+        # Squared log return against the previous mid, accumulated here so
+        # realized volatility never has to recompute it.
+        previous = self._mid.values[-1] if self._mid.values else None
+        if previous is not None and previous > 0 and mid > 0:
+            self._squared_returns.append(ts, math.log(mid / previous) ** 2)
+        else:
+            self._squared_returns.append(ts, 0.0)
+        self._mid.append(ts, mid)
         self._trim(ts)
 
     def _ofi_increment(
@@ -211,11 +302,9 @@ class FeatureEngine:
 
     def _trim(self, now_ms: int) -> None:
         cutoff = now_ms - self.history_ms
-        while self.mid_history and self.mid_history[0][0] < cutoff:
-            self.mid_history.popleft()
-        ofi_cutoff = now_ms - max(self.ofi_window_ms, 60_000)
-        while self.ofi_history and self.ofi_history[0][0] < ofi_cutoff:
-            self.ofi_history.popleft()
+        self._mid.compact(cutoff)
+        self._squared_returns.compact(cutoff)
+        self._ofi.compact(now_ms - max(self.ofi_window_ms, 60_000))
 
     # ---- primitives ------------------------------------------------------
 
@@ -226,15 +315,9 @@ class FeatureEngine:
         explicit None than a return computed against a bogus anchor.
         """
         target = ts - int(seconds * 1000)
-        if not self.mid_history or self.mid_history[0][0] > target:
+        if not self._mid.ts or self._mid.ts[0] > target:
             return None
-        result = None
-        for sample_ts, mid in self.mid_history:
-            if sample_ts <= target:
-                result = mid
-            else:
-                break
-        return result
+        return self._mid.value_at_or_before(target)
 
     def _return_bps(self, ts: int, current_mid: float, seconds: float) -> float:
         past = self._mid_at(ts, seconds)
@@ -253,24 +336,21 @@ class FeatureEngine:
         frequency itself spikes during volatility.
         """
         cutoff = ts - int(seconds * 1000)
-        samples = [(t, m) for t, m in self.mid_history if t >= cutoff and m > 0]
-        if len(samples) < 3:
+        start = self._mid.index_since(cutoff)
+        if len(self._mid.ts) - start < 3:
             return 0.0
 
-        total = 0.0
-        for index in range(1, len(samples)):
-            previous, current = samples[index - 1][1], samples[index][1]
-            if previous > 0 and current > 0:
-                total += math.log(current / previous) ** 2
-
-        elapsed = (samples[-1][0] - samples[0][0]) / 1000.0
+        # Squared returns were accumulated at append time. The first sample in
+        # the window carries the return from *before* it, which belongs to the
+        # previous window, so sum from start + 1.
+        total = self._squared_returns.sum_since(self._mid.ts[start + 1])
+        elapsed = (self._mid.ts[-1] - self._mid.ts[start]) / 1000.0
         if elapsed <= 0:
             return 0.0
         return math.sqrt(total / elapsed)
 
     def _ofi_sum(self, ts: int, seconds: float) -> float:
-        cutoff = ts - int(seconds * 1000)
-        return sum(value for sample_ts, value in self.ofi_history if sample_ts >= cutoff)
+        return self._ofi.sum_since(ts - int(seconds * 1000))
 
     @staticmethod
     def _obi(bid_volume: float, ask_volume: float) -> float:
@@ -374,10 +454,8 @@ class FeatureEngine:
                 0.0, (self.funding_time_ms - snapshot.ts) / 1000.0
             )
 
-        if self.mid_history:
-            snapshot.history_seconds = round(
-                (ts - self.mid_history[0][0]) / 1000.0, 2
-            )
+        if self._mid.ts:
+            snapshot.history_seconds = round((ts - self._mid.ts[0]) / 1000.0, 2)
 
         # Latency between the exchange stamping the book and us processing it.
         snapshot.book_age_ms = max(0, now - ts)

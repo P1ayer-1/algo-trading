@@ -73,6 +73,70 @@ realistic weak edge, and against pure noise — a check that can only ever say
 
 ---
 
+## binance_import.py — test the pipeline today, without waiting
+
+```
+python backend\analysis\binance_import.py --date 2026-09-01 --hours 2
+python backend\analysis\check_features.py --data-dir data\binance --horizon 5 --cost-bps 6
+```
+
+Downloads free historical USDⓈ-M futures data from
+`https://data.binance.vision` (no API key, no account) and runs it through the
+**same** OrderBook / TradeTape / FeatureEngine / FeatureRecorder as the live
+bot, producing a feature CSV in the identical format.
+
+Two datasets per day:
+- `bookTicker` — every change to the best bid/ask, with sizes
+- `aggTrades` — every trade, with the aggressor side
+
+**Runtime:** ~6k events/sec, so a full BTCUSDT day (20–40M updates) takes
+roughly an hour. `--hours 2` gives ~30k rows in about five minutes — start
+there.
+
+### What it does and doesn't tell you
+
+Answers: does the pipeline work end to end on real data? Do OBI / OFI /
+trade-flow carry predictive information at all? How large is it, and does it
+survive costs?
+
+Does **not** answer: whether an edge exists *on BloFin*. Different venue, fees,
+tick size, and participants.
+
+The direction of the bias is worth knowing. Binance BTCUSDT perp is among the
+most liquid and most heavily arbitraged instruments anywhere, so edges there
+are competed down hard. A smaller venue like BloFin is generally *less*
+efficient — so a signal visible on Binance is quite likely present on BloFin
+too, while a signal absent on Binance is weak evidence either way.
+
+### Degraded columns — bookTicker is top-of-book only
+
+| Column | Status |
+|---|---|
+| `obi_1`, `ofi_*`, `tfi_*`, `microprice`, `spread_bps`, `ret_*`, `rv_*` | fully valid |
+| `obi_5`, `obi_20` | **identical to `obi_1`** — no depth in this feed |
+| `bid_depth_20`, `ask_depth_20` | best-level size only |
+| `funding_rate` | always 0 — not in this dataset |
+
+OFI is unaffected, which matters: it's defined purely on the touch and has the
+strongest theoretical basis of the features here. The importer prints this
+warning on every run.
+
+### If the format ever changes
+
+The parser reads column names from the header when present, falls back to
+documented positions when absent, auto-detects millisecond vs microsecond
+timestamps, and hard-validates the first 50 rows (bid < ask, plausible prices,
+plausible epoch). A layout change raises `SchemaError` with a clear message
+rather than producing a plausible-looking, wrong dataset.
+
+One convention worth knowing, since getting it backwards inverts every flow
+signal: Binance reports `is_buyer_maker`, which is the **inverse** of BloFin's
+`side`. `is_buyer_maker=true` means the buyer was passive, so the *aggressor
+was a seller*. The importer inverts it; there are tests pinning both
+directions.
+
+---
+
 ## replay.py — rebuild features from the raw archive
 
 ```

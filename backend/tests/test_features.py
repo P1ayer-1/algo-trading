@@ -420,3 +420,127 @@ def test_snapshot_ts_is_exchange_time_not_wall_clock():
     assert snapshot.ts == 1_700_000_000_000
     assert snapshot.received_ts > snapshot.ts  # wall clock is "now", not 2023
     assert snapshot.book_age_ms == snapshot.received_ts - snapshot.ts
+
+
+# ---------------------------------------------------------------------------
+# _Series — the O(log n) windowed-query structure
+# ---------------------------------------------------------------------------
+
+
+def test_series_sum_since_matches_a_naive_filter():
+    from trading.features import _Series
+
+    series = _Series()
+    for index in range(500):
+        series.append(1000 + index * 10, float(index))
+    for cutoff in (1000, 2500, 4000, 5990, 99999):
+        naive = sum(v for t, v in zip(series.ts, series.values) if t >= cutoff)
+        assert series.sum_since(cutoff) == pytest.approx(naive)
+
+
+def test_series_value_at_or_before():
+    from trading.features import _Series
+
+    series = _Series()
+    for index in range(10):
+        series.append(100 + index * 10, float(index))
+    assert series.value_at_or_before(145) == 4.0   # 140 is the latest <= 145
+    assert series.value_at_or_before(140) == 4.0   # inclusive
+    assert series.value_at_or_before(99) is None   # before all history
+
+
+def test_series_compaction_preserves_sums():
+    """Compaction rebases the cumulative sums; if it were wrong, every
+    windowed value would silently drift after the first compaction."""
+    from trading.features import _Series
+
+    series = _Series()
+    for index in range(20_000):
+        series.append(1000 + index, 1.0)
+
+    before = series.sum_since(19_000)
+    series.compact(15_000)
+    assert len(series.ts) < 20_000, "expected compaction to drop old samples"
+    assert series.sum_since(19_000) == pytest.approx(before)
+
+
+def test_series_does_not_compact_below_the_threshold():
+    from trading.features import _Series
+
+    series = _Series()
+    for index in range(100):
+        series.append(1000 + index, 1.0)
+    series.compact(1099)
+    assert len(series.ts) == 100  # too few to be worth an O(n) rebuild
+
+
+# ---------------------------------------------------------------------------
+# The fast path must equal the naive path
+# ---------------------------------------------------------------------------
+
+
+def _naive_realized_vol(pairs, ts, seconds):
+    cutoff = ts - int(seconds * 1000)
+    samples = [(t, m) for t, m in pairs if t >= cutoff and m > 0]
+    if len(samples) < 3:
+        return 0.0
+    total = sum(
+        math.log(samples[i][1] / samples[i - 1][1]) ** 2
+        for i in range(1, len(samples))
+        if samples[i - 1][1] > 0 and samples[i][1] > 0
+    )
+    elapsed = (samples[-1][0] - samples[0][0]) / 1000.0
+    return math.sqrt(total / elapsed) if elapsed > 0 else 0.0
+
+
+def _naive_ofi_sum(pairs, ts, seconds):
+    cutoff = ts - int(seconds * 1000)
+    return sum(v for t, v in pairs if t >= cutoff)
+
+
+def test_incremental_volatility_equals_a_full_rescan():
+    """Regression guard for the O(log n) rewrite.
+
+    The engine accumulates squared returns incrementally instead of rescanning
+    history. This pins that the optimisation did not change the numbers — a
+    silent drift here would alter every recorded feature.
+    """
+    import random
+
+    random.seed(3)
+    engine = FeatureEngine()
+    mid = 60000.0
+    base = 1_757_000_000_000
+    for index in range(1200):
+        mid += random.gauss(0, 0.7)
+        engine.on_book_event(book_with_mid(round(mid, 4), ts=base + index * 20))
+
+    pairs = engine.mid_history
+    ts = base + 1199 * 20
+    for seconds in (10.0, 60.0):
+        assert engine._realized_vol(ts, seconds) == pytest.approx(
+            _naive_realized_vol(pairs, ts, seconds), abs=1e-12
+        )
+
+
+def test_incremental_ofi_equals_a_full_rescan():
+    import random
+
+    random.seed(4)
+    engine = FeatureEngine()
+    mid = 60000.0
+    base = 1_757_000_000_000
+    for index in range(1200):
+        mid += random.gauss(0, 0.7)
+        engine.on_book_event(
+            book_at(round(mid - 0.05, 4), random.uniform(1, 20),
+                    round(mid + 0.05, 4), random.uniform(1, 20),
+                    ts=base + index * 20)
+        )
+
+    pairs = engine.ofi_history
+    ts = base + 1199 * 20
+    for seconds in (1.0, 5.0):
+        assert engine._ofi_sum(ts, seconds) == pytest.approx(
+            _naive_ofi_sum(pairs, ts, seconds), abs=1e-9
+        )
