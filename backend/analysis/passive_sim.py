@@ -70,6 +70,7 @@ necessarily BloFin. Fill rates are a property of a specific venue's queue.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +95,23 @@ except Exception:  # pragma: no cover - keeps the analysis tools standalone
     ROUND_TRIP_MAKER_BPS = 1.2
 
 SIDES = ("bid", "ask")
+
+
+def clears_fee_gate(spread_bps: float) -> bool:
+    """Can a passive round trip on this instrument cover its own fees?
+
+    A passive round trip captures the WHOLE spread — half on the way in
+    against mid, half on the way out — and pays a maker fee on each leg. So
+    the bar is `spread >= round trip`, and an instrument below it loses on
+    arithmetic before adverse selection, queue position or any signal is
+    involved.
+
+    This is the cheapest and most decisive test in the project, which is why
+    it lives in one function that both `passive_sim` and `spread_survey`
+    call rather than being re-derived in each.
+    """
+    return spread_bps >= ROUND_TRIP_MAKER_BPS
+
 
 # The three fill rules, in the order they are reported. "cancel-adj" is the
 # pessimistic rule with the queue shrunk by the measured cancellation share —
@@ -713,7 +731,7 @@ def report_economics(table: Dict[str, Tuple[np.ndarray, np.ndarray, int]],
                      fills: Dict[Tuple[str, str], np.ndarray],
                      horizons_s: Sequence[float],
                      decision_horizon: float,
-                     half_spread_bps: float) -> None:
+                     spread_bps: float) -> None:
     column = int(np.argmin(np.abs(np.asarray(horizons_s) - decision_horizon)))
     horizon = horizons_s[column]
 
@@ -721,18 +739,22 @@ def report_economics(table: Dict[str, Tuple[np.ndarray, np.ndarray, int]],
     print(f"ECONOMICS AT {horizon:g}s  (the number that decides)")
     print("=" * 72)
 
-    # Do this arithmetic before reading anything below it. Providing liquidity
-    # earns the half spread and nothing else; if that is smaller than the fee,
-    # a flawless fill with zero adverse selection still loses, and no queue
-    # assumption, signal or horizon can change it. On a one-tick-wide
-    # instrument this is usually the whole story.
-    starved = half_spread_bps < ROUND_TRIP_MAKER_BPS
-    print(f"  median half spread             {half_spread_bps:>7.3f} bps  "
-          "<- the most a passive fill can capture")
+    # Do this arithmetic before reading anything below it.
+    #
+    # A passive round trip captures the WHOLE spread — half on the way in
+    # against mid, half on the way out — and pays two maker fees. So the gate
+    # is `spread > round trip`, not `half spread > round trip`: comparing one
+    # leg's capture against two legs' cost is too strict by a factor of two.
+    # It makes no difference on a one-tick instrument where the answer is
+    # hopeless either way, and it is exactly wrong for any instrument sitting
+    # near the threshold — which is the only population worth searching.
+    starved = not clears_fee_gate(spread_bps)
+    print(f"  median spread                  {spread_bps:>7.3f} bps  "
+          "<- a passive round trip captures all of it")
     print(f"  round trip, both legs passive  {ROUND_TRIP_MAKER_BPS:>7.3f} bps  "
           f"({MAKER_BPS:.2f} per leg)")
-    print(f"  a flawless fill, marked out instantly, earns "
-          f"{half_spread_bps - ROUND_TRIP_MAKER_BPS:+.3f} bps")
+    print(f"  headroom before adverse selection is even involved: "
+          f"{spread_bps - ROUND_TRIP_MAKER_BPS:+.3f} bps")
     if starved:
         print("  The spread does not cover the fee. Everything below is "
               "measuring how\n  much worse than that it gets.")
@@ -760,6 +782,19 @@ def report_economics(table: Dict[str, Tuple[np.ndarray, np.ndarray, int]],
           "before\n  you know whether it fills. It is not an hourly rate: "
           "quotes overlap.")
 
+    # `gross` is marked out against MID, so it credits the entry's half spread
+    # and assumes the exit happens at mid — while `net` charges a maker fee for
+    # that exit. A genuinely passive exit would also earn the other half
+    # spread. That credit is stated rather than folded in, because this
+    # simulator does not model the exit fill, and an exit resting at the touch
+    # is subject to exactly the adverse selection measured above.
+    print(f"\n  A passive EXIT would add back the other half spread "
+          f"(+{spread_bps / 2.0:.3f} bps),\n  giving "
+          f"{net_by_model['pessimistic'] + spread_bps / 2.0:+.3f} pessimistic / "
+          f"{net_by_model['optimistic'] + spread_bps / 2.0:+.3f} optimistic. "
+          "That exit is not\n  simulated, and it faces the same adverse "
+          "selection the entry just did.")
+
     print("\n" + "=" * 72)
     print("VERDICT")
     print("=" * 72)
@@ -784,13 +819,14 @@ def report_economics(table: Dict[str, Tuple[np.ndarray, np.ndarray, int]],
     elif starved:
         print("  THE SPREAD NEVER COVERED THE FEE")
         print(f"  Net {optimistic:+.3f} bps even at the FRONT of the queue, and "
-              f"{half_spread_bps - ROUND_TRIP_MAKER_BPS:+.3f} of\n  that was "
-              "lost before a single fill was adversely selected. This is not a "
+              f"{spread_bps - ROUND_TRIP_MAKER_BPS:+.3f} of\n  that was lost "
+              "before a single fill was adversely selected. This is not a "
               "queue\n  problem or a signal problem — it is arithmetic.")
-        print("  A one-tick spread on a heavily arbitraged instrument cannot "
-              "pay a maker\n  fee. Look at a wider-spread venue or symbol, or "
-              "at a fee tier with a maker\n  rebate, before looking at "
-              "anything else.")
+        print(f"  This instrument needs a spread above "
+              f"{ROUND_TRIP_MAKER_BPS:.2f} bps and has "
+              f"{spread_bps:.3f}.\n  Run spread_survey.py to find one that "
+              "does, or look at a fee tier with a\n  maker rebate, before "
+              "looking at anything else.")
     else:
         print("  ADVERSE SELECTION EXCEEDS THE SPREAD")
         print(f"  Net {optimistic:+.3f} bps even at the FRONT of the queue, so "
@@ -975,24 +1011,45 @@ def _report_out_of_sample(
 
 
 def tardis_events(cache: Path, exchange: str, symbol: str, date: str,
-                  depth: int, hours: Optional[float]) -> List[dict]:
+                  depth: int, hours: Optional[float],
+                  api_key: Optional[str] = None) -> List[dict]:
     """Merged book+trade messages from the Tardis sample files.
 
-    Reuses the importer's parsers rather than re-reading the CSVs here, so a
-    schema fix lands in one place and the simulator can never disagree with
-    the feature files about what the data said.
-    """
-    from analysis.tardis_import import book_events, trade_events
+    Fetches whatever is not already cached. It used to require the files to be
+    there already, which broke the one path that matters most: `spread_survey`
+    prints a `passive_sim` command for each instrument that clears the fee
+    gate, and after a `--discard-downloads` survey that command could not run.
+    A tool that names its own next step should be able to perform it.
 
-    book_path = cache / f"{exchange}-{symbol}-book_snapshot_{depth}-{date}.csv.gz"
-    trade_path = cache / f"{exchange}-{symbol}-trades-{date}.csv.gz"
-    for path in (book_path, trade_path):
-        if not path.exists():
-            raise SystemExit(
-                f"\nMissing {path}.\nDownload it first:\n"
-                f"  python backend\\analysis\\tardis_import.py --date {date} "
-                f"--symbol {symbol} --hours 2"
-            )
+    Reuses the importer's parsers and its download helper rather than
+    re-reading the CSVs here, so a schema fix lands in one place and the
+    simulator can never disagree with the feature files about what the data
+    said.
+    """
+    from analysis.importer_core import download
+    from analysis.tardis_import import book_events, dataset_url, trade_events
+
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    unauthorised = (
+        "Tardis only serves the 1st of each month for free. Either pick the "
+        "1st,\nor pass a paid key with --api-key / $TARDIS_API_KEY."
+    )
+    not_found = (
+        f"{symbol} has no data for {date} on {exchange}.\nCheck the symbol is "
+        "spelled the way that venue spells it, and that it was listed then."
+    )
+
+    book_type = f"book_snapshot_{depth}"
+    book_path = download(
+        dataset_url(exchange, book_type, date, symbol),
+        cache / f"{exchange}-{symbol}-{book_type}-{date}.csv.gz",
+        headers=headers, not_found_hint=not_found,
+        unauthorised_hint=unauthorised)
+    trade_path = download(
+        dataset_url(exchange, "trades", date, symbol),
+        cache / f"{exchange}-{symbol}-trades-{date}.csv.gz",
+        headers=headers, not_found_hint=not_found,
+        unauthorised_hint=unauthorised)
 
     limit_ms = int(hours * 3_600_000) if hours else None
     print("Parsing book snapshots...")
@@ -1051,6 +1108,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "to the one you should plan with.")
     parser.add_argument("--train-fraction", type=float, default=0.7,
                         help="Fraction of the session used to CHOOSE a bucket.")
+    parser.add_argument("--api-key", default=os.environ.get("TARDIS_API_KEY"),
+                        help="Paid Tardis key; lifts the 1st-of-month limit. "
+                             "Defaults to $TARDIS_API_KEY.")
     args = parser.parse_args(argv)
 
     horizons = tuple(float(part) for part in args.horizons.split(",") if part.strip())
@@ -1066,7 +1126,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"{args.date}")
         print("=" * 72)
         events: Iterable[dict] = tardis_events(
-            cache, args.exchange, args.symbol, args.date, args.depth, args.hours)
+            cache, args.exchange, args.symbol, args.date, args.depth,
+            args.hours, args.api_key)
     else:
         raw_dir = args.raw_dir or repo_root / "data" / "raw"
         print(f"Passive fill simulation - raw archive {args.date or 'all dates'}")
@@ -1091,7 +1152,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     table = markout_table(market, quotes, fills, horizons_s=horizons)
     report_markout(table, horizons)
     report_economics(table, fills, horizons, args.decision_horizon,
-                     float(np.median(quotes.spread_bps)) / 2.0)
+                     float(np.median(quotes.spread_bps)))
     report_conditional(market, quotes, fills, signals=signals,
                        buckets=args.buckets, horizon=args.decision_horizon,
                        model=args.conditional_model,

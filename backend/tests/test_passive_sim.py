@@ -22,6 +22,7 @@ import pytest
 
 from analysis.passive_sim import (
     MODELS,
+    ROUND_TRIP_MAKER_BPS,
     Market,
     Quotes,
     assign_buckets,
@@ -30,6 +31,7 @@ from analysis.passive_sim import (
     markout_bps,
     markout_table,
     observable,
+    report_economics,
     resolve_fill,
     simulate,
     touch_cancel_share,
@@ -447,6 +449,25 @@ def test_bucket_assignment_covers_every_bucket_on_the_training_rows():
     values = np.linspace(-1.0, 1.0, 500)
     membership = assign_buckets(values, bucket_edges(values, 5))
     assert sorted(set(membership.tolist())) == [0, 1, 2, 3, 4]
+
+
+def test_the_economics_gate_uses_the_whole_spread_not_the_half(capsys):
+    # A passive round trip captures the spread on both legs and pays two maker
+    # fees, so an instrument at exactly the round-trip fee is break-even. The
+    # earlier version compared the HALF spread against the whole round trip,
+    # which is too strict by 2x and would have failed this instrument.
+    horizons = [0.0, 5.0]
+    table = {model: (np.array([0.0, 0.0]), np.array([0.01, 0.01]), 100)
+             for model in MODELS}
+    fills = {(side, model): np.zeros(100, dtype=np.int64)
+             for side in ("bid", "ask") for model in MODELS}
+    report_economics(table, fills, horizons, 5.0, ROUND_TRIP_MAKER_BPS * 1.2)
+    out = capsys.readouterr().out
+    assert "does not cover the fee" not in out
+    assert "NEVER COVERED THE FEE" not in out
+
+    report_economics(table, fills, horizons, 5.0, ROUND_TRIP_MAKER_BPS * 0.8)
+    assert "does not cover the fee" in capsys.readouterr().out
 
 
 def test_a_mostly_tied_feature_collapses_to_fewer_buckets_not_empty_ones():

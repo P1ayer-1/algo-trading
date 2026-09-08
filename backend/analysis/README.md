@@ -481,24 +481,35 @@ the safe direction to be wrong in.
 
 ### Read the arithmetic gate before anything else
 
-The report prints the median half spread next to the maker round trip before
-any simulation result, because on a tight instrument that one comparison
-settles the question:
+The report prints the median spread next to the maker round trip before any
+simulation result, because on a tight instrument that one comparison settles
+the question:
 
 ```
-  median half spread               0.006 bps  <- the most a passive fill can capture
-  round trip, both legs passive    1.200 bps  (0.60 per leg)
-  a flawless fill, marked out instantly, earns -1.194 bps
+  median spread                    0.013 bps  <- a passive round trip captures all of it
+  round trip, both legs passive    4.000 bps  (2.00 per leg)
+  headroom before adverse selection is even involved: -3.987 bps
 ```
+
+A passive round trip captures the **whole** spread — half on the way in
+against mid, half on the way out — and pays a maker fee on each leg. So the
+gate is `spread >= round trip`. An earlier version of this compared the *half*
+spread against the whole round trip, which is too strict by a factor of two;
+it made no difference on BTCUSDT, where the answer is hopeless either way, and
+it was exactly wrong for instruments near the threshold, which are the only
+ones worth searching for. `passive_sim.clears_fee_gate` is now the single
+definition, imported by `spread_survey.py` rather than restated.
 
 Binance BTCUSDT perp trades one tick wide almost always. A tick is $0.10 on a
-~$110k instrument, so the half spread is **0.006 bps against a 1.2 bps maker
-round trip — roughly 200x too small**. A perfect fill, at the front of the
-queue, marked out instantly, against a counterparty who knows nothing, still
-loses. No signal, queue assumption or horizon repairs that, and the verdict
-says so rather than burying it under a table.
+~$110k instrument, so the spread is **0.013 bps against a 4.0 bps maker round
+trip — roughly 300x too small** at the default VIP 0 fee tier. A perfect fill,
+at the front of the queue, marked out instantly, against a counterparty who
+knows nothing, still loses. No signal, queue assumption or horizon repairs
+that.
 
-That gate is worth knowing before spending a week on a fill model.
+That gate is worth knowing before spending a week on a fill model — and it is
+cheap enough to run across a whole universe, which is what `spread_survey.py`
+does.
 
 ### What it found
 
@@ -513,7 +524,7 @@ Six hours of BTCUSDT on 2026-09-01, quoting every second with a 60s timeout
 | markout @ 0s | +0.019 | +0.005 | **−0.400** |
 | markout @ 1s | −0.079 | −0.416 | −1.161 |
 | markout @ 60s | −0.110 ±0.155 | −0.607 ±0.157 | −1.489 ±0.159 |
-| **net of fees @ 60s** | **−1.310** | **−1.807** | **−2.689** |
+| **net of fees @ 60s** | **−4.110** | **−4.607** | **−5.489** |
 
 Three things in that table are worth more than the verdict.
 
@@ -523,7 +534,7 @@ fill-rate number for this instrument is quoting an assumption, not a
 measurement — which is the whole reason for the two bounds.
 
 **Markout is already −0.400 bps at the instant of the pessimistic fill.** The
-half spread is 0.006. So by the time enough volume had printed to clear a
+half spread is 0.007. So by the time enough volume had printed to clear a
 whole queue, the mid had moved through the quote by sixty times what providing
 liquidity paid. Waiting at the back of the queue does not buy a fill at a good
 price — it buys a fill precisely when the level is being swept. That single
@@ -537,6 +548,64 @@ an order of magnitude smaller. **Nothing past ~10s in this table is measured**,
 and the errors are computed on the *effective* sample size for the reason
 `check_features.py` uses it: consecutive fills share nearly all of their
 markout window. Prefer `--decision-horizon 5`.
+
+### Then the same thing on instruments whose spread is not hopeless
+
+`spread_survey.py` found four majors clearing the old 1.2 bps gate. Simulated
+at three hours each on 2026-09-01, decision horizon 5s, they say something the
+BTCUSDT run could not:
+
+| symbol | spread | half spread | optimistic markout | adverse selection | pessimistic markout |
+|---|---|---|---|---|---|
+| ADAUSDT | 5.019 | 2.510 | **+1.967** | 0.543 | −4.338 |
+| LTCUSDT | 2.053 | 1.027 | +0.378 | 0.649 | −2.525 |
+| AVAXUSDT | 1.378 | 0.689 | +0.179 | 0.510 | −2.111 |
+| DOGEUSDT | 1.207 | 0.604 | +0.316 | 0.288 | −1.761 |
+| BTCUSDT | 0.013 | 0.007 | −0.107 | 0.113 | −1.321 |
+
+The fourth column is the measured cost of being filled: half spread minus the
+optimistic markout, which is what the counterparty took out of the trade.
+
+**Adverse selection is roughly half a basis point, and it does not scale with
+the spread.** Across a 400x range of spreads it stays in 0.29–0.65 bps with no
+trend. That is the single most useful number the simulator has produced,
+because it turns the whole question into arithmetic you can do in your head
+before downloading anything:
+
+```
+    a passive round trip needs    spread  >  2 x (0.5 + maker fee per leg)
+
+    VIP 0  (2.00/leg)   spread > 5.0 bps
+    VIP 1  (0.60/leg)   spread > 2.2 bps
+    VIP 5  (0.00/leg)   spread > 1.0 bps
+```
+
+**Two P&L conventions, and they are not the same number.** The formula above
+is a full round trip: capture the spread on both legs, pay adverse selection
+on both, pay two fees. The simulator's headline `net of fees` column is
+deliberately more conservative — it charges both fees but credits only the
+*entry* half spread, because the exit leg is not simulated and an exit resting
+at the touch faces adverse selection of its own. The report prints the
+difference explicitly on the line beginning `A passive EXIT would add back`.
+Round-trip arithmetic is the right frame for choosing an instrument; the
+conservative column is the right frame for deciding whether to trade one.
+
+ADAUSDT at 5.019 bps sits just under the VIP 0 bar, which its own measured
+adverse selection puts at `2 x (0.543 + 2.00) = 5.09`. Both conventions agree
+it fails there: −0.07 bps on round-trip arithmetic, −2.03 on the conservative
+column. At VIP 1 the bar drops to 2.29 and it clears comfortably — **+2.73 bps
+round trip, or +0.767 on the conservative column, at the front of the queue.**
+At the back of the queue it is −5.538 either way.
+
+That is the `DEPENDS ENTIRELY ON QUEUE POSITION` verdict, and it is the first
+positive net number this project has produced.
+
+Do not read it as an edge yet. It is one instrument, one day, three hours, at
+the *optimistic* bound — the bound that assumes you are at the front of a
+queue holding 173,000 contracts. The pessimistic bound on the same rows is
+−5.538. The honest statement is that ADA-like instruments are the first place
+the arithmetic stops being impossible, and that everything then depends on a
+queue position this simulator deliberately refuses to model.
 
 ### The conditional section picks out of sample, on purpose
 
@@ -603,6 +672,95 @@ come out the other way — and testing that costs one `--symbol` flag.
 
 The BloFin answer needs `--source raw` and enough recorded hours to be worth
 reading, which is one more argument for leaving the recorder running.
+
+---
+
+## spread_survey.py — is there anything whose spread covers the fee?
+
+```
+python backend\analysis\spread_survey.py --date 2026-09-01 --hours 3
+python backend\analysis\spread_survey.py --date 2026-09-01 ^
+    --exchanges binance-futures,bybit --symbols SOLUSDT,DOGEUSDT
+```
+
+`passive_sim.py` established that passive quoting on Binance BTCUSDT perp
+fails on arithmetic: a 0.013 bps spread against a 4.0 bps maker round trip.
+But that is a property of *that instrument*, not a law — so this asks the
+obvious follow-up across a whole universe, cheaply.
+
+The gate is one line, and it lives in `passive_sim.clears_fee_gate` so the two
+tools can never disagree about what passing means:
+
+```
+    median spread  >=  COST_MAKER_MAKER_BPS
+```
+
+It downloads one `book_snapshot_5` per instrument — no trade files, since the
+spread is a book property — measures the spread distribution, and ranks. The
+files land in the same cache `passive_sim.py` reads, so a symbol surveyed here
+needs no second download when you simulate it.
+
+### What it found
+
+Ten majors on binance-futures, first three hours of 2026-09-01:
+
+| symbol | median spread | p25 | p75 | above gate | median touch |
+|---|---|---|---|---|---|
+| ADAUSDT | 5.019 | 5.014 | 5.029 | 100% | 173,350 |
+| LTCUSDT | 2.053 | 2.051 | 2.056 | 100% | 226 |
+| AVAXUSDT | 1.378 | 1.376 | 1.380 | 100% | 613 |
+| DOGEUSDT | 1.207 | 1.205 | 1.209 | 100% | 250,211 |
+| SOLUSDT | 0.970 | 0.968 | 0.970 | 0% | 847 |
+| LINKUSDT | 0.881 | 0.879 | 0.882 | 0.1% | 273 |
+| XRPUSDT | 0.725 | 0.723 | 0.728 | 0% | 15,077 |
+| BNBUSDT | 0.144 | 0.144 | 0.145 | 0% | 17 |
+| ETHUSDT | 0.041 | 0.040 | 0.041 | 0% | 79 |
+| BTCUSDT | 0.013 | 0.013 | 0.013 | 0% | 3 |
+
+**A 400x range across ten instruments on one venue on one day.** BTCUSDT is
+not representative of anything except BTCUSDT, and every conclusion this
+project drew from it about execution cost was a conclusion about the most
+arbitraged perpetual in existence.
+
+**The spreads are pinned, not distributed.** p25 and p75 sit within 0.01 bps
+of the median on every row, and `above gate` is 100% or ~0% with nothing in
+between. These instruments are trading at their **minimum tick**, essentially
+all the time. The spread in bps is then just `tick / price`, which is why a
+$0.40 coin with a $0.0001 tick shows 5 bps while a $110k coin with a $0.10
+tick shows 0.013.
+
+That has a consequence worth being explicit about, because it is the whole
+reason the wide names are interesting. When the tick binds, market makers
+*cannot* compete the spread away — so they queue up behind it instead. Look at
+the touch column: 173,000 contracts resting at ADA's best bid against 3 at
+BTC's. A wide spread on a large-tick instrument is not a reward for bearing
+adverse selection; it is a queue you have to get to the front of. Which is
+exactly why the survey's output is a shortlist for `passive_sim.py` and not a
+result, and why that simulator brackets queue position instead of assuming it.
+
+### The `above gate` column, and why the median is not enough
+
+A symbol at 0.9 bps median that clears 1.2 bps a third of the time is a
+*selective* quoting opportunity — quote only while the spread is wide. A
+symbol pinned at 1.3 bps all day is a different and better one. The median
+alone cannot tell them apart, so the fraction of book updates clearing the
+gate is reported next to it, and the verdict treats a part-time pass as its
+own case.
+
+On this universe the distinction turned out not to matter: every instrument is
+either always through the gate or never. It will matter on a venue whose
+spreads actually move.
+
+### What it does not tell you
+
+**A wide spread is not free money.** Makers widen because the flow is more
+informed, so spread and adverse selection normally move together. The measured
+adverse selection across the four wide names came out at 0.29–0.65 bps with no
+trend in spread (see `passive_sim.py` above), which is a genuinely encouraging
+result — but it is four instruments on one day, and it is the kind of thing
+that changes in a regime this sample does not contain.
+
+A pass here earns an instrument a simulation, nothing more.
 
 ---
 

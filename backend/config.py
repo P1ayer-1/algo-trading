@@ -11,6 +11,7 @@ import os
 import sys
 from decimal import Decimal
 from pathlib import Path
+from typing import Dict, Tuple
 
 # This file lives in backend/, one level below the repo root.
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -87,10 +88,57 @@ TAPE_WINDOW_SECONDS = float(os.getenv("BLOFIN_TAPE_WINDOW_SECONDS", "60"))
 # question is really "is the predicted move bigger than these?", so they get
 # defined once, here, and everything else imports them.
 #
-# BloFin futures schedule, VIP 1 (confirmed 2026-09-07). Fractions of
-# notional, per side.
-MAKER_FEE_RATE = Decimal(os.getenv("BLOFIN_MAKER_FEE_RATE", "0.00006"))  # 0.0060%
-TAKER_FEE_RATE = Decimal(os.getenv("BLOFIN_TAKER_FEE_RATE", "0.00050"))  # 0.0500%
+# BloFin futures schedule by VIP tier. Fractions of notional, per side.
+#
+# PROVENANCE, because these decide everything: read 2026-09-07 from BloFin's
+# published schedule and fee-structure pages. blofin.com serves 403 to
+# automated fetches, so tiers 0/1/2/5 came from search results quoting those
+# pages rather than from the pages themselves, and tiers 3 and 4 could not be
+# confirmed at all -- they are deliberately absent rather than interpolated.
+# **Confirm against your own account before sizing anything on this.** The
+# tier that bills you is the one you are actually on.
+#
+# There is no maker rebate at any tier. The floor is 0.0000% maker at VIP 5,
+# so no BloFin schedule ever PAYS you to provide liquidity; the best available
+# case is that providing it becomes free. That kills the "a rebate would
+# invert the passive economics" idea outright -- see backend/analysis/README
+# under passive_sim.py.
+VIP_TIERS: Dict[int, Tuple[Decimal, Decimal]] = {
+    # tier: (maker, taker)
+    0: (Decimal("0.00020"), Decimal("0.00060")),  # 0.0200% / 0.0600%
+    1: (Decimal("0.00006"), Decimal("0.00050")),  # 0.0060% / 0.0500%
+    2: (Decimal("0.00004"), Decimal("0.00045")),  # 0.0040% / 0.0450%
+    5: (Decimal("0.00000"), Decimal("0.00035")),  # 0.0000% / 0.0350%
+}
+
+# Qualification is whichever of three thresholds you hit first, refreshed
+# daily at 12:00 UTC:
+#
+#   VIP 1   50,000 USDT held  |  10,000,000 USDT 30d futures  |  1,000,000 USDT 30d spot
+#   VIP 2                     |                               |  2,000,000 USDT 30d spot
+#
+# The asset route matters more than it looks. VIP 1 is reachable by holding
+# 50k on the exchange without trading a single contract, and the difference
+# between VIP 0 and VIP 1 is 2.0bps vs 0.6bps per passive leg -- which is the
+# difference between passive quoting being impossible and merely hard. See
+# the passive_sim results in backend/analysis/README.md.
+#
+# DEFAULT IS VIP 0, deliberately. An account that has never traded is VIP 0,
+# and the entire history of this project is results that died once their cost
+# assumption was made honest. Set BLOFIN_VIP_TIER=1 once the account actually
+# qualifies -- not in anticipation of qualifying.
+VIP_TIER = int(os.getenv("BLOFIN_VIP_TIER", "0"))
+if VIP_TIER not in VIP_TIERS:
+    raise SystemExit(
+        f"BLOFIN_VIP_TIER={VIP_TIER} is not a tier this file has rates for. "
+        f"Known: {sorted(VIP_TIERS)}. Tiers 3 and 4 exist on BloFin but their "
+        "rates were never confirmed, so they are not guessed at here."
+    )
+
+_TIER_MAKER, _TIER_TAKER = VIP_TIERS[VIP_TIER]
+
+MAKER_FEE_RATE = Decimal(os.getenv("BLOFIN_MAKER_FEE_RATE", str(_TIER_MAKER)))
+TAKER_FEE_RATE = Decimal(os.getenv("BLOFIN_TAKER_FEE_RATE", str(_TIER_TAKER)))
 
 
 def _bps(rate: Decimal) -> Decimal:
@@ -98,18 +146,26 @@ def _bps(rate: Decimal) -> Decimal:
 
 
 # Round-trip cost in bps for the three ways a position can open and close.
-# The spread is not included: measured median spread on BTC-USDT is 0.013bps,
-# three orders of magnitude below the taker fee, so fees are the whole story.
-MAKER_FEE_BPS = _bps(MAKER_FEE_RATE)                    # 0.6
-TAKER_FEE_BPS = _bps(TAKER_FEE_RATE)                    # 5.0
-COST_MAKER_MAKER_BPS = MAKER_FEE_BPS * 2                # 1.2  passive in, passive out
-COST_MAKER_TAKER_BPS = MAKER_FEE_BPS + TAKER_FEE_BPS    # 5.6  passive in, market out
-COST_TAKER_TAKER_BPS = TAKER_FEE_BPS * 2                # 10.0 crossing both ways
+#
+# The spread was long treated as negligible here, and on BTC-USDT it is:
+# 0.013bps of median spread against a 4.0bps maker round trip at VIP 0. That
+# is only true of a small-tick instrument, though. Measured across ten majors
+# on 2026-09-01, the median spread runs from 0.013bps (BTCUSDT) to 5.019bps
+# (ADAUSDT), because a low-priced coin's minimum tick is a large fraction of
+# its price. On those, the spread is not a rounding error -- it is the entire
+# revenue of a passive strategy. See backend/analysis/spread_survey.py.
+#
+# Comments below show bps at VIP 0, the default.
+MAKER_FEE_BPS = _bps(MAKER_FEE_RATE)                    # 2.0
+TAKER_FEE_BPS = _bps(TAKER_FEE_RATE)                    # 6.0
+COST_MAKER_MAKER_BPS = MAKER_FEE_BPS * 2                # 4.0  passive in, passive out
+COST_MAKER_TAKER_BPS = MAKER_FEE_BPS + TAKER_FEE_BPS    # 8.0  passive in, market out
+COST_TAKER_TAKER_BPS = TAKER_FEE_BPS * 2                # 12.0 crossing both ways
 
 # The cost the risk engine's edge gate and the analysis tooling assume by
 # default. Taker/taker deliberately: it is a *veto* threshold, and the
 # conservative assumption is that you cross the spread on both sides. Set
-# BLOFIN_ROUND_TRIP_COST_BPS to COST_MAKER_MAKER_BPS (1.2) to see what a
+# BLOFIN_ROUND_TRIP_COST_BPS to COST_MAKER_MAKER_BPS (4.0 at VIP 0) to see what a
 # fully passive execution engine would need to clear -- but only once such an
 # engine exists and its fill rate has been measured, not before.
 ROUND_TRIP_COST_BPS = Decimal(

@@ -69,10 +69,11 @@ first. Recording is therefore step one, not step four.
 │   │   ├── check_features.py  # do the features predict anything?
 │   │   ├── train_model.py     # LightGBM + shuffled-label control + paired test
 │   │   ├── passive_sim.py     # markout curves + bracketed passive fill rates
+│   │   ├── spread_survey.py   # which instruments' spreads cover the maker fee
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (271 tests)
+│   └── tests/                 # pytest suite (289 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── features-*.csv         #   labelled features — regenerable
 │   └── raw/                   #   raw events — IRREPLACEABLE
@@ -151,7 +152,8 @@ Useful environment variables (set in `.env` or the shell):
 | `BLOFIN_FEATURE_SAMPLE_MS` | How often to persist a row | `1000` |
 | `BLOFIN_LABEL_HORIZONS` | Forward label horizons, seconds | `300,900,1800` |
 | `BLOFIN_LABEL_THRESHOLD_BPS` | Move size counted as a signal | `10` |
-| `BLOFIN_MAKER_FEE_RATE` / `BLOFIN_TAKER_FEE_RATE` | Fee schedule, per side | `0.00006` / `0.0005` |
+| `BLOFIN_VIP_TIER` | BloFin fee tier (0, 1, 2, 5) | `0` |
+| `BLOFIN_MAKER_FEE_RATE` / `BLOFIN_TAKER_FEE_RATE` | Override the tier's rates, per side | from tier |
 | `BLOFIN_ROUND_TRIP_COST_BPS` | Cost the edge gate must clear | `10` |
 | `BLOFIN_MAX_LEVERAGE` | Risk engine leverage cap | `5` |
 | `BLOFIN_MIN_LIQ_BUFFER_PCT` | Required distance to liquidation | `0.15` |
@@ -212,12 +214,12 @@ cd backend
 python -m pytest
 ```
 
-271 tests covering the order book's gap handling, the OFI recursion, the
+289 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
-queue bracket, and the evaluation statistics. They need no network,
-credentials, or SDK.
+queue bracket, the maker-fee gate, and the evaluation statistics. They need
+no network, credentials, or SDK.
 
 ## Roadmap toward the actual bot
 
@@ -342,12 +344,88 @@ Next, in order:
    optimistic bound also loses.
 
    Where this leaves the passive idea: not dead, but not on this instrument.
-   The gate to clear is a spread wider than 1.2 bps, which BTC perp on the
-   most arbitraged venue in existence will never offer. A less efficient venue
-   (BloFin itself, via `--source raw`), a wider-spread symbol, or a fee tier
-   with a maker rebate are the three things that could change the arithmetic,
-   and each costs one flag to test. Perp funding carry remains the other open
-   question, and it is the one that needs no directional forecast at all.
+   The gate to clear is a spread wider than the maker round trip, which BTC
+   perp on the most arbitraged venue in existence will never offer. Steps 9a
+   and 9b below went looking for one that does.
+
+9a. ~~**Which instruments' spreads cover the fee?**~~ —
+   `backend\analysis\spread_survey.py`. The gate is one line — a passive
+   round trip captures the whole spread and pays two maker fees, so it needs
+   `spread >= COST_MAKER_MAKER_BPS` — and it is cheap enough to run across a
+   universe. Ten majors on binance-futures, 2026-09-01:
+
+   | | BTC | ETH | BNB | XRP | LINK | SOL | DOGE | AVAX | LTC | ADA |
+   |---|---|---|---|---|---|---|---|---|---|---|
+   | median spread (bps) | 0.013 | 0.041 | 0.144 | 0.725 | 0.881 | 0.970 | 1.207 | 1.378 | 2.053 | **5.019** |
+
+   **A 400x range on one venue on one day.** Everything this project concluded
+   about execution cost from BTCUSDT was a conclusion about the most
+   arbitraged perpetual in existence. The spreads are also *pinned* — p25 and
+   p75 within 0.01 bps of the median — because these instruments sit at their
+   minimum tick essentially always, so the spread in bps is just `tick/price`.
+
+   That has a sting in it. When the tick binds, makers cannot compete the
+   spread away, so they queue behind it instead: 173,000 contracts resting at
+   ADA's best bid against 3 at BTC's. A wide spread here is not payment for
+   adverse selection, it is a queue to get to the front of — which is exactly
+   what step 9 refuses to model and brackets instead.
+
+   Simulating the four that cleared gave the first positive number in this
+   project's history, and one clean empirical regularity:
+
+   | symbol | spread | optimistic markout | adverse selection | pessimistic |
+   |---|---|---|---|---|
+   | ADAUSDT | 5.019 | **+1.967** | 0.543 | −4.338 |
+   | LTCUSDT | 2.053 | +0.378 | 0.649 | −2.525 |
+   | AVAXUSDT | 1.378 | +0.179 | 0.510 | −2.111 |
+   | DOGEUSDT | 1.207 | +0.316 | 0.288 | −1.761 |
+   | BTCUSDT | 0.013 | −0.107 | 0.113 | −1.321 |
+
+   **Adverse selection is about half a basis point and does not scale with the
+   spread** — 0.29 to 0.65 bps across a 400x spread range, no trend. So the
+   whole question reduces to arithmetic you can do before downloading
+   anything: a passive round trip needs `spread > 2 x (0.5 + maker fee per
+   leg)`.
+
+9b. ~~**The fee schedule, because the gate is made of it**~~ — `backend\config.py`.
+   Every number above depends on a constant this repo had been assuming. Read
+   from BloFin's published schedule on 2026-09-07 (their site 403s automated
+   fetches, so this came from search results quoting it — **confirm against
+   your own account**):
+
+   | tier | maker | taker | qualification |
+   |---|---|---|---|
+   | VIP 0 | 0.0200% | 0.0600% | default |
+   | VIP 1 | 0.0060% | 0.0500% | 50k USDT held, or 10M 30d futures, or 1M 30d spot |
+   | VIP 2 | 0.0040% | 0.0450% | 2M USDT 30d spot |
+   | VIP 5 | 0.0000% | 0.0350% | — |
+
+   Two findings, and the second is the one that matters.
+
+   **There is no maker rebate at any tier.** The floor is 0% at VIP 5. No
+   BloFin schedule ever pays you to provide liquidity; the best case is that
+   providing it becomes free. That closes off the "a rebate would invert the
+   economics" idea entirely.
+
+   **The repo had been assuming VIP 1 rates on an account that has never
+   traded.** A fresh account is VIP 0, where the maker fee is 2.0 bps per leg
+   rather than 0.6 — a 4.0 bps round trip, not 1.2. The default is now VIP 0
+   (`BLOFIN_VIP_TIER`), because the entire history of this project is results
+   that died once their cost assumption was made honest.
+
+   The tier is now the single biggest lever in the project, and the threshold
+   sits exactly between two verdicts:
+
+   | | gate | best instrument surveyed | front-of-queue net |
+   |---|---|---|---|
+   | VIP 0 | 5.0 bps | ADAUSDT at 5.019 | **−2.03** |
+   | VIP 1 | 2.2 bps | ADAUSDT at 5.019 | **+0.77** |
+
+   VIP 1's cheapest route is **holding 50,000 USDT on the exchange** — an
+   asset threshold, not a volume one, so it is reachable without trading a
+   contract. Whether that is an acceptable thing to do is a decision, not a
+   measurement, and it is now the decision the passive branch waits on.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
