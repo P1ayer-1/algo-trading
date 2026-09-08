@@ -406,6 +406,206 @@ not supported.
 
 ---
 
+## passive_sim.py — what a passive quote actually earns
+
+```
+python backend\analysis\passive_sim.py --date 2026-09-01 --hours 2
+python backend\analysis\passive_sim.py --source raw --date 2026-09-07
+python backend\analysis\passive_sim.py --date 2026-09-01 --hours 6 ^
+    --signals obi_1,tfi_5s --decision-horizon 5
+```
+
+Roadmap step 9, and the first tool here that measures *execution* rather than
+prediction. Every result in this repo has died on cost rather than on
+forecasting, and the one effect that survived — short-horizon cross-sectional
+reversal — is the return to providing liquidity to whatever just moved. Both
+point at the same open question: what does a resting order earn, once the
+people who fill it are done selecting against you?
+
+It places a hypothetical passive quote on both sides of the touch every
+`--quote-interval` ms, leaves it there until it fills or `--timeout` elapses,
+and reports:
+
+* **fill rate** — how often a quote trades at all,
+* **the markout curve** — where the mid sits 0s / 1s / 5s / … after the fill,
+  signed so positive is money. At 0s it is the half spread you captured; its
+  decay after that is adverse selection, priced in basis points.
+
+Unconditional first, then conditional on a signal. That order is deliberate: a
+conditional number with nothing to compare it against is not a number.
+
+### The queue problem, and why this brackets instead of modelling
+
+You cannot see how many orders sit ahead of yours at a price, and you cannot
+see how many of them cancel. Neither is in any market data feed at any price.
+So the simulator does not model queue position — it runs the identical markout
+machinery under two rules that are wrong in known, opposite directions:
+
+| | rule |
+|---|---|
+| **Pessimistic** | You join behind the entire visible size `Q` and fill only once cumulative same-side aggressor volume at that price exceeds `Q`. Nobody ahead of you cancels. |
+| **Optimistic** | You fill the moment any trade occurs at your price. |
+
+Truth is between them, and closer to the optimistic end than the pessimistic
+bound suggests, because real queues shrink by cancellation as well as by
+trading and the pessimistic rule counts only the trading.
+
+**Plan with the pessimistic number and treat the gap as your uncertainty.**
+Every figure in the report is printed as three columns for exactly that
+reason.
+
+Both rules are the same function with a different amount of volume to clear —
+optimistic is the pessimistic rule with `Q = 0`. There is no second code path
+that could drift from the first, and a property test asserts the bracket never
+inverts on random tapes.
+
+### Locating the truth inside the bracket, without a queue model
+
+*How far* toward the optimistic end is not a matter of opinion. Queue position
+is unobservable; **cancellation is not**. Between two book updates at an
+unchanged touch price, the size fell by more than the volume that printed
+there, and the excess was cancelled. `touch_cancel_share` measures exactly
+that.
+
+On the Tardis 2026-09-01 BTCUSDT sample it is **92.2% on the bid and 90.8% on
+the ask** — nine tenths of the queue ahead of you evaporates rather than
+trading. That is the number that says the pessimistic bound is very
+pessimistic indeed.
+
+A third column, `cancel-adj`, is the pessimistic rule with `Q` scaled by
+`1 - c`. It is an interpolation driven by that measurement, not a third model,
+and it sits inside the bracket by construction. The measurement is biased
+*down* — intervals where someone adds size hide removals inside a smaller net
+change — which makes `cancel-adj` conservative rather than optimistic. That is
+the safe direction to be wrong in.
+
+### Read the arithmetic gate before anything else
+
+The report prints the median half spread next to the maker round trip before
+any simulation result, because on a tight instrument that one comparison
+settles the question:
+
+```
+  median half spread               0.006 bps  <- the most a passive fill can capture
+  round trip, both legs passive    1.200 bps  (0.60 per leg)
+  a flawless fill, marked out instantly, earns -1.194 bps
+```
+
+Binance BTCUSDT perp trades one tick wide almost always. A tick is $0.10 on a
+~$110k instrument, so the half spread is **0.006 bps against a 1.2 bps maker
+round trip — roughly 200x too small**. A perfect fill, at the front of the
+queue, marked out instantly, against a counterparty who knows nothing, still
+loses. No signal, queue assumption or horizon repairs that, and the verdict
+says so rather than burying it under a table.
+
+That gate is worth knowing before spending a week on a fill model.
+
+### What it found
+
+Six hours of BTCUSDT on 2026-09-01, quoting every second with a 60s timeout
+(20,665 quote pairs, 590k book updates, 592k trades):
+
+| | optimistic | cancel-adj | pessimistic |
+|---|---|---|---|
+| fill rate, bid | 96.7% | 84.6% | 63.2% |
+| fill rate, ask | 97.4% | 86.1% | 67.7% |
+| median wait, bid | 0.4s | 2.9s | 10.4s |
+| markout @ 0s | +0.019 | +0.005 | **−0.400** |
+| markout @ 1s | −0.079 | −0.416 | −1.161 |
+| markout @ 60s | −0.110 ±0.155 | −0.607 ±0.157 | −1.489 ±0.159 |
+| **net of fees @ 60s** | **−1.310** | **−1.807** | **−2.689** |
+
+Three things in that table are worth more than the verdict.
+
+**The bracket is wide, and wide in the way that matters.** Fill rates run
+63%–97%, and the 60s markout runs −1.49 to −0.11 bps. Anyone quoting a single
+fill-rate number for this instrument is quoting an assumption, not a
+measurement — which is the whole reason for the two bounds.
+
+**Markout is already −0.400 bps at the instant of the pessimistic fill.** The
+half spread is 0.006. So by the time enough volume had printed to clear a
+whole queue, the mid had moved through the quote by sixty times what providing
+liquidity paid. Waiting at the back of the queue does not buy a fill at a good
+price — it buys a fill precisely when the level is being swept. That single
+number is the clearest statement in this repo of what queue position is worth.
+
+**Adverse selection saturates in about a second.** Optimistic markout goes
+−0.079 at 1s, −0.109 at 10s, −0.110 at 60s: essentially all the damage is
+immediate and the rest is drift. The standard errors say the same thing from
+the other side — ±0.155 bps at 60s and ±0.805 at 300s, against point estimates
+an order of magnitude smaller. **Nothing past ~10s in this table is measured**,
+and the errors are computed on the *effective* sample size for the reason
+`check_features.py` uses it: consecutive fills share nearly all of their
+markout window. Prefer `--decision-horizon 5`.
+
+### The conditional section picks out of sample, on purpose
+
+Choosing the best signal bucket on the rows you then report is the oldest way
+to manufacture a backtest — with five buckets and a noisy metric, one of them
+looks good whether or not anything is there. So the bucket edges are fitted on
+the first `--train-fraction` of the session, the best bucket is chosen there,
+and the number reported is what that choice earned *afterwards*, printed
+beside the unconditional figure over the same rows.
+
+It survived, and it is far too small to matter:
+
+| signal | picked | in-sample | out-of-sample | unconditional | fill rate |
+|---|---|---|---|---|---|
+| `obi_1` | bucket 3 | −1.362 | **−1.207** | −1.521 | 67.8% vs 63.8% |
+| `ofi_1s` | bucket 1 | −1.448 | −1.397 | −1.521 | 64.6% vs 63.8% |
+| `ret_5s` | bucket 1 | −1.421 | −1.430 | −1.521 | 64.3% vs 63.8% |
+| `tfi_5s` | bucket 2 | −1.332 | −1.467 | −1.521 | 63.8% vs 63.8% |
+
+All four beat unconditional quoting out of sample, by 0.05 to 0.31 bps, and
+`obi_1` did it while *raising* the fill rate — so it is not the usual failure
+mode where a signal wins by quoting into states nobody trades against. The
+best of them, quoting only when the book is balanced, is a genuine effect of
+about a third of a basis point.
+
+Against a 1.2 bps fee and a 1.5 bps markout deficit, a third of a basis point
+is a rounding error. The honest summary is that conditioning works and does
+not remotely close the gap.
+
+### Reading the verdict
+
+| Verdict | Meaning |
+|---|---|
+| `THE SPREAD NEVER COVERED THE FEE` | Arithmetic, not execution. The half spread is below the maker round trip, so a flawless fill loses. Look at a wider-spread symbol or venue, or a tier with a maker rebate. |
+| `ADVERSE SELECTION EXCEEDS THE SPREAD` | The spread would have covered the fee, but whoever fills you knows where price is going. No queue assumption rescues it. |
+| `DEPENDS ENTIRELY ON QUEUE POSITION` | The bracket straddles zero. This is the case where queue position *is* the strategy — a late passive fill is a different trade from an early one. |
+| `PASSIVE ENTRY PAYS, EVEN AT THE BACK OF THE QUEUE` | Clears cost under the pessimistic rule. Confirm on another date, size from the pessimistic number, treat the rest as headroom. |
+
+### Options worth knowing
+
+| flag | default | note |
+|---|---|---|
+| `--source` | `tardis` | `raw` reads `data/raw/` — the real venue, through the same reader `replay.py` uses. |
+| `--quote-interval` | `1000` ms | Quotes overlap whenever this is below `--timeout`. The effective-sample-size correction accounts for it; the raw fill counts do not. |
+| `--timeout` | `60` s | How long a quote rests. Longer raises the fill rate and worsens the markout — both bounds move together. |
+| `--decision-horizon` | `60` s | Horizon the verdict is taken at. On this data anything past ~10s is inside the noise. |
+| `--conditional-model` | `pessimistic` | Queue rule the conditional table uses — the one you should plan with. |
+| `--hours` | all | Both sources parse into memory, as the importers do. Start with 2; six hours is ~10 minutes and ~2 GB. |
+
+### What it does not model
+
+Your own order changes the book, and nothing here accounts for that: the quote
+is assumed small enough not to matter to the queue and large enough to matter
+to you. It rests at a fixed price rather than being requoted as the touch
+moves, which is the conservative choice — a managed quote fills more often and
+is selected against harder.
+
+And with `--source tardis` this is Binance, not BloFin. Fill rates are a
+property of one venue's queue and do not transfer. Binance BTCUSDT perp is
+also close to the worst case for this question: the most arbitraged perpetual
+in existence, quoted one tick wide. A less efficient venue, or a symbol whose
+spread is several ticks, is where the arithmetic gate above could plausibly
+come out the other way — and testing that costs one `--symbol` flag.
+
+The BloFin answer needs `--source raw` and enough recorded hours to be worth
+reading, which is one more argument for leaving the recorder running.
+
+---
+
 ## replay.py — rebuild features from the raw archive
 
 ```

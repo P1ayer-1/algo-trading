@@ -68,10 +68,11 @@ first. Recording is therefore step one, not step four.
 │   │   ├── cross_sectional_import.py  # the same, as a multi-symbol panel
 │   │   ├── check_features.py  # do the features predict anything?
 │   │   ├── train_model.py     # LightGBM + shuffled-label control + paired test
+│   │   ├── passive_sim.py     # markout curves + bracketed passive fill rates
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (238 tests)
+│   └── tests/                 # pytest suite (271 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── features-*.csv         #   labelled features — regenerable
 │   └── raw/                   #   raw events — IRREPLACEABLE
@@ -211,11 +212,12 @@ cd backend
 python -m pytest
 ```
 
-238 tests covering the order book's gap handling, the OFI recursion, the
+271 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
-raw-archive round trip, and the evaluation statistics. They need
-no network, credentials, or SDK.
+raw-archive round trip, the passive simulator's aggressor convention and
+queue bracket, and the evaluation statistics. They need no network,
+credentials, or SDK.
 
 ## Roadmap toward the actual bot
 
@@ -298,22 +300,64 @@ Next, in order:
    LightGBM does beat the linear baseline here in a way it never did on BTC
    alone (decile monotonicity +0.960 vs +0.697 at 900s), so the non-linearity
    is real in the cross-section. It is just nowhere near two round trips.
-9. **Execution, or a different question.** Two readings of the above, and they
-   point in the same direction. The effect found is *reversal*, which is the
-   return to providing liquidity to whatever just moved — so the edge lives on
-   the passive side of the book, not the aggressive one. And every result so
-   far has died on cost rather than on prediction. Measuring the real passive
-   fill rate and its adverse selection is now worth more than any further
-   feature work. Perp funding carry is the other open question, and it is the
-   one that needs no directional forecast at all.
+9. ~~**Execution — what a passive quote actually earns**~~ —
+   `backend\analysis\passive_sim.py`. Two readings of step 8 pointed the same
+   way. The effect found is *reversal*, which is the return to providing
+   liquidity to whatever just moved, so the edge lives on the passive side of
+   the book; and every result so far had died on cost rather than prediction.
+   Measuring the real passive fill rate and its adverse selection was worth
+   more than any further feature work.
+
+   **Run, and it fails on arithmetic before it gets to adverse selection.**
+   Six hours of Binance BTCUSDT (Tardis, 2026-09-01), quoting at the touch
+   every second with a 60s timeout. Queue position is unobservable, so it is
+   bracketed rather than modelled — pessimistic joins behind the whole visible
+   size `Q` and fills only once same-side aggressor volume exceeds it,
+   optimistic fills on any trade at the price:
+
+   | | optimistic | cancel-adj | pessimistic |
+   |---|---|---|---|
+   | fill rate (bid) | 96.7% | 84.6% | 63.2% |
+   | median wait | 0.4s | 2.9s | 10.4s |
+   | markout @ 0s | +0.019 | +0.005 | **−0.400** |
+   | markout @ 60s | −0.110 `±0.155` | −0.607 `±0.157` | −1.489 `±0.159` |
+   | net of maker fees | −1.310 | −1.807 | **−2.689** |
+
+   The median half spread is **0.006 bps against a 1.2 bps maker round trip**.
+   Binance BTCUSDT perp is one tick wide almost always, and one tick is $0.10
+   on a $110k instrument — so a flawless fill at the front of the queue,
+   marked out instantly, against a counterparty who knows nothing, loses 1.19
+   bps before adverse selection is even involved. That is not a queue problem
+   or a signal problem. Conditioning on `obi_1` survives an out-of-sample
+   split and helps by **+0.31 bps** while *raising* the fill rate, which is a
+   real effect and a rounding error against the gap.
+
+   Two things the bracket bought that a point estimate would not have. The
+   fill-rate range is 63%–97%, so any single fill-rate assumption is an
+   assumption; and markout is already **−0.400 bps at the instant of the
+   pessimistic fill**, sixty times the half spread, which says a back-of-queue
+   fill arrives precisely when the level is being swept. Queue position is not
+   a detail here, it is the trade. Measured cancellation share at the touch is
+   **92%**, so the truth sits far closer to the optimistic bound — and the
+   optimistic bound also loses.
+
+   Where this leaves the passive idea: not dead, but not on this instrument.
+   The gate to clear is a spread wider than 1.2 bps, which BTC perp on the
+   most arbitraged venue in existence will never offer. A less efficient venue
+   (BloFin itself, via `--source raw`), a wider-spread symbol, or a fee tier
+   with a maker rebate are the three things that could change the arithmetic,
+   and each costs one flag to test. Perp funding carry remains the other open
+   question, and it is the one that needs no directional forecast at all.
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
    `check_order()`. This is where the existing kill switch finally guards
    something real. Demo account only.
 12. **Backtesting / paper trading** — with realistic fees, queue position and
-   slippage. Expect the paper results to be considerably worse than the
-   backtest; that gap is the honest measure of the model.
+   slippage. Step 9 already built the queue-position half of this: reuse
+   `passive_sim.py`'s bracket rather than picking a single fill assumption,
+   and report both bounds. Expect the paper results to be considerably
+   worse than the backtest; that gap is the honest measure of the model.
 
 Given the stated leverage profile: this stays on the BloFin demo environment
 until steps 5-11 are done and the liquidation math has been checked against the
