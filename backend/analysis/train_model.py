@@ -75,6 +75,7 @@ from analysis.check_features import (  # noqa: E402
     build_matrix,
     drop_constant_features,
     load_rows,
+    panel_geometry,
 )
 from analysis.stats import (  # noqa: E402
     auc,
@@ -149,9 +150,45 @@ def decimate(count: int, stride: int) -> np.ndarray:
     return np.arange(0, count, max(1, stride))
 
 
+def decimate_by_timestamp(timestamps: np.ndarray, stride: int) -> np.ndarray:
+    """Row indices belonging to every `stride`-th distinct timestamp.
+
+    For a cross-sectional panel, thinning by row would keep an arbitrary
+    scattering of symbols and destroy the cross-section. Thinning by timestamp
+    keeps whole cross-sections and drops the overlapping ones between them,
+    which is what non-overlapping means for panel data.
+    """
+    unique = np.unique(timestamps)
+    kept = set(unique[:: max(1, stride)].tolist())
+    return np.flatnonzero(np.isin(timestamps, list(kept)))
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
+
+
+def _clusters(groups: Optional[np.ndarray], count: int) -> Optional[List[np.ndarray]]:
+    """Row indices grouped by `groups`, or None when every row stands alone."""
+    if groups is None:
+        return None
+    unique = np.unique(groups)
+    if len(unique) == len(groups):
+        return None
+    order = np.argsort(groups, kind="stable")
+    sorted_groups = groups[order]
+    edges = np.flatnonzero(np.diff(sorted_groups)) + 1
+    return np.split(order, edges)
+
+
+def _resample(
+    rng: np.random.Generator, count: int, clusters: Optional[List[np.ndarray]]
+) -> np.ndarray:
+    """One bootstrap draw: rows, or whole clusters of rows."""
+    if clusters is None:
+        return rng.integers(0, count, count)
+    pick = rng.integers(0, len(clusters), len(clusters))
+    return np.concatenate([clusters[index] for index in pick])
 
 
 def bootstrap_top_decile(
@@ -160,23 +197,31 @@ def bootstrap_top_decile(
     *,
     draws: int = 2000,
     seed: int = 0,
+    groups: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, float]:
     """Mean top-decile forward return with a 95% bootstrap interval.
 
     Rows must already be decimated to non-overlapping forward windows, or the
     resampling assumption is false and the interval comes out too narrow.
+
+    `groups` turns this into a cluster bootstrap, resampling whole groups
+    rather than rows. Pass the timestamp of each row for a cross-sectional
+    panel: ten symbols observed at the same instant are ten correlated
+    measurements of one moment, and resampling them independently would report
+    an interval roughly sqrt(10) too narrow.
     """
     rng = np.random.default_rng(seed)
     count = len(returns)
     cut = max(1, count // 10)
     point = float(np.sort(returns[np.argsort(scores)][-cut:]).mean())
+    clusters = _clusters(groups, count)
 
     means = np.empty(draws)
     for draw in range(draws):
-        pick = rng.integers(0, count, count)
+        pick = _resample(rng, count, clusters)
         sample_scores, sample_returns = scores[pick], returns[pick]
         order = np.argsort(sample_scores)
-        means[draw] = sample_returns[order][-cut:].mean()
+        means[draw] = sample_returns[order][-max(1, len(pick) // 10):].mean()
     low, high = np.percentile(means, [2.5, 97.5])
     return point, float(low), float(high)
 
@@ -188,6 +233,7 @@ def paired_top_decile_difference(
     *,
     draws: int = 2000,
     seed: int = 0,
+    groups: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, float]:
     """Bootstrap `top_decile(a) - top_decile(b)` on the SAME resampled rows.
 
@@ -205,14 +251,16 @@ def paired_top_decile_difference(
     rng = np.random.default_rng(seed)
     count = len(returns)
     cut = max(1, count // 10)
+    clusters = _clusters(groups, count)
 
     def top(scores: np.ndarray, values: np.ndarray) -> float:
-        return float(values[np.argsort(scores)][-cut:].mean())
+        cutoff = max(1, len(values) // 10)
+        return float(values[np.argsort(scores)][-cutoff:].mean())
 
     point = top(scores_a, returns) - top(scores_b, returns)
     differences = np.empty(draws)
     for draw in range(draws):
-        pick = rng.integers(0, count, count)
+        pick = _resample(rng, count, clusters)
         sampled = returns[pick]
         differences[draw] = (top(scores_a[pick], sampled)
                              - top(scores_b[pick], sampled))
@@ -226,9 +274,11 @@ def score_report(
     returns: np.ndarray,
     *,
     seed: int,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     binary = (returns > 0).astype(float)
-    point, low, high = bootstrap_top_decile(scores, returns, seed=seed)
+    point, low, high = bootstrap_top_decile(scores, returns, seed=seed,
+                                            groups=groups)
     deciles = decile_returns(scores, returns)
     monotonic = float(
         np.corrcoef(np.arange(len(deciles)), deciles)[0, 1]
@@ -424,9 +474,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     X, names = drop_constant_features(X, names)
     del rows
 
-    intervals = np.diff(timestamps)
-    interval_s = float(np.median(intervals)) / 1000.0 if len(intervals) else 1.0
-    stride = max(1, math.ceil(args.horizon / max(interval_s, 1e-9)))
+    interval_s, rows_per_ts, n_unique = panel_geometry(timestamps)
+    if interval_s <= 0:
+        raise SystemExit("Timestamps do not advance; nothing to split on.")
+    # Rows sharing a forward window. For a panel this is the time overlap
+    # multiplied by the width of the cross-section.
+    timestamp_stride = max(1, math.ceil(args.horizon / interval_s))
+    stride = max(1, math.ceil(timestamp_stride * max(1.0, rows_per_ts)))
 
     params = dict(DEFAULT_PARAMS)
     params["seed"] = args.seed
@@ -448,6 +502,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("DATA AND SPLIT")
     print("=" * 78)
     print(f"  rows                 {len(y):,}")
+    if rows_per_ts > 1.01:
+        print(f"  cross-section        {n_unique:,} timestamps x "
+              f"{rows_per_ts:.1f} rows each")
     print(f"  features             {len(names)}")
     print(f"  horizon              {args.horizon:g}s")
     print(f"  sample interval      {interval_s:g}s")
@@ -459,7 +516,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  purge gap            {stride:,} rows")
     print(f"  test                 {test.stop - test.start:,} rows "
           f"(untouched until the end)")
-    keep = decimate(test.stop - test.start, stride)
+    test_timestamps = timestamps[test]
+    keep = (decimate_by_timestamp(test_timestamps, timestamp_stride)
+            if rows_per_ts > 1.01
+            else decimate(test.stop - test.start, stride))
+    groups = test_timestamps[keep] if rows_per_ts > 1.01 else None
     print(f"  test, decimated      {len(keep):,} non-overlapping rows")
     if len(keep) < 200:
         raise SystemExit(
@@ -528,14 +589,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     weights = fit_logistic(X_train, (y_train > 0).astype(float), l2=1.0)
     results.append(score_report(
         "logistic baseline", predict_proba(X_test, weights)[keep], y_eval,
-        seed=args.seed,
+        seed=args.seed, groups=groups,
     ))
     model_result = score_report(
-        "lightgbm", test_scores[keep], y_eval, seed=args.seed,
+        "lightgbm", test_scores[keep], y_eval, seed=args.seed, groups=groups,
     )
     model_result["per_seed"] = [
-        float(score_report("run", run[keep], y_eval, seed=args.seed)
-              ["top_decile_bps"])
+        float(score_report("run", run[keep], y_eval, seed=args.seed,
+                           groups=groups)["top_decile_bps"])
         for run in test_score_runs
     ]
     results.append(model_result)
@@ -562,11 +623,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             ))
         control = score_report(
             "shuffled control", np.mean(control_runs, axis=0)[keep], y_eval,
-            seed=args.seed,
+            seed=args.seed, groups=groups,
         )
         control["per_seed"] = [
-            float(score_report("run", run[keep], y_eval, seed=args.seed)
-                  ["top_decile_bps"])
+            float(score_report("run", run[keep], y_eval, seed=args.seed,
+                               groups=groups)["top_decile_bps"])
             for run in control_runs
         ]
         results.append(control)
@@ -580,10 +641,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     control_scores = (np.mean(control_runs, axis=0)[keep]
                       if not args.no_control else model_scores)
     vs_control = paired_top_decile_difference(
-        model_scores, control_scores, y_eval, seed=args.seed
+        model_scores, control_scores, y_eval, seed=args.seed, groups=groups
     )
     vs_baseline = paired_top_decile_difference(
-        model_scores, baseline_scores, y_eval, seed=args.seed
+        model_scores, baseline_scores, y_eval, seed=args.seed, groups=groups
     )
     print_paired([
         ("lightgbm - shuffled control", vs_control),
@@ -605,6 +666,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "best_iterations": [each.best_iteration for each in boosters],
         "sample_interval_s": interval_s,
         "overlap_stride": stride,
+        "rows_per_timestamp": rows_per_ts,
         "rows": {"train": train.stop - train.start,
                  "valid": valid.stop - valid.start,
                  "test": test.stop - test.start,

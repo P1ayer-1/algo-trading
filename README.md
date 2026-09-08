@@ -65,12 +65,13 @@ first. Recording is therefore step one, not step four.
 │   │   └── risk.py            # liquidation math, sizing, hard limits
 │   ├── analysis/              # offline tooling (see analysis/README.md)
 │   │   ├── bars_import.py     # free Binance bar/OI/funding history -> dataset
+│   │   ├── cross_sectional_import.py  # the same, as a multi-symbol panel
 │   │   ├── check_features.py  # do the features predict anything?
 │   │   ├── train_model.py     # LightGBM + shuffled-label control + paired test
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (219 tests)
+│   └── tests/                 # pytest suite (238 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── features-*.csv         #   labelled features — regenerable
 │   └── raw/                   #   raw events — IRREPLACEABLE
@@ -210,7 +211,7 @@ cd backend
 python -m pytest
 ```
 
-219 tests covering the order book's gap handling, the OFI recursion, the
+238 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, and the evaluation statistics. They need
@@ -264,19 +265,58 @@ Next, in order:
    The constraint is the feature set, not the model class. Adding capacity to
    a model that already cannot separate itself from noise is the one move
    guaranteed not to help.
-8. **Better features, then regime detection** — the honest next step. The bar
-   feature set is bars, open interest, positioning and carry; it has no
-   cross-asset, no order-flow at the trading horizon, and no event data. Also
-   replace the percentile-based `vol_regime` placeholder with a fitted model.
-9. **Execution engine** — adaptive limit orders, wired to the risk engine's
+8. **Cross-sectional panel** — `backend\analysis\cross_sectional_import.py`.
+   Ten majors, 364 days, 349,420 rows: predict which coin outperforms rather
+   than where BTC goes, so the market factor is subtracted from the label
+   instead of forecast.
+
+   **The clearest signal this project has found, and still not tradeable.**
+   Ten features significant at |IC| 0.02-0.04, and *every* momentum sign
+   negative — short-horizon cross-sectional reversal, the coin that led the
+   last 15-240 minutes lagging the next 15. Sign consistency across ten
+   independent lookbacks is what a real effect looks like; noise gives random
+   signs. On a 70/30 purged split the linear decile ladder is monotonic at
+   **+0.957**.
+
+   But the size is wrong by an order of magnitude. Top decile +0.49bps, bottom
+   −0.41bps, so a long/short spread of ~0.9bps against **2.4bps** for two
+   maker legs. And under the stricter test — 60/20/20 with a shuffled-label
+   control — neither model separates from its control at any horizon:
+
+   | horizon | LightGBM | shuffled control | paired difference |
+   |---|---|---|---|
+   | 300s | +0.79 bps | +0.57 bps | +0.22 `[-0.05, +0.50]` |
+   | 900s | +0.36 bps | +0.21 bps | +0.15 `[-0.53, +0.83]` |
+   | 1800s | +0.50 bps | −0.04 bps | +0.54 `[-0.53, +1.54]` |
+
+   Worth noting the control clears zero at 300s. That is the top-decile metric
+   itself being biased upward for any score correlated with cross-sectional
+   volatility — high-beta names have fatter right tails, so selecting on
+   anything vol-adjacent lifts the mean. Catching that is precisely why the
+   control exists.
+
+   LightGBM does beat the linear baseline here in a way it never did on BTC
+   alone (decile monotonicity +0.960 vs +0.697 at 900s), so the non-linearity
+   is real in the cross-section. It is just nowhere near two round trips.
+9. **Execution, or a different question.** Two readings of the above, and they
+   point in the same direction. The effect found is *reversal*, which is the
+   return to providing liquidity to whatever just moved — so the edge lives on
+   the passive side of the book, not the aggressive one. And every result so
+   far has died on cost rather than on prediction. Measuring the real passive
+   fill rate and its adverse selection is now worth more than any further
+   feature work. Perp funding carry is the other open question, and it is the
+   one that needs no directional forecast at all.
+10. **Regime detection** — replace the percentile-based `vol_regime`
+   placeholder with a fitted model.
+11. **Execution engine** — adaptive limit orders, wired to the risk engine's
    `check_order()`. This is where the existing kill switch finally guards
    something real. Demo account only.
-10. **Backtesting / paper trading** — with realistic fees, queue position and
+12. **Backtesting / paper trading** — with realistic fees, queue position and
    slippage. Expect the paper results to be considerably worse than the
    backtest; that gap is the honest measure of the model.
 
 Given the stated leverage profile: this stays on the BloFin demo environment
-until steps 5-9 are done and the liquidation math has been checked against the
+until steps 5-11 are done and the liquidation math has been checked against the
 exchange's own numbers. Leverage magnifies model *and* execution errors, and
 the risk engine's default limits (5x, 15% liquidation buffer) are deliberately
 far more conservative than the project's stated ambition.

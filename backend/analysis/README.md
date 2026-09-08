@@ -297,6 +297,58 @@ wrong dataset.
 
 ---
 
+## cross_sectional_import.py — which coin outperforms, not where BTC goes
+
+```
+python backend\analysis\cross_sectional_import.py
+python backend\analysis\check_features.py --data-dir data\cross\... --horizon 900
+python backend\analysis\train_model.py    --data-dir data\cross\... --horizon 900
+```
+
+`bars_import.py` asks "will BTC be higher in 15 minutes?" A year of data and
+two model classes said no, with intervals tight enough to believe it. That is
+the expected answer — BTC-USDT perp is among the most arbitraged instruments in
+existence.
+
+This asks a different question. The label is each symbol's forward return
+**minus the cross-sectional mean**, so the market factor is subtracted out
+rather than predicted, and what remains is dispersion across the ten most
+liquid USDT-M perpetuals. Features are the same ones converted to
+cross-sectional ranks in `[-1, +1]`: a raw `ret_60m` of +40bps says little,
+but being the strongest of ten majors over the last hour is a statement about
+relative positioning that is scale-free and comparable across regimes.
+
+Ranks rather than z-scores, deliberately — a z-score is dominated by whichever
+coin had an outlier that minute, and this data has an outlier most minutes.
+
+### Two assumptions it breaks downstream, and how they are fixed
+
+Rows become one per (timestamp, symbol). Both fixes live in
+`check_features.panel_geometry()` and are no-ops for single-asset files.
+
+**The purge gap is measured in rows.** With ten symbols per timestamp, a gap
+computed from `span / (rows - 1)` is ten times too short *in time*, so training
+rows end up inside the test period's forward window. The gap is now
+`horizon / interval x rows_per_timestamp`, with the interval taken from
+distinct timestamps.
+
+**Bootstrap resampling must draw whole timestamps.** Ten symbols observed at
+one instant are ten correlated measurements of one moment. Resampling them as
+independent rows reports an interval roughly `sqrt(10)` too narrow.
+`train_model.py` switches to a cluster bootstrap automatically when it sees
+duplicate timestamps.
+
+### The cost of not having to know where the market is going
+
+A cross-sectional position is two legs, so it pays two round trips: 2.4bps
+maker or 20bps taker at VIP 1. `--threshold-bps` defaults to the latter. The
+edge has to clear double what a directional trade needed.
+
+Note also that `--sample-minutes` defaults to 15 rather than 5: ten symbols
+multiply the row count, and every tool downstream loads the file into memory.
+
+---
+
 ## train_model.py — LightGBM, and whether it beats nothing
 
 ```

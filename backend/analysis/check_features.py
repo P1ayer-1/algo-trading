@@ -67,6 +67,9 @@ from analysis.stats import (  # noqa: E402
 EXCLUDED_FEATURES = {
     "ts",
     "received_ts",
+    # Panel identifier, not a feature. It is also a string, and without this it
+    # would parse as NaN and silently drop every row in a cross-sectional file.
+    "symbol",
     "mid",
     "microprice",
     "spread",
@@ -77,6 +80,24 @@ EXCLUDED_FEATURES = {
 
 # An out-of-sample IC above this is almost never real at HFT horizons.
 SUSPICIOUS_IC = 0.20
+
+
+def panel_geometry(timestamps: np.ndarray) -> Tuple[float, float, int]:
+    """(sample interval in seconds, rows per timestamp, distinct timestamps).
+
+    A single-asset file has one row per timestamp and this reduces to the
+    obvious thing. A cross-sectional file has one row per (timestamp, symbol),
+    and every quantity derived from `len(rows)` is then wrong by the width of
+    the panel: the naive interval collapses toward zero, which silently shrinks
+    the purge gap by the same factor and lets training rows sit inside the test
+    period's forward window.
+    """
+    unique = np.unique(timestamps)
+    if len(unique) < 2:
+        return 0.0, float(len(timestamps)), len(unique)
+    span_seconds = float(unique.max() - unique.min()) / 1000.0
+    interval = span_seconds / (len(unique) - 1)
+    return interval, len(timestamps) / len(unique), len(unique)
 
 # The longest BACKWARD-looking window any feature uses (rv_60s). A row younger
 # than this reports padded zeros for its slowest features.
@@ -197,13 +218,19 @@ def describe(
     y: np.ndarray, timestamps: np.ndarray, horizon: float, threshold_bps: float
 ) -> Tuple[float, int]:
     span_seconds = (timestamps.max() - timestamps.min()) / 1000.0
-    interval = span_seconds / max(1, len(timestamps) - 1)
-    eff_n = effective_sample_size(len(y), horizon, interval)
+    interval, rows_per_ts, n_unique = panel_geometry(timestamps)
+    # Counted in distinct timestamps, not rows. For a cross-sectional panel
+    # that treats one whole cross-section as a single observation, which
+    # understates the true figure - the safe direction to be wrong in.
+    eff_n = effective_sample_size(n_unique, horizon, interval)
 
     print("\n" + "=" * 72)
     print("DATA")
     print("=" * 72)
     print(f"  rows                  {len(y):,}")
+    if rows_per_ts > 1.01:
+        print(f"  cross-section         {n_unique:,} timestamps x "
+              f"{rows_per_ts:.1f} rows each")
     print(f"  time span             {span_seconds / 3600:.2f} hours")
     print(f"  mean sample interval  {interval * 1000:.0f} ms")
     print(f"  forward horizon       {horizon:g}s")
@@ -306,8 +333,12 @@ def evaluate(
     horizon: float,
     interval: float,
     cost_bps: float,
+    rows_per_timestamp: float = 1.0,
 ) -> Dict[str, float]:
-    purge = max(1, int(horizon / max(interval, 1e-9)))
+    # In ROWS, so it has to scale with the width of the panel.
+    purge = max(1, int(math.ceil(
+        horizon / max(interval, 1e-9) * max(1.0, rows_per_timestamp)
+    )))
     train, test = purged_split(len(y), train_fraction=0.7, purge_rows=purge)
 
     print("\n" + "=" * 72)
@@ -448,6 +479,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     X, names = drop_constant_features(X, names)
 
     interval, eff_n = describe(y, timestamps, args.horizon, args.threshold_bps)
+    _, rows_per_ts, _ = panel_geometry(timestamps)
     ics = information_coefficients(X, y, names, eff_n)
     clean = leakage_checks(ics, y, eff_n)
 
@@ -455,7 +487,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("\nLeakage checks failed. Fix those before trusting anything below.\n")
 
     evaluate(X, y, names, horizon=args.horizon, interval=interval,
-             cost_bps=args.cost_bps)
+             cost_bps=args.cost_bps, rows_per_timestamp=rows_per_ts)
     return 0
 
 
