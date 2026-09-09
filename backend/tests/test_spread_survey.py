@@ -213,8 +213,29 @@ def test_every_known_tier_has_a_maker_below_its_taker():
         assert maker < taker, f"VIP {tier} has maker >= taker"
 
 
+def test_the_tier_ladder_never_gets_worse_as_it_goes_up(monkeypatch):
+    """A transcription error in the fee table moves every verdict downstream.
+
+    Every number in VIP_TIERS was copied by hand from somewhere else, and the
+    table is the most load-bearing thing in the project. Monotonicity is the
+    one invariant that catches a whole class of those errors.
+    """
+    import config
+
+    ordered = sorted(config.VIP_TIERS.items())
+    for (low, (low_maker, low_taker)), (high, (high_maker, high_taker)) in zip(
+        ordered, ordered[1:]
+    ):
+        assert high_maker <= low_maker, f"tier {high} maker is worse than {low}"
+        assert high_taker <= low_taker, f"tier {high} taker is worse than {low}"
+        assert (high_maker, high_taker) != (low_maker, low_taker), (
+            f"tiers {low} and {high} share rates, which is what a "
+            "mis-numbered reading looks like"
+        )
+
+
 def test_no_tier_pays_a_maker_rebate():
-    # The floor is 0% maker at VIP 5. If a negative rate ever appears here it
+    # The floor is 0% maker at VIP 5, the top of the ladder. If a negative rate ever appears here it
     # inverts the passive economics entirely and every conclusion in
     # analysis/README under passive_sim.py has to be revisited -- so it should
     # not slip in unnoticed.
@@ -233,11 +254,16 @@ def test_the_tier_is_selectable_and_an_unknown_one_is_refused(monkeypatch):
     assert reloaded.COST_MAKER_MAKER_BPS == reloaded.MAKER_FEE_BPS * 2
     assert reloaded.VIP_TIER == 1
 
-    # Tiers 3 and 4 exist on BloFin but their rates were never confirmed.
-    # Guessing them would be worse than refusing.
     monkeypatch.setenv("BLOFIN_VIP_TIER", "3")
-    with pytest.raises(SystemExit):
-        importlib.reload(config)
+    reloaded = importlib.reload(config)
+    assert reloaded.VIP_TIER == 3
+
+    # VIP 4 exists on BloFin but its rates have never been confirmed, and the
+    # ladder ends at VIP 5. Guessing either is worse than refusing.
+    for unknown in ("4", "6"):
+        monkeypatch.setenv("BLOFIN_VIP_TIER", unknown)
+        with pytest.raises(SystemExit):
+            importlib.reload(config)
 
     monkeypatch.delenv("BLOFIN_VIP_TIER")
     importlib.reload(config)

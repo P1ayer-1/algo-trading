@@ -469,6 +469,54 @@ Next, in order:
    the search-result reading above, and at +0.77 bps a 0.2 bps error in the
    maker fee is a quarter of the result. Worth reading off a real fill.
 
+   ### The tier has stopped being the biggest lever, and that is the finding
+
+   Account-reported on 2026-09-09: VIP 3 is 0.0020% / 0.0425%, and the ladder
+   **ends at VIP 5** — which independently corroborates the original reading
+   of the top tier. VIP 4 is still unconfirmed and stays absent rather than
+   interpolated. With tier 3 filled in, the whole ladder is visible at once,
+   and it is front-loaded to the point of being lopsided:
+
+   | step | gain, bps of round trip |
+   |---|---|
+   | VIP 0 → VIP 1 | **+2.80** |
+   | VIP 1 → VIP 2 | +0.40 |
+   | VIP 2 → VIP 3 | +0.40 |
+   | VIP 3 → VIP 5 | +0.40 |
+
+   **The first step is 70% of the entire ladder, and this account has already
+   taken it.** Everything remaining between here and the top of BloFin's
+   schedule is worth 1.20 bps.
+
+   Net passive round trip at the front of the queue, from step 9a's measured
+   markouts:
+
+   | symbol | VIP 0 | VIP 1 | VIP 2 | VIP 3 | VIP 5 | queue bracket |
+   |---|---|---|---|---|---|---|
+   | ADAUSDT | −2.03 | +0.77 | +1.17 | +1.57 | +1.97 | **6.30** |
+   | LTCUSDT | −3.62 | −0.82 | −0.42 | −0.02 | +0.38 | 2.90 |
+   | DOGEUSDT | −3.68 | −0.88 | −0.48 | −0.08 | +0.32 | 2.08 |
+   | AVAXUSDT | −3.82 | −1.02 | −0.62 | −0.22 | +0.18 | 2.29 |
+   | BTCUSDT | −4.11 | −1.31 | −0.91 | −0.51 | −0.11 | 1.21 |
+
+   Read the last column against the rest of the table. **ADA's uncertainty
+   about queue position spans 6.30 bps. The entire fee ladder, VIP 0 to VIP 5,
+   spans 4.00.** So the single largest unknown in the passive branch is no
+   longer the fee schedule — it is where in the queue an order actually sits,
+   and no tier upgrade touches it.
+
+   There is a floor underneath all of this that no tier can lift. The maker
+   fee bottoms out at zero, but adverse selection was measured at ~0.5 bps per
+   leg and does not scale with spread, so a passive round trip needs about
+   **1.0 bps of spread at any tier**, forever. VIP 5 does not make quoting
+   free; it makes quoting cost exactly adverse selection.
+
+   One more thing belongs in the decision, since VIP 3 is volume-qualified
+   rather than asset-qualified: 30-day futures volume is earned by trading at
+   your *current* tier's fees. If passive quoting is unprofitable at VIP 1,
+   the route to VIP 3 is paid for in losses, and +0.80 bps is what is being
+   bought. That is a real trade to evaluate, not an obvious yes.
+
    Re-run of the step 9a survey at the VIP 1 gate, from the same measurements:
 
    | symbol | spread | clears 1.2 gate | clears 2.2 w/ adv. sel. | net (optimistic) | net (pessimistic) |

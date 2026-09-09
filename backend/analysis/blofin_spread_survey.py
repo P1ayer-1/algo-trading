@@ -152,6 +152,23 @@ class SpreadSamples:
         return clearing / len(self.spreads_bps)
 
     @property
+    def above_bar(self) -> float:
+        """Fraction of samples clearing the empirical bar.
+
+        Reported in preference to `above_gate` because this is the bar that
+        binds at every tier. The arithmetic gate is `2 x maker fee`, which
+        goes to ZERO at the top tier and is then trivially cleared by any
+        positive spread - a column reading 100.0% for all 487 instruments
+        measures nothing. Adverse selection has no such floor, so this one
+        stays meaningful however good the fee schedule gets.
+        """
+        if not self.spreads_bps:
+            return float("nan")
+        clearing = sum(1 for value in self.spreads_bps
+                       if value >= EMPIRICAL_GATE_BPS)
+        return clearing / len(self.spreads_bps)
+
+    @property
     def passes(self) -> bool:
         return self.samples > 0 and clears_fee_gate(self.median_bps)
 
@@ -285,13 +302,24 @@ def report(rows: Sequence[SpreadSamples], *, minutes: float, interval: float,
     print(f"BLOFIN SPREAD SURVEY  ({minutes:g} min at {interval:g}s, "
           f"{len(rows)} instruments)")
     print("=" * 86)
+    vacuous = ROUND_TRIP_MAKER_BPS <= 0
     print(f"  gate: a passive round trip captures the whole spread and pays "
           f"{ROUND_TRIP_MAKER_BPS:.2f} bps")
     print(f"        ({MAKER_BPS:.2f} per leg), so an instrument needs a median "
           f"spread at or above that.")
-    print(f"  and:  measured adverse selection adds "
-          f"{ADVERSE_SELECTION_BPS_PER_LEG:.1f} bps per leg, so the empirical "
-          f"bar is {EMPIRICAL_GATE_BPS:.2f} bps.")
+    if vacuous:
+        print("        -- which at this tier is ZERO, so the fee gate is "
+              "vacuous: every")
+        print("           positive spread clears it, and the bar below is "
+              "the only one that binds.")
+    print(f"  bar:  measured adverse selection adds "
+          f"{ADVERSE_SELECTION_BPS_PER_LEG:.1f} bps per leg, so the bar that "
+          f"matters is {EMPIRICAL_GATE_BPS:.2f} bps.")
+    print("        Fees fall with the tier; adverse selection does not, so "
+          "this bar can never")
+    print(f"        go below "
+          f"{2 * ADVERSE_SELECTION_BPS_PER_LEG:.1f} bps however good the "
+          "schedule gets.")
     if min_volume_usd > 0:
         print(f"  filtered to 24h volume >= ${min_volume_usd:,.0f}.")
 
@@ -303,7 +331,7 @@ def report(rows: Sequence[SpreadSamples], *, minutes: float, interval: float,
     shown = ranked[:top]
 
     print(f"\n  {'instrument':<18}{'spread':>9}{'p25':>8}{'p75':>8}"
-          f"{'tick bps':>10}{'above gate':>12}{'24h vol':>13}   verdict")
+          f"{'tick bps':>10}{'above bar':>12}{'24h vol':>13}   verdict")
     print("  " + "-" * 82)
     for entry in shown:
         volume = (f"${entry.volume_usd_24h/1e6:,.1f}M"
@@ -317,7 +345,7 @@ def report(rows: Sequence[SpreadSamples], *, minutes: float, interval: float,
         pinned = "*" if entry.tick_bound else " "
         print(f"  {entry.inst_id:<18}{entry.median_bps:>9.3f}"
               f"{entry.p25_bps:>8.3f}{entry.p75_bps:>8.3f}"
-              f"{entry.tick_bps:>9.3f}{pinned}{entry.above_gate:>11.1%}"
+              f"{entry.tick_bps:>9.3f}{pinned}{entry.above_bar:>11.1%}"
               f"{volume:>13}   {verdict}")
     if len(ranked) > len(shown):
         print(f"  ... {len(ranked) - len(shown)} more below "
@@ -329,7 +357,7 @@ def report(rows: Sequence[SpreadSamples], *, minutes: float, interval: float,
     passing = [row for row in ranked if row.passes]
     both = [row for row in ranked if row.passes_empirical]
     selective = [row for row in ranked
-                 if not row.passes and row.above_gate >= 0.10]
+                 if not row.passes_empirical and row.above_bar >= 0.10]
 
     print("\n" + "=" * 86)
     print("VERDICT")
@@ -365,7 +393,7 @@ def report(rows: Sequence[SpreadSamples], *, minutes: float, interval: float,
               "materially below Binance's - which is\n  plausible on a less "
               "arbitraged venue, and is a measurement, not a hope.")
     elif selective:
-        names = ", ".join(f"{row.inst_id} ({row.above_gate:.0%})"
+        names = ", ".join(f"{row.inst_id} ({row.above_bar:.0%})"
                           for row in selective[:8])
         print("  Nothing clears the gate on median spread, but some clear it "
               "part of the\n  time:\n    " + names)

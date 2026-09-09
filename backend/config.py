@@ -115,25 +115,77 @@ FEED_STALL_TIMEOUT_S = float(os.getenv("BLOFIN_FEED_STALL_TIMEOUT_S", "30"))
 # **Confirm against your own account before sizing anything on this.** The
 # tier that bills you is the one you are actually on.
 #
-# There is no maker rebate at any tier. The floor is 0.0000% maker at VIP 5,
-# so no BloFin schedule ever PAYS you to provide liquidity; the best available
-# case is that providing it becomes free. That kills the "a rebate would
-# invert the passive economics" idea outright -- see backend/analysis/README
-# under passive_sim.py.
+# There is no maker rebate at any tier. The floor is 0.0000% maker at the top
+# tier, so no BloFin schedule ever PAYS you to provide liquidity; the best
+# available case is that providing it becomes free. That kills the "a rebate
+# would invert the passive economics" idea outright -- see the README under
+# passive_sim.py.
+#
+# The consequence of a zero floor rather than a negative one is the single
+# most important thing in this table, and it is easy to miss: the fee can go
+# to zero but ADVERSE SELECTION CANNOT. Measured at ~0.5bps per passive leg,
+# it puts a hard floor of ~1.0bps on the spread a passive round trip needs, at
+# ANY tier. Tier improvements buy less and less as they approach it; past
+# VIP 3 they are nearly all bought already.
 VIP_TIERS: Dict[int, Tuple[Decimal, Decimal]] = {
     # tier: (maker, taker)
     0: (Decimal("0.00020"), Decimal("0.00060")),  # 0.0200% / 0.0600%
     1: (Decimal("0.00006"), Decimal("0.00050")),  # 0.0060% / 0.0500%
     2: (Decimal("0.00004"), Decimal("0.00045")),  # 0.0040% / 0.0450%
+    3: (Decimal("0.00002"), Decimal("0.000425")),  # 0.0020% / 0.0425%
     5: (Decimal("0.00000"), Decimal("0.00035")),  # 0.0000% / 0.0350%
 }
 
+# Tier 3 is account-reported (2026-09-09) rather than read off the published
+# page. The ladder ENDS at VIP 5, also account-reported, which corroborates
+# the original search-result reading of the top tier -- so tiers 0, 1, 2 and 5
+# now have two independent sources agreeing, and only VIP 4 is still missing.
+# It is absent rather than interpolated, for the same reason 3 and 4 both used
+# to be: a guessed number here silently moves every verdict downstream.
+#
 # Qualification is whichever of three thresholds you hit first, refreshed
 # daily at 12:00 UTC:
 #
 #   VIP 1   50,000 USDT held  |  10,000,000 USDT 30d futures  |  1,000,000 USDT 30d spot
 #   VIP 2                     |                               |  2,000,000 USDT 30d spot
+#   VIP 3+  thresholds not confirmed here -- volume-based
 #
+# Worth being clear-eyed about the volume route, because it is not free: 30d
+# futures volume is earned by trading at your CURRENT tier's fees. If passive
+# quoting is unprofitable at VIP 1, the path to VIP 3 is paid for in losses,
+# and that cost belongs in the decision alongside the better rate it buys.
+
+
+def _check_tier_ladder() -> None:
+    """A fee schedule must not get worse as the tier improves.
+
+    This is the most load-bearing table in the project and every number in it
+    was transcribed by hand from somewhere else. A transcription error here
+    silently moves every gate, every verdict and every "is there an edge"
+    answer downstream, so the one invariant that catches a whole class of them
+    is worth asserting at import.
+    """
+    ordered = sorted(VIP_TIERS.items())
+    for (low_tier, (low_maker, low_taker)), (high_tier, (high_maker, high_taker)) in zip(
+        ordered, ordered[1:]
+    ):
+        if high_maker > low_maker or high_taker > low_taker:
+            raise SystemExit(
+                f"VIP_TIERS is not monotonic: tier {high_tier} "
+                f"({high_maker}/{high_taker}) is worse than tier {low_tier} "
+                f"({low_maker}/{low_taker}). One of them is transcribed wrong."
+            )
+        if (high_maker, high_taker) == (low_maker, low_taker):
+            raise SystemExit(
+                f"VIP_TIERS has tier {low_tier} and tier {high_tier} on "
+                f"identical rates ({low_maker}/{low_taker}). That is what a "
+                "mis-numbered reading looks like; confirm which tier is real "
+                "and drop the other."
+            )
+
+
+_check_tier_ladder()
+
 # The asset route matters more than it looks. VIP 1 is reachable by holding
 # 50k on the exchange without trading a single contract, and the difference
 # between VIP 0 and VIP 1 is 2.0bps vs 0.6bps per passive leg -- which is the
@@ -148,8 +200,9 @@ VIP_TIER = int(os.getenv("BLOFIN_VIP_TIER", "0"))
 if VIP_TIER not in VIP_TIERS:
     raise SystemExit(
         f"BLOFIN_VIP_TIER={VIP_TIER} is not a tier this file has rates for. "
-        f"Known: {sorted(VIP_TIERS)}. Tiers 3 and 4 exist on BloFin but their "
-        "rates were never confirmed, so they are not guessed at here."
+        f"Known: {sorted(VIP_TIERS)}. VIP 4 exists on BloFin but its rates "
+        "have never been confirmed, so they are not guessed at here. The "
+        "ladder ends at VIP 5."
     )
 
 _TIER_MAKER, _TIER_TAKER = VIP_TIERS[VIP_TIER]
