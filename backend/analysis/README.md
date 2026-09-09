@@ -781,6 +781,71 @@ that changes in a regime this sample does not contain.
 
 A pass here earns an instrument a simulation, nothing more.
 
+**And it is the wrong venue.** Everything above is `binance-futures`, because
+that is what Tardis archives. This account trades on BloFin. See below.
+
+---
+
+## blofin_spread_survey.py — the same question, on the venue we actually use
+
+```
+python backendnalysislofin_spread_survey.py
+python backendnalysislofin_spread_survey.py --minutes 30 --min-volume-usd 5e6
+```
+
+`spread_survey.py` reads Tardis archives, and Tardis does not carry BloFin. So
+every execution-cost conclusion in this repo has strictly been a conclusion
+about Binance — the most arbitraged venue in existence — while the account
+sits on a much smaller one.
+
+BloFin's `getTickers()` returns best bid, best ask and 24h volume for all 487
+instruments in **one unauthenticated REST call**, so the venue-native survey
+needs no archive, no download and no API key. It polls that endpoint for
+`--minutes` and reports the median spread per instrument.
+
+The gate comes from `passive_sim.clears_fee_gate`, imported not restated, so
+the two tools cannot disagree about what passing means.
+
+### The endpoint was verified against the book before anything was believed
+
+A ticker endpoint that returned a cached or indicative quote would make this
+whole survey an artifact. Checked against `getOrderBook` per instrument, and
+against the recorder's own websocket feed for BTC-USDT:
+
+| instrument | ticker | order book | recorder (websocket) |
+|---|---|---|---|
+| BTC-USDT | 0.013 | 0.013 | 0.0127 |
+| ADA-USDT | 13.602 | 13.602 | — |
+| NEAR-USDT | 12.780 | 12.780 | — |
+
+Exact agreement, including on the one instrument where there is an independent
+third source. The endpoint is genuine top-of-book.
+
+### Two columns that carry the argument
+
+**`tick bps`** is `tickSize / mid`, the narrowest spread the instrument is
+allowed to quote. Where the measured spread sits on that floor (marked `*`),
+makers *cannot* compete the width away, so they queue behind it instead — the
+spread is a queue to reach the front of, not a payment for risk, and queue
+position is precisely what `passive_sim` refuses to model. Where the spread is
+well above its floor, makers are choosing that width, and the reason they
+choose it is adverse selection.
+
+**`24h vol`**, priced in USD rather than base units, because a wide spread on
+an instrument nobody trades is not an opportunity. Filtered at `$1M` by
+default.
+
+### What it does not tell you
+
+The `2.20 bps` empirical bar it prints uses adverse selection of 0.5 bps per
+leg — a number **measured on Binance** and assumed here. It has never been
+measured on BloFin, and a less arbitraged venue is not obviously the same in
+either direction. Measuring it needs a book and trade recording on the
+instrument itself, which the recorder already does: point `BLOFIN_INST_ID` at
+a candidate and run it.
+
+So a pass here earns an instrument a *recording*, which earns it a simulation.
+
 ---
 
 ## replay.py — rebuild features from the raw archive

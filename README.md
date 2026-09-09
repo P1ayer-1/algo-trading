@@ -450,22 +450,52 @@ Next, in order:
 
    **The repo had been assuming VIP 1 rates on an account that has never
    traded.** A fresh account is VIP 0, where the maker fee is 2.0 bps per leg
-   rather than 0.6 — a 4.0 bps round trip, not 1.2. The default is now VIP 0
-   (`BLOFIN_VIP_TIER`), because the entire history of this project is results
-   that died once their cost assumption was made honest.
+   rather than 0.6 — a 4.0 bps round trip, not 1.2. The repo *default* is
+   therefore VIP 0, because the entire history of this project is results that
+   died once their cost assumption was made honest.
 
-   The tier is now the single biggest lever in the project, and the threshold
-   sits exactly between two verdicts:
+   The tier is the single biggest lever in the project, and the threshold sits
+   exactly between two verdicts:
 
    | | gate | best instrument surveyed | front-of-queue net |
    |---|---|---|---|
    | VIP 0 | 5.0 bps | ADAUSDT at 5.019 | **−2.03** |
    | VIP 1 | 2.2 bps | ADAUSDT at 5.019 | **+0.77** |
 
-   VIP 1's cheapest route is **holding 50,000 USDT on the exchange** — an
-   asset threshold, not a volume one, so it is reachable without trading a
-   contract. Whether that is an acceptable thing to do is a decision, not a
-   measurement, and it is now the decision the passive branch waits on.
+   **This account is VIP 1** (confirmed 2026-09-09), so `BLOFIN_VIP_TIER=1` is
+   set in `.env` and the working numbers are the second row. The repo default
+   stays VIP 0 for anyone cloning it. Note what is and is not confirmed: the
+   *tier* comes from the account, the *rates* for that tier still come from
+   the search-result reading above, and at +0.77 bps a 0.2 bps error in the
+   maker fee is a quarter of the result. Worth reading off a real fill.
+
+   Re-run of the step 9a survey at the VIP 1 gate, from the same measurements:
+
+   | symbol | spread | clears 1.2 gate | clears 2.2 w/ adv. sel. | net (optimistic) | net (pessimistic) |
+   |---|---|---|---|---|---|
+   | ADAUSDT | 5.019 | yes | yes | **+0.77** | −5.54 |
+   | LTCUSDT | 2.053 | yes | no | −0.82 | −3.73 |
+   | AVAXUSDT | 1.378 | yes | no | −1.02 | −3.31 |
+   | DOGEUSDT | 1.207 | yes | no | −0.88 | −2.96 |
+   | BTCUSDT | 0.013 | no | no | −1.31 | −2.52 |
+
+   Three things this does not settle. The arithmetic gate in
+   `passive_sim.clears_fee_gate` is `spread >= 1.2` and now admits four of ten
+   majors rather than one — but it deliberately excludes adverse selection,
+   and on the empirical `2 x (0.5 + fee)` bar only ADA survives. ADA's own
+   bracket runs **+0.77 to −5.54**, so the sign of the answer is still decided
+   by queue position, which step 9 refuses to model for good reason. And every
+   number in that table is *Binance*, measured through Tardis; this account
+   trades on **BloFin**, whose spreads have never been measured here at all.
+
+   That last one is now the cheap missing measurement rather than a deposit
+   decision, and step 9c is it.
+
+9c. **What are BloFin's own spreads?** — `backendnalysislofin_spread_survey.py`.
+   Everything the passive branch believes about execution cost was measured on
+   a venue this account does not trade on. BloFin's `getTickers()` returns best
+   bid/ask for every instrument, unauthenticated, in one REST call, so the
+   venue-native version of step 9a costs a poll rather than a download.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
