@@ -106,6 +106,9 @@ class CarryPlan:
     liquidation_price: Optional[Decimal] = None
     liquidation_distance: Optional[Decimal] = None
 
+    spot_fee_rate: Decimal = ZERO
+    spot_after_fee: Decimal = ZERO
+
     # Economics
     round_trip_bps: Decimal = ZERO
     funding_per_day_bps: Decimal = ZERO
@@ -208,7 +211,14 @@ def plan_carry(
 
     plan.perp_contracts = contracts
     plan.perp_base = contracts * market.contract_value
-    plan.spot_base = round_down(plan.perp_base, market.spot_lot_size)
+    # The spot taker fee is charged in the BASE currency, so buying exactly
+    # the perp's base leaves the hedge short by the fee: a 254-unit buy at
+    # 0.1% delivered 253.746 against a 254 short. Measured on a real fill, not
+    # inferred. So buy the amount that NETS to the hedge after the fee.
+    plan.spot_fee_rate = spot_taker_bps / BPS
+    gross = plan.perp_base / (ONE - plan.spot_fee_rate)
+    plan.spot_base = round_down(gross, market.spot_lot_size)
+    plan.spot_after_fee = plan.spot_base * (ONE - plan.spot_fee_rate)
     if plan.spot_base < market.spot_min_size:
         plan.reasons.append(
             f"spot leg {plan.spot_base} is below the {market.spot_min_size} "
@@ -217,7 +227,7 @@ def plan_carry(
 
     # Whatever the two lot sizes could not reconcile is naked directional
     # exposure, so it is measured rather than assumed away.
-    plan.residual_base = plan.perp_base - plan.spot_base
+    plan.residual_base = plan.perp_base - plan.spot_after_fee
     plan.residual_usd = abs(plan.residual_base) * market.spot_mid
     plan.notional_usd = plan.perp_base * market.perp_mid
 

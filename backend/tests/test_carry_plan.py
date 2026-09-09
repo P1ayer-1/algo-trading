@@ -67,10 +67,23 @@ def test_a_zero_step_is_a_no_op():
 # ---------------------------------------------------------------------------
 
 
-def test_the_two_legs_match_when_the_lot_sizes_allow_it():
+def test_a_coarse_lot_size_cannot_absorb_the_fee():
+    """A 1-unit spot lot cannot buy the 1000.6 that would net to 1000.
+
+    So the residual is the fee itself - unavoidable at this granularity, and
+    reported rather than hidden. A finer lot size removes it; see
+    `test_the_spot_leg_is_grossed_up_for_a_fee_paid_in_base`.
+    """
     result = plan()
-    assert result.spot_base == result.perp_base
-    assert result.residual_base == 0
+    assert result.spot_base == result.perp_base, "rounded back down to the lot"
+    assert result.residual_base == pytest.approx(
+        result.perp_base * result.spot_fee_rate)
+
+
+def test_a_fine_lot_size_leaves_the_legs_matched():
+    result = plan(market=market(spot_lot_size=Decimal("0.000001")))
+    assert result.spot_after_fee == pytest.approx(result.perp_base,
+                                                  rel=Decimal("0.00001"))
 
 
 def test_the_perp_leg_is_sized_first_and_spot_follows():
@@ -258,3 +271,45 @@ def test_an_unusable_quote_is_refused():
 def test_nonsense_inputs_are_refused():
     assert not plan(target_notional_usd=Decimal("0")).ok
     assert not plan(leverage=Decimal("0")).ok
+
+
+# ---------------------------------------------------------------------------
+# The spot fee is charged in the BASE currency
+# ---------------------------------------------------------------------------
+#
+# Measured on a real fill: buying 254 SUI at 0.1% delivered 253.746, because
+# the fee comes out of what you receive rather than out of the USDT. Buying
+# exactly the perp's base therefore leaves the hedge short by the fee, every
+# single time, in the same direction.
+
+
+def test_the_spot_leg_is_grossed_up_for_a_fee_paid_in_base():
+    result = plan(spot_taker_bps=Decimal("10"),
+                  market=market(spot_lot_size=Decimal("0.001")))
+
+    assert result.spot_base > result.perp_base, "must buy more than the hedge"
+    assert result.spot_after_fee == pytest.approx(result.perp_base,
+                                                  rel=Decimal("0.0001"))
+
+
+def test_grossing_up_shrinks_the_residual_by_orders_of_magnitude():
+    """Without it the hedge is short by the whole fee."""
+    result = plan(spot_taker_bps=Decimal("10"),
+                  market=market(spot_lot_size=Decimal("0.001")))
+    naive_residual = result.perp_base * Decimal("0.001")
+
+    assert abs(result.residual_base) < naive_residual / 100
+
+
+def test_a_zero_fee_needs_no_gross_up():
+    result = plan(spot_taker_bps=Decimal("0"),
+                  market=market(spot_lot_size=Decimal("0.001")))
+    assert result.spot_base == result.perp_base
+
+
+def test_the_residual_is_measured_after_the_fee_not_before():
+    """What matters is what survives to hedge with."""
+    result = plan(spot_taker_bps=Decimal("10"),
+                  market=market(spot_lot_size=Decimal("0.001")))
+    assert result.residual_base == pytest.approx(
+        result.perp_base - result.spot_after_fee)

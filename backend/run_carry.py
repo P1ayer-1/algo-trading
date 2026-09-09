@@ -59,6 +59,7 @@ from plan_carry import (  # noqa: E402
 from server import log  # noqa: E402
 from trading.carry import plan_carry  # noqa: E402
 from trading.carry_executor import CarryExecutor  # noqa: E402
+from trading.margin_tiers import maintenance_margin_rate  # noqa: E402
 from trading.risk import RiskLimits  # noqa: E402
 
 
@@ -239,6 +240,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     wallets = read_wallets(client)
     daily = funding_per_day_bps(api, args.instrument, args.funding_pages)
 
+    # MMR from the exchange's own tier table, on the SAME host as the
+    # account: demo and production publish different schedules (SUI
+    # isolated tier 1 is 0.0050 on production and 0.0065 on demo), and
+    # the wrong one makes liquidation look further away than it is.
+    wanted_contracts = (args.notional / market.perp_mid
+                        / market.contract_value)
+    mmr = maintenance_margin_rate(client, args.instrument, wanted_contracts)
+    if mmr is None:
+        raise SystemExit(
+            f"Could not read the margin tier for {args.instrument} on "
+            f"{environment}. A liquidation price from a guessed MMR is a "
+            "number that looks measured and is not.")
+    log(f"  maintenance margin rate {mmr} (tier for ~{wanted_contracts:.0f} "
+        f"contracts on {environment})")
+
     plan = plan_carry(
         market=market, wallets=wallets,
         target_notional_usd=args.notional, leverage=args.leverage,
@@ -246,7 +262,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         spot_taker_bps=Decimal(str(SPOT_TAKER_FEE_BPS)),
         perp_taker_bps=Decimal(str(TAKER_FEE_BPS)),
         limits=RiskLimits(),
-        maintenance_margin_rate=MEASURED_MMR,
+        maintenance_margin_rate=mmr,
         fee_buffer_bps=MEASURED_FEE_BUFFER_BPS,
     )
     report_plan(plan, market, wallets, hold_days=args.hold_days,
