@@ -539,11 +539,74 @@ Next, in order:
    That last one is now the cheap missing measurement rather than a deposit
    decision, and step 9c is it.
 
-9c. **What are BloFin's own spreads?** — `backendnalysislofin_spread_survey.py`.
+9c. ~~**What are BloFin's own spreads?**~~ — `backendnalysislofin_spread_survey.py`.
    Everything the passive branch believes about execution cost was measured on
    a venue this account does not trade on. BloFin's `getTickers()` returns best
    bid/ask for every instrument, unauthenticated, in one REST call, so the
    venue-native version of step 9a costs a poll rather than a download.
+
+   **Run, 20 minutes at 5s on 2026-09-09, and BloFin is systematically wider.**
+   57 instruments cleared a $1M/24h volume filter; **37 clear the 2.20 bps
+   VIP 1 bar**, against one of ten on Binance. On the four majors both surveys
+   cover:
+
+   | symbol | Binance (2026-09-01) | BloFin (2026-09-09) | ratio |
+   |---|---|---|---|
+   | ADA | 5.019 | 9.091 | 1.8x |
+   | LTC | 2.053 | 5.530 | 2.7x |
+   | AVAX | 1.378 | 3.749 | 2.7x |
+   | DOGE | 1.207 | 3.316 | 2.7x |
+   | **BTC** | **0.013** | **0.013** | **1.0x** |
+
+   BTC is the row that makes the rest of the table mean something. It is
+   identical to three decimal places, because BTC is pinned at its minimum
+   tick on both venues and a pinned spread is arithmetic, not competition:
+   `tick/price`, and both are $0.1 on a ~$78.7k instrument. So BloFin is
+   **wider exactly where makers have room to choose the width, and identical
+   where they do not**, which is the signature of less maker competition
+   rather than a measurement artifact or a units error.
+
+   The shape of the spread differs too, and this cuts against the opportunity.
+   Binance's wide names were *pinned* — p25 and p75 within 0.01 bps of the
+   median. BloFin's are not: ADA runs p25 4.551 / median 9.091 / p75 13.609,
+   oscillating between sitting on its tick floor and three times wider. Only
+   one instrument in the top 30 (NEAR) was tick-bound at all. A spread that
+   wide and that variable on $2.4M of daily volume is at least as consistent
+   with *nobody quoting* as with *money available for quoting*, and those two
+   have very different consequences.
+
+   **What this does not establish.** The headroom is bigger; the net is
+   unknown. Converting spread into a net number needs the markout simulation,
+   and that needs book and trade data for the instrument — `passive_sim.py`
+   measured Binance ADA's optimistic markout at +1.967 against a 5.019 spread,
+   so a quote at the touch captured well under half its width. Extrapolating
+   that ratio to BloFin would be inventing the result. Two things must be
+   measured on BloFin itself before any of this is tradeable:
+
+   - **Adverse selection.** Assumed at 0.5 bps/leg from Binance throughout.
+     Never measured here, and a less arbitraged venue is not obviously the
+     same in either direction.
+   - **Queue position.** Still the largest single unknown in the branch — a
+     6.30 bps bracket on ADA against a 4.00 bps total fee ladder.
+
+   Both need exactly what `recorder.py` already produces, pointed at one of
+   these instruments instead of BTC-USDT. That is step 9d, and there is a data
+   hazard to fix first — see below.
+
+   The dates are eight days apart, which is the honest caveat on the ratio
+   column. A consistent 2.7x across three independent instruments is larger
+   than typical day-to-day variation, but it is not the same as a same-day
+   comparison.
+
+9d. **Record a wide instrument — but fix the filename first.** `recorder.py`
+   writes `features-<date>.csv` with **no instrument in the name and no
+   instrument column in the rows**. Two recorders on different symbols would
+   land in files distinguishable only by the collision suffix, and a later
+   `check_features.py` run would concatenate BTC-USDT and ADA-USDT rows into
+   one matrix without complaint — the columns are identical, so the
+   schema-intersection guard added for the label-generation bug cannot see
+   this one. Put the instrument in the path before pointing the recorder
+   anywhere new.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
