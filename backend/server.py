@@ -1,10 +1,30 @@
 """Everything that talks to the outside world: the local HTTP server that
 serves the chart page, the local websocket server that pushes live updates
-to it, and the three background loops that keep LiveChartState fresh:
+to it, and the background loops that keep LiveChartState fresh:
 
   - refresh_candles_loop  — periodic REST candle refetch (source of truth)
   - poll_ticker_loop      — frequent REST price polling (fallback/backup)
   - blofin_stream_loop    — the primary path: BloFin's public websocket feed
+  - feed.run              — the microstructure feed, which does the RECORDING
+  - publish_features_loop — pushes features to the browser
+
+Every one of them runs under `supervise`, and that is not decoration.
+
+These loops are not equally important. The first three and the last exist to
+keep a chart on a screen up to date; `feed.run` is the one writing the raw
+event archive, and raw events cannot be re-collected — once a market moment
+has passed it is gone. So the failure mode that matters is a cosmetic loop
+taking the recorder down with it.
+
+Which is exactly what happened on 2026-09-08 at 03:02 UTC, seven hours into an
+unattended run. One dropped HTTP keep-alive on the chart's candle endpoint
+raised `RemoteDisconnected`; `refresh_candles_loop` had no handler; and
+`run_servers` was gathering the raw coroutines, so `asyncio.gather` propagated
+the first exception and ended the process — recorder, raw archive and all.
+
+Both halves are fixed: every loop handles its own errors, and `supervise`
+restarts any that still manages to fall over, so no loop can end the run. See
+tests/test_server_resilience.py.
 """
 
 import asyncio

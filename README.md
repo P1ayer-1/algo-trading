@@ -73,7 +73,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (289 tests)
+│   └── tests/                 # pytest suite (298 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── features-*.csv         #   labelled features — regenerable
 │   └── raw/                   #   raw events — IRREPLACEABLE
@@ -194,6 +194,34 @@ full table and the reasoning about databases.
 Collect across **varied conditions** — a model trained only on quiet books
 learns nothing about the regimes that actually hurt you.
 
+### If it stops overnight
+
+It shouldn't any more. On 2026-09-08 a run died at 03:02 UTC, seven hours in,
+because one dropped HTTP keep-alive on the *chart's* candle endpoint raised
+`RemoteDisconnected` in the one loop that had no error handler — and
+`run_servers` was gathering the raw coroutines, so `asyncio.gather` propagated
+it and ended the process, recorder and raw archive included.
+
+Both halves are fixed (`backend/server.py`): every loop handles its own
+errors, and `supervise` restarts any that still falls over, so no loop can end
+the run. The chart going stale is now a cosmetic failure, which is what it
+always should have been. Console lines carry a UTC timestamp and are flushed,
+so a failure that happens while you are asleep leaves a usable record instead
+of sitting in a block buffer that dies with the process.
+
+**Nothing was lost in that incident** beyond the hours that never happened —
+the `finally` block flushed cleanly, and the 7 hours already on disk are
+intact. Worth knowing the shape of the loss, though: the raw archive is the
+irreplaceable half, and a crash is only ever as expensive as the time before
+someone notices.
+
+One gap remains, and it is worth knowing about. A *stalled* feed — TCP still
+open, no messages arriving — is not currently detected, and no exception is
+raised to restart. `feed.status()` already exposes `tape_staleness_s` and
+`book_age_ms`, so a watchdog that forces a reconnect when those go quiet is
+the obvious next hardening step. Until then, glance at the row count on the
+chart's Microstructure panel.
+
 ## Checking whether it predicts anything
 
 After a few days:
@@ -214,12 +242,13 @@ cd backend
 python -m pytest
 ```
 
-289 tests covering the order book's gap handling, the OFI recursion, the
+298 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
-queue bracket, the maker-fee gate, and the evaluation statistics. They need
-no network, credentials, or SDK.
+queue bracket, the maker-fee gate, the loop supervisor that keeps an
+overnight run alive, and the evaluation statistics. They need no network,
+credentials, or SDK.
 
 ## Roadmap toward the actual bot
 

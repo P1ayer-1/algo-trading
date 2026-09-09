@@ -28,7 +28,7 @@ try:
     from blofin.rest_market import MarketAPI
 
     from market_data import fetch_rest_candles, fetch_tick_size
-    from server import build_microstructure_feed, run_servers
+    from server import build_microstructure_feed, log, run_servers
     from state import LiveChartState
 except ModuleNotFoundError as exc:
     missing = exc.name or "a dependency"
@@ -60,8 +60,27 @@ async def main() -> None:
 
     market_api = MarketAPI(DemoClient() if USE_DEMO else Client())
     state = LiveChartState()
-    state.tick_size = await asyncio.to_thread(fetch_tick_size, market_api)
-    await state.set_candles(await asyncio.to_thread(fetch_rest_candles, market_api))
+
+    # Both of these seed the CHART, and both are REST calls that can fail the
+    # same way the overnight candle refresh did — a dropped keep-alive on a
+    # cold connection pool. Failing here used to abort before recording had
+    # started, which is the worst possible moment: the run you left going all
+    # night never began.
+    #
+    # So neither is allowed to stop startup. `tick_size` falls back to the
+    # LiveChartState default, and the candle history is filled in by
+    # refresh_candles_loop within one cycle anyway.
+    try:
+        state.tick_size = await asyncio.to_thread(fetch_tick_size, market_api)
+    except Exception as exc:
+        log(f"Could not fetch tick size ({type(exc).__name__}: {exc}); "
+            f"using default {state.tick_size}.")
+    try:
+        await state.set_candles(
+            await asyncio.to_thread(fetch_rest_candles, market_api))
+    except Exception as exc:
+        log(f"Could not fetch initial candles ({type(exc).__name__}: {exc}); "
+            "starting with an empty chart, the refresh loop will fill it in.")
 
     feed = None
     if MICRO_ENABLED and not args.no_microstructure:
