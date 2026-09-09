@@ -22,7 +22,8 @@ path that sends an order to an exchange. What exists is:
   microprice, spread, multi-horizon returns, realised volatility, funding.
 - A recorder that writes those features to CSV with **forward-looking labels**,
   so there is something to train a model on later.
-- A raw event archive (`data/raw/`) keeping every websocket message, so any
+- A raw event archive (`data/<INST-ID>/raw/`) keeping every websocket message,
+  so any
   feature invented later can be recomputed over all past history.
 - A standalone, tested risk engine: liquidation-price math, volatility- and
   Kelly-based position sizing, hard limits, and a kill switch.
@@ -71,10 +72,11 @@ first. Recording is therefore step one, not step four.
 │   │   ├── train_model.py     # LightGBM + shuffled-label control + paired test
 │   │   ├── passive_sim.py     # markout curves + bracketed passive fill rates
 │   │   ├── spread_survey.py   # which instruments' spreads cover the maker fee
+│   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (308 tests)
+│   └── tests/                 # pytest suite (335 tests)
 ├── data/                      # recorded data (gitignored)
 │   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
 │       ├── features-*.csv     #     labelled features — regenerable
@@ -288,14 +290,15 @@ cd backend
 python -m pytest
 ```
 
-308 tests covering the order book's gap handling, the OFI recursion, the
+335 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
 queue bracket, the maker-fee gate, the loop supervisor that keeps an
 overnight run alive, the stall watchdog that reconnects a silent feed, the
-loader that refuses to concatenate CSVs from two label generations, and the
-evaluation statistics. They need no network,
+loader that refuses to concatenate CSVs from two label generations or two
+instruments, the multi-instrument recorder's isolation, and the evaluation
+statistics. They need no network,
 credentials, or SDK.
 
 ## Roadmap toward the actual bot
@@ -639,7 +642,8 @@ Next, in order:
    instrument column, so two symbols would have merged into one matrix that
    nothing downstream could object to. Both writers are now scoped to
    `data/<INST-ID>/`, `check_features.py` refuses to cross that boundary, and
-   `backendecord.py` runs N instruments headless in one process.
+   `backend
+ecord.py` runs N instruments headless in one process.
 
    **Running since 2026-09-09, 15 instruments**, chosen so the data answers
    two different questions:
