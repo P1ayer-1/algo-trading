@@ -25,11 +25,16 @@ TRANSPORT_ERROR = {"code": "500", "msg": "gateway"}
 
 class FakeBroker:
     def __init__(self, *, perp=OK, spot=OK, transfer=OK, leverage=OK,
-                 unwind=OK, mode="isolated", position=None):
+                 unwind=OK, mode="isolated", position=None,
+                 spot_fills=Decimal("2534")):
         self.responses = {"perp": perp, "spot": spot, "transfer": transfer,
                           "leverage": leverage, "unwind": unwind}
         self.mode = mode
         self.position = position
+        # What the spot leg actually adds to the balance, which is what the
+        # executor checks rather than the order response.
+        self.spot_fills = spot_fills
+        self.base_held = Decimal("0")
         self.calls: List[str] = []
 
     def transfer(self, **kwargs) -> Dict[str, Any]:
@@ -51,14 +56,17 @@ class FakeBroker:
 
     def place_spot(self, *, inst_id, side, size, client_order_id) -> Dict[str, Any]:
         self.calls.append(f"spot:{side}")
-        return self.responses["spot"]
+        response = self.responses["spot"]
+        if response is OK:
+            self.base_held += self.spot_fills
+        return response
 
     def perp_position(self, inst_id) -> Optional[Dict[str, Any]]:
         self.calls.append("perp_position")
         return self.position
 
     def spot_balance(self, currency) -> Decimal:
-        return Decimal("1000")
+        return self.base_held
 
 
 def good_plan(**overrides) -> CarryPlan:
@@ -289,3 +297,47 @@ def test_a_dry_run_still_refuses_a_bad_margin_mode():
     broker = FakeBroker(mode="cross", position=position())
     result = execute(broker, dry_run=True)
     assert any("ACCOUNT-wide" in problem for problem in result.problems)
+
+
+# ---------------------------------------------------------------------------
+# The hedge is the right SIZE, not merely filled
+# ---------------------------------------------------------------------------
+
+
+def test_a_spot_fill_of_the_wrong_size_is_caught():
+    """The failure `targetCurrency` causes, and the reason the check reads the
+    balance rather than the order response.
+
+    Quoting size in the quote currency instead of the base fills cleanly and
+    reports success, while buying roughly 1/price of the intended hedge.
+    """
+    broker = FakeBroker(position=position(),
+                        spot_fills=Decimal("323"))   # 254 USDT of SUI, not 254 SUI
+    result = execute(broker)
+
+    assert any("wrong size" in problem for problem in result.problems)
+    assert any("targetCurrency" in problem for problem in result.problems)
+
+
+def test_a_spot_fill_of_the_right_size_passes():
+    broker = FakeBroker(position=position(), spot_fills=Decimal("2534"))
+    result = execute(broker)
+
+    assert result.ok, result.problems
+    assert result.spot_acquired == Decimal("2534")
+
+
+def test_a_small_fill_difference_is_tolerated():
+    """Market orders do not fill to the microlot; 2% is the bar."""
+    broker = FakeBroker(position=position(), spot_fills=Decimal("2520"))
+    assert execute(broker).ok
+
+
+def test_the_balance_delta_is_measured_not_the_absolute():
+    """An account already holding the base currency must not read as a fill."""
+    broker = FakeBroker(position=position(), spot_fills=Decimal("2534"))
+    broker.base_held = Decimal("10000")
+    result = execute(broker)
+
+    assert result.spot_acquired == Decimal("2534")
+    assert result.ok, result.problems

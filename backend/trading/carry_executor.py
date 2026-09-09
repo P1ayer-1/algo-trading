@@ -103,6 +103,7 @@ class ExecutionResult:
     planned_liquidation: Optional[Decimal] = None
     actual_liquidation: Optional[Decimal] = None
     actual_mmr: Optional[Decimal] = None
+    spot_acquired: Optional[Decimal] = None
 
     def add(self, step: Step) -> Step:
         self.steps.append(step)
@@ -182,6 +183,13 @@ class CarryExecutor:
             return result
 
         tag = uuid.uuid4().hex[:16]
+        # Recorded before anything is sent, so the spot leg can be verified by
+        # what the BALANCE did rather than by what the order response said.
+        # `size` on a spot market order means base units or quote depending on
+        # a parameter the venue lets you omit, so a fill that reports success
+        # is not yet evidence the hedge is the right size.
+        base_before = (ZERO if self.dry_run
+                       else self.broker.spot_balance(base_currency))
 
         # ---- funding the wallets ------------------------------------------
         if plan.spot_transfer_usd > 0:
@@ -257,6 +265,7 @@ class CarryExecutor:
         if not self.dry_run:
             self.sleep(self.settle_seconds)
             self._verify(result, plan)
+            self._verify_spot(result, plan, base_currency, base_before)
         return result
 
     def _unwind(self, result: ExecutionResult, plan: CarryPlan) -> None:
@@ -279,6 +288,29 @@ class CarryExecutor:
             result.problems.append(
                 "UNWIND FAILED - a naked short perp is open on "
                 f"{plan.inst_id}. Close it by hand now.")
+
+    def _verify_spot(self, result: ExecutionResult, plan: CarryPlan,
+                     base_currency: str, before: Decimal) -> None:
+        """Did the spot leg actually buy the amount the hedge needs?
+
+        Checked against the balance rather than the order response, because
+        the failure this guards is a units mismatch: `targetCurrency` decides
+        whether a market order's `size` is base or quote, and the wrong one
+        fills successfully at the wrong size. An order response cannot show
+        that; a balance can.
+        """
+        after = self.broker.spot_balance(base_currency)
+        acquired = after - before
+        result.spot_acquired = acquired
+
+        if plan.spot_base <= 0:
+            return
+        drift = abs(acquired - plan.spot_base) / plan.spot_base
+        if drift > Decimal("0.02"):
+            result.problems.append(
+                f"spot leg bought {acquired} {base_currency}, plan needed "
+                f"{plan.spot_base} ({drift:.1%} off). The hedge is the wrong "
+                f"size - check targetCurrency on the order.")
 
     def _verify(self, result: ExecutionResult, plan: CarryPlan) -> None:
         """Read the position back and price it the way the exchange does.

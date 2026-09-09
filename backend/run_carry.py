@@ -100,9 +100,19 @@ class BlofinBroker:
 
     def place_spot(self, *, inst_id: str, side: str, size: Decimal,
                    client_order_id: str) -> Dict[str, Any]:
+        # `targetCurrency` is OPTIONAL in BloFin's schema and decides whether
+        # `size` on a market order means base units or quote. Leaving it to a
+        # default would make a hedge of 254 SUI or of 254 USDT-worth of SUI
+        # depending on a value not written down here - a 3x mis-hedge that
+        # fills cleanly and looks correct. Always explicit.
         return self.client.post("/api/v1/spot/trade/order", {
-            "instId": inst_id, "side": side, "orderType": "market",
-            "size": str(size), "clientOrderId": client_order_id,
+            "instType": "SPOT",
+            "instId": inst_id,
+            "side": side,
+            "orderType": "market",
+            "targetCurrency": "base_currency",
+            "size": str(size),
+            "clientOrderId": client_order_id,
         })
 
     def perp_position(self, inst_id: str) -> Optional[Dict[str, Any]]:
@@ -134,6 +144,15 @@ def report_execution(result, *, hold_days: Decimal) -> None:
         print(f"  [{marker}] {step.name:<10} {step.detail}{sent}")
         if step.error:
             print(f"         {step.error}")
+
+    if result.spot_acquired is not None:
+        print("\n  HEDGE SIZE, MEASURED FROM THE BALANCE")
+        print(f"    spot acquired        {result.spot_acquired} "
+              f"{result.inst_id.split('-')[0]}")
+        print("    Checked against the balance, not the order response: "
+              "`targetCurrency`\n    decides whether a market order's size is "
+              "base or quote, and the wrong one\n    fills cleanly at the "
+              "wrong size.")
 
     if result.actual_liquidation is not None:
         print("\n  VERIFIED AGAINST THE EXCHANGE")

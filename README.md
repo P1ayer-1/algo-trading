@@ -317,7 +317,7 @@ cd backend
 python -m pytest
 ```
 
-476 tests covering the order book's gap handling, the OFI recursion, the
+480 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
