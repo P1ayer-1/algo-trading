@@ -239,3 +239,118 @@ def test_shuffling_inflates_auc_which_is_why_we_never_shuffle():
     assert np.isfinite(ordered) and np.isfinite(shuffled)
     # The shuffled estimate should not be *lower* — leakage only helps it.
     assert shuffled >= ordered - 0.05
+
+
+# ---------------------------------------------------------------------------
+# Mixed schemas: the corpus in data/ is not one generation of columns
+# ---------------------------------------------------------------------------
+#
+# Every change to BLOFIN_LABEL_HORIZONS starts a new generation of label
+# columns, and the files written under the old ones stay on disk. A real run
+# hit exactly this: 37,595 rows of 1s/5s/30s labels sitting next to
+# 300s/900s/1800s rows, concatenated blind, KeyError thousands of rows in.
+
+RENAMES = {
+    "fwd_ret_bps_1s": "fwd_ret_bps_300s", "label_1s": "label_300s",
+    "fwd_ret_bps_5s": "fwd_ret_bps_900s", "label_5s": "label_900s",
+}
+LONG_HORIZON_COLUMNS = [RENAMES.get(name, name) for name in FEATURE_COLUMNS]
+
+
+def write_long_horizon_csv(path, rows):
+    """The same rows, labelled 300s/900s instead of 1s/5s."""
+    renamed = [{RENAMES.get(key, key): value for key, value in row.items()}
+               for row in rows]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=LONG_HORIZON_COLUMNS)
+        writer.writeheader()
+        writer.writerows(renamed)
+
+
+def test_a_file_from_an_older_horizon_generation_is_skipped(tmp_path):
+    write_csv(tmp_path / "features-2026-01-01.csv",
+              synth_rows(400, signal_strength=1.0, seed=11))
+    write_long_horizon_csv(tmp_path / "features-2026-01-02.csv",
+                           synth_rows(600, signal_strength=1.0, seed=12))
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        rows = load_rows(tmp_path, target_column="fwd_ret_bps_900s")
+
+    assert len(rows) == 600, "only the file carrying the horizon should load"
+    assert all("fwd_ret_bps_900s" in row for row in rows)
+
+    # Skipping quietly would be worse than crashing: the banner would claim a
+    # corpus 40% larger than the one actually measured.
+    report = buffer.getvalue()
+    assert "Skipped 1 file(s), 400 rows" in report
+    assert "features-2026-01-01.csv" in report
+    assert "has: 1s, 5s" in report
+
+
+def test_mixed_horizons_run_end_to_end_instead_of_raising_keyerror(tmp_path):
+    """The regression test for the crash this loader was rewritten to fix."""
+    # 5s sampling, so a 900s horizon costs a 180-row purge gap rather than
+    # swallowing the whole test set.
+    write_csv(tmp_path / "features-2026-01-01.csv",
+              synth_rows(400, signal_strength=1.0, seed=13, interval_ms=5000))
+    write_long_horizon_csv(
+        tmp_path / "features-2026-01-02.csv",
+        synth_rows(1500, signal_strength=1.0, seed=14, interval_ms=5000))
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        main(["--data-dir", str(tmp_path), "--horizon", "900",
+              "--cost-bps", "0"])
+
+    report = buffer.getvalue()
+    assert "VERDICT" in report
+    assert "Skipped 1 file(s), 400 rows" in report
+
+
+def test_no_file_carrying_the_horizon_says_what_is_on_disk(tmp_path):
+    write_csv(tmp_path / "features-2026-01-01.csv",
+              synth_rows(400, signal_strength=1.0, seed=15))
+
+    buffer = io.StringIO()
+    with pytest.raises(SystemExit, match="Horizons present on disk: 1s, 5s"):
+        with redirect_stdout(buffer):
+            load_rows(tmp_path, target_column="fwd_ret_bps_1800s")
+
+
+def test_build_matrix_refuses_a_horizon_not_shared_by_every_row(tmp_path):
+    """The backstop, for a caller that did not filter by file.
+
+    Taking the schema from `rows[0]` is the actual defect: whichever file sorts
+    first silently decides what the columns mean for all the others, and the
+    rows behind it blow up on access. Asking for a horizon that only half the
+    corpus carries has to fail here, before the matrix is built.
+    """
+    old = synth_rows(500, signal_strength=1.0, seed=16)
+    new = [{RENAMES.get(key, key): value for key, value in row.items()}
+           for row in synth_rows(500, signal_strength=1.0, seed=17)]
+
+    # `new` first, so `rows[0]` advertises a horizon most of the corpus lacks.
+    with pytest.raises(SystemExit, match=r"Available horizons.*'1s'.*'900s'"):
+        build_matrix(new + old, horizon=5.0)
+
+
+def test_build_matrix_keeps_only_columns_every_row_has(tmp_path):
+    """A feature added part-way through a run is not a feature for the corpus.
+
+    Half a column is worse than no column: the rows predating it would parse as
+    NaN and be dropped wholesale by the finite-value filter, quietly discarding
+    every row recorded before the feature existed.
+    """
+    with_extra = [dict(row, only_in_new=1.0)
+                  for row in synth_rows(500, signal_strength=1.0, seed=18)]
+    without = synth_rows(500, signal_strength=1.0, seed=19)
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        X, y, names, _ = build_matrix(with_extra + without, horizon=5.0)
+
+    assert "only_in_new" not in names
+    assert "obi_1" in names, "columns shared by every row must survive"
+    assert len(X) == len(y) == 1000, "no row should be dropped for this"
+    assert "2 different headers" in buffer.getvalue()

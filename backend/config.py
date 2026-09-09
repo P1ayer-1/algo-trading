@@ -83,6 +83,23 @@ BOOK_DEPTH = os.getenv("BLOFIN_BOOK_DEPTH", "books")
 # Rolling trade-tape window, seconds. Must exceed the longest tfi_* horizon.
 TAPE_WINDOW_SECONDS = float(os.getenv("BLOFIN_TAPE_WINDOW_SECONDS", "60"))
 
+# How long the microstructure feed may go with NO market data before it is
+# treated as dead and reconnected.
+#
+# This guards the failure that error handling cannot see: the socket stays
+# open, pings and pongs keep flowing, and the subscription silently stops
+# delivering. Nothing raises, so `supervise` never restarts the loop and the
+# recorder writes nothing for hours. The SDK cannot catch it either - its
+# receive loop swallows its own read timeout with `continue`, and `listen()`
+# then blocks forever on an empty queue.
+#
+# Sizing: the `books` channel on a liquid perp updates several times a second,
+# so total silence is anomalous within seconds, not minutes. 30s is roughly
+# two orders of magnitude above the normal inter-message gap - late enough
+# that no ordinary quiet patch trips it, early enough that a stall costs
+# half a minute of data rather than a night of it. Reconnecting is cheap.
+FEED_STALL_TIMEOUT_S = float(os.getenv("BLOFIN_FEED_STALL_TIMEOUT_S", "30"))
+
 # --- Fees and execution cost ------------------------------------------------
 # THE most load-bearing numbers in this project. Every "is there an edge?"
 # question is really "is the predicted move bigger than these?", so they get

@@ -47,6 +47,7 @@ from config import (
     BOOK_DEPTH,
     DATA_DIR,
     FEATURE_SAMPLE_INTERVAL_MS,
+    FEED_STALL_TIMEOUT_S,
     FRONTEND_DIR,
     INST_ID,
     LABEL_HORIZONS,
@@ -238,6 +239,7 @@ def build_microstructure_feed() -> MicrostructureFeed:
         record_raw=RECORD_RAW,
         sample_interval_ms=FEATURE_SAMPLE_INTERVAL_MS,
         tape_window_seconds=TAPE_WINDOW_SECONDS,
+        stall_timeout_s=FEED_STALL_TIMEOUT_S,
         label_config=LabelConfig(
             horizons_seconds=LABEL_HORIZONS,
             threshold_bps=LABEL_THRESHOLD_BPS,

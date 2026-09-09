@@ -119,20 +119,72 @@ except Exception:  # pragma: no cover - keeps the analysis tools standalone
     MAKER_ONLY_COST_BPS = 1.2
 
 
-def load_rows(data_dir: Path, pattern: str = "features-*.csv") -> List[dict]:
+def horizons_in(fieldnames: List[str]) -> List[str]:
+    """The forward horizons a header actually carries, as `300s`-style tags."""
+    return [name[len("fwd_ret_bps_"):] for name in fieldnames
+            if name.startswith("fwd_ret_bps_")]
+
+
+def load_rows(data_dir: Path, pattern: str = "features-*.csv",
+              target_column: Optional[str] = None) -> List[dict]:
+    """Concatenate the recorded CSVs, skipping files of the wrong vintage.
+
+    The files in `data/` are NOT guaranteed to share a schema. Every change to
+    `BLOFIN_LABEL_HORIZONS` starts a new generation of label columns, and the
+    old files stay on disk carrying their old names. Concatenating them blind
+    and then indexing the requested horizon raises `KeyError` thousands of rows
+    into the run - and that is the benign failure. The dangerous one is silent:
+    feature columns used to be read off `rows[0]`, so a schema change that only
+    reordered or renamed inputs would build a matrix whose columns mean
+    different things in different halves of the data.
+
+    So each file is admitted on its own header. A file without the requested
+    horizon is skipped, loudly and with its row count, because "your corpus is
+    half the size the banner implies" is exactly the kind of thing that must
+    not be discovered after the conclusion has been drawn.
+    """
     files = sorted(glob.glob(str(data_dir / pattern)))
     if not files:
         raise SystemExit(
             f"No files matching {pattern} in {data_dir}.\n"
             "Run the bot first (python backend/live-chart.py) to record data."
         )
+
     rows: List[dict] = []
+    kept: List[Tuple[str, int]] = []
+    skipped: List[Tuple[str, int, List[str]]] = []
     for path in files:
         with open(path, newline="", encoding="utf-8") as handle:
-            rows.extend(csv.DictReader(handle))
-    print(f"Loaded {len(rows):,} rows from {len(files)} file(s):")
-    for path in files:
-        print(f"  {os.path.basename(path)}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            if target_column is not None and target_column not in fields:
+                skipped.append((path, sum(1 for _ in reader), horizons_in(fields)))
+                continue
+            file_rows = list(reader)
+        rows.extend(file_rows)
+        kept.append((path, len(file_rows)))
+
+    print(f"Loaded {len(rows):,} rows from {len(kept)} file(s):")
+    for path, count in kept:
+        print(f"  {os.path.basename(path):<28} {count:>9,} rows  "
+              f"({os.path.getsize(path) / 1e6:.1f} MB)")
+
+    if skipped:
+        total = sum(count for _, count, _ in skipped)
+        print(f"\nSkipped {len(skipped)} file(s), {total:,} rows, with no "
+              f"{target_column} column - recorded under other label horizons:")
+        for path, count, available in skipped:
+            have = ", ".join(available) if available else "no forward labels"
+            print(f"  {os.path.basename(path):<28} {count:>9,} rows  has: {have}")
+        print("  backend/analysis/replay.py can re-derive them from the raw "
+              "archive at the\n  current horizons if you want them back.")
+
+    if not rows:
+        available = sorted({tag for _, _, tags in skipped for tag in tags})
+        raise SystemExit(
+            f"\nNo rows carry {target_column}. Horizons present on disk: "
+            f"{', '.join(available) if available else 'none'}."
+        )
     return rows
 
 
@@ -149,19 +201,37 @@ def build_matrix(
     """Return (X, forward_returns, feature_names, timestamps), warmup dropped."""
     tag = f"{horizon:g}s".replace(".", "p")
     target_column = f"fwd_ret_bps_{tag}"
-    if target_column not in rows[0]:
-        available = [key for key in rows[0] if key.startswith("fwd_ret_bps_")]
+
+    # Schema off the INTERSECTION of every row, not off `rows[0]`. A corpus
+    # spanning a horizon change holds more than one header, and taking the
+    # first row's columns as the schema is how a `KeyError` ends up thousands
+    # of rows into the run - or worse, how a renamed feature ends up silently
+    # meaning two different things in two halves of the matrix. `load_rows`
+    # already drops whole files of the wrong vintage; this is the backstop for
+    # a caller that did not pass `target_column`.
+    schemas = {frozenset(row) for row in rows}
+    shared = frozenset.intersection(*schemas) if schemas else frozenset()
+    if target_column not in shared:
+        available = sorted({key[len("fwd_ret_bps_"):] for schema in schemas
+                            for key in schema if key.startswith("fwd_ret_bps_")})
         raise SystemExit(
             f"No column {target_column}. Available horizons: {available}"
         )
+    if len(schemas) > 1:
+        print(f"Note: {len(schemas)} different headers in this corpus; using "
+              f"the {len(shared)} columns common to all of them.")
 
     label_columns = {
-        key for key in rows[0] if key.startswith(("fwd_ret_bps_", "label_"))
+        key for key in shared if key.startswith(("fwd_ret_bps_", "label_"))
     }
+    # Ordered by the first row's layout so the report reads in file order,
+    # restricted to what every row actually has.
     feature_names = [
         key
         for key in rows[0]
-        if key not in EXCLUDED_FEATURES and key not in label_columns
+        if key in shared
+        and key not in EXCLUDED_FEATURES
+        and key not in label_columns
     ]
 
     kept: List[dict] = []
@@ -474,7 +544,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Move size counted as up/down for the balance report.")
     args = parser.parse_args(argv)
 
-    rows = load_rows(args.data_dir)
+    tag = f"{args.horizon:g}s".replace(".", "p")
+    rows = load_rows(args.data_dir, target_column=f"fwd_ret_bps_{tag}")
     X, y, names, timestamps = build_matrix(rows, args.horizon)
     X, names = drop_constant_features(X, names)
 

@@ -237,13 +237,27 @@ function renderFeedState() {
     return false;
   }
 
+  // A silent feed still reports `connected` — the socket is open, it just has
+  // nothing to say. The backend reconnects at stallTimeoutSeconds; show the
+  // condition from halfway there so a human watching sees it coming rather
+  // than only seeing the reconnect afterwards.
+  const silence = status.silenceSeconds;
+  const stallAt = status.stallTimeoutSeconds || 30;
+  if (silence !== null && silence !== undefined && silence > stallAt / 2) {
+    feedStateEl.className = "feed-state warn";
+    feedStateEl.textContent =
+      `no data for ${silence.toFixed(0)}s - reconnecting at ${stallAt}s`;
+    return false;
+  }
+
   const levels = status.bookLevels || {};
   const recorder = status.recorder || {};
   const recorded = recorder.enabled ? `${recorder.rowsWritten || 0} rows` : "off";
   feedStateEl.className = "feed-state ok";
   feedStateEl.textContent =
     `live - ${levels.bids || 0}x${levels.asks || 0} levels, ` +
-    `${status.resyncs || 0} resyncs, recording ${recorded}`;
+    `${status.resyncs || 0} resyncs, ${status.stalls || 0} stalls, ` +
+    `recording ${recorded}`;
   return true;
 }
 

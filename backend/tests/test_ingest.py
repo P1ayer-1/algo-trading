@@ -6,6 +6,8 @@ The class itself imports the SDK at module load, so these tests are skipped
 when it isn't installed rather than failing.
 """
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("blofin", reason="BloFin SDK not installed")
@@ -90,3 +92,111 @@ def test_unknown_channel_is_ignored(tmp_path):
     feed = make_feed(tmp_path)
     seed(feed)
     assert feed.handle_message({"arg": {"channel": "nonsense"}, "data": [{}]}) is False
+
+
+# ---------------------------------------------------------------------------
+# The stall watchdog
+# ---------------------------------------------------------------------------
+#
+# The failure this guards is the one that raises nothing: socket open, pings
+# answered, subscription silently delivering no data. `supervise` cannot help
+# there - it restarts loops that fail, and this loop does not fail, it waits.
+
+
+class FakeClient:
+    """A `listen()` that yields a scripted prefix and then goes silent."""
+
+    def __init__(self, messages, *, then_silent=True):
+        self._messages = list(messages)
+        self._then_silent = then_silent
+        self.closed = False
+
+    async def listen(self):
+        for message in self._messages:
+            yield message
+        if self._then_silent:
+            await asyncio.Event().wait()  # never returns, like a dead feed
+
+    async def close(self):
+        self.closed = True
+
+
+def test_silence_past_the_timeout_ends_the_stream(tmp_path):
+    feed = make_feed(tmp_path)
+    feed.stall_timeout_s = 0.05
+    client = FakeClient([])
+
+    desynced = asyncio.run(feed._stream(client))
+
+    assert desynced is False, "a stall is not a desync; the reason differs"
+    assert feed.stalls == 1
+    # Returning is the whole point: the caller reconnects. Blocking here is
+    # what silently killed the overnight data.
+
+
+def test_messages_keep_the_stream_alive(tmp_path):
+    feed = make_feed(tmp_path)
+    feed.stall_timeout_s = 5.0
+    snapshot = books([[100.0, 5]], [[100.5, 5]], seq=1, action="snapshot")
+    client = FakeClient([snapshot, books([[100.0, 9]], [], seq=2, prev=1)],
+                        then_silent=False)
+
+    desynced = asyncio.run(feed._stream(client))
+
+    assert desynced is False
+    assert feed.stalls == 0, "a feed that is delivering must never be stalled"
+    assert feed.messages == 2
+
+
+def test_the_timeout_measures_silence_not_total_time(tmp_path):
+    """A slow feed is not a stalled one.
+
+    Getting this wrong in the obvious way — a deadline on the whole stream
+    rather than on each message — would reconnect a perfectly healthy feed
+    every `stall_timeout_s`, throwing away the book snapshot each time.
+    """
+    feed = make_feed(tmp_path)
+    feed.stall_timeout_s = 0.1
+
+    class Trickle:
+        async def listen(self):
+            for index in range(6):
+                await asyncio.sleep(0.03)   # under the timeout, repeatedly
+                yield books([[100.0, 5 + index]], [[100.5, 5]],
+                            seq=index + 1,
+                            action="snapshot" if index == 0 else "update",
+                            prev=None if index == 0 else index)
+
+        async def close(self):
+            pass
+
+    asyncio.run(feed._stream(Trickle()))
+
+    assert feed.stalls == 0
+    assert feed.messages == 6, "0.18s of trickle beats a 0.1s per-message gap"
+
+
+def test_a_desync_is_reported_separately_from_a_stall(tmp_path):
+    feed = make_feed(tmp_path)
+    feed.stall_timeout_s = 5.0
+    # A gap: seq jumps without a matching prevSeqId.
+    client = FakeClient(
+        [books([[100.0, 5]], [[100.5, 5]], seq=1, action="snapshot"),
+         books([[100.0, 9]], [], seq=9, prev=8)],
+        then_silent=False,
+    )
+
+    assert asyncio.run(feed._stream(client)) is True
+    assert feed.stalls == 0
+
+
+def test_status_exposes_silence_before_the_watchdog_acts(tmp_path):
+    """A human watching the chart panel should see a stall coming."""
+    feed = make_feed(tmp_path)
+    assert feed.status()["silenceSeconds"] is None, "nothing received yet"
+
+    seed(feed)
+    status = feed.status()
+    assert status["silenceSeconds"] is not None
+    assert status["silenceSeconds"] < 1.0
+    assert status["stalls"] == 0

@@ -17,7 +17,7 @@ data foundation has to exist before there is anything worth executing on.
 | `tape.py` | Rolling window of aggressive trades | nothing |
 | `features.py` | OBI, OFI, microprice, spread, returns, realised volatility | orderbook, tape |
 | `recorder.py` | Writes feature rows + forward labels to CSV | features |
-| `ingest.py` | The live websocket loop wiring the above together | all of the above, BloFin SDK |
+| `ingest.py` | The live websocket loop wiring the above together, with a stall watchdog | all of the above, BloFin SDK |
 | `risk.py` | Liquidation math, position sizing, hard limits | **nothing** |
 
 `risk.py` importing nothing from this package is a deliberate constraint: the
@@ -102,7 +102,7 @@ cd backend
 python -m pytest
 ```
 
-75 tests. The ones that matter most:
+113 tests. The ones that matter most:
 
 - `test_orderbook.py` — a sequence gap must mark the book **stale**, and the
   bad update must not be applied.
@@ -110,7 +110,23 @@ python -m pytest
   would invert the direction of every trade.
 - `test_risk.py` — liquidation prices checked against hand-computed values,
   not against whatever the code currently returns.
-- `test_ingest.py` — desync recovery (skipped if the SDK isn't installed).
+- `test_ingest.py` — desync recovery, and the stall watchdog: silence past
+  `stall_timeout_s` must end the stream, a trickle under it must not, and the
+  two must be distinguishable from a desync (skipped if the SDK isn't
+  installed).
+
+## A silent feed is worse than a crashed one
+
+`_stream()` awaits each message with a deadline rather than looping over
+`client.listen()` directly. The failure it exists for raises nothing: the
+socket stays open, pings are answered, and the subscription simply stops
+delivering. `supervise` restarts loops that fail, and a loop waiting on a
+silent socket has not failed — so without this, the recorder writes nothing
+until a human notices, and the raw archive is the irreplaceable half.
+
+The deadline is per message, not per stream. A deadline on the whole stream
+would reconnect a healthy slow feed on a fixed cycle, discarding the book
+snapshot every time.
 
 ## Not built yet
 

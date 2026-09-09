@@ -76,6 +76,25 @@ The script is tested against data with a deliberately planted edge, against a
 realistic weak edge, and against pure noise — a check that can only ever say
 "promising" is worse than no check.
 
+### `data/` holds more than one generation of columns
+
+Every change to `BLOFIN_LABEL_HORIZONS` starts a new set of label columns, and
+the files written under the old ones stay on disk. `check_features.py` admits
+each file on its own header and **skips those without the horizon you asked
+for**, reporting the file and its row count:
+
+```
+Loaded 47,692 rows from 3 file(s):
+  ...
+Skipped 1 file(s), 37,595 rows, with no fwd_ret_bps_900s column - recorded
+under other label horizons:
+  features-2026-09-07.csv    37,595 rows  has: 1s, 5s, 30s
+```
+
+Read that line. A corpus 44% smaller than the directory suggests is a very
+different basis for a verdict, and the skipped rows are not lost — `replay.py`
+re-derives them from the raw archive at the current horizons.
+
 ---
 
 ## bars_import.py — the actual training set

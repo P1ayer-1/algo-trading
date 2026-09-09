@@ -47,11 +47,13 @@ class MicrostructureFeed:
         label_config: Optional[LabelConfig] = None,
         tape_window_seconds: float = 60.0,
         record_raw: bool = True,
+        stall_timeout_s: float = 30.0,
         on_snapshot: Optional[Callable[[FeatureSnapshot], Any]] = None,
     ):
         self.inst_id = inst_id
         self.use_demo = use_demo
         self.book_depth = book_depth
+        self.stall_timeout_s = stall_timeout_s
         self.on_snapshot = on_snapshot
 
         self.book = OrderBook()
@@ -71,8 +73,13 @@ class MicrostructureFeed:
         self.latest: FeatureSnapshot = FeatureSnapshot()
         self.connected = False
         self.reconnects = 0
+        self.stalls = 0
         self.messages = 0
         self.started_at = time.time()
+        # Wall-clock of the last message off the wire. `_stream()` is what
+        # acts on it; this is here so `status()` can show the silence to a
+        # human before the watchdog decides.
+        self.last_message_at: Optional[float] = None
 
         # A single crossed update can just be a mid-update race, so tolerate a
         # few in a row before forcing an expensive resubscribe.
@@ -89,6 +96,7 @@ class MicrostructureFeed:
             return False
 
         self.messages += 1
+        self.last_message_at = time.time()
         # Archive first, parse second. If anything below throws, the event is
         # already safely on disk and can be replayed after the fix.
         self.raw_log.write(channel, message)
@@ -154,13 +162,12 @@ class MicrostructureFeed:
                     f"{self.inst_id} [{self.book_depth}, trades, funding-rate]"
                 )
 
-                async for message in client.listen():
-                    if self.handle_message(message):
-                        print(
-                            "Order book desync "
-                            f"({self.book.last_gap_reason}) - resyncing."
-                        )
-                        break
+                self.last_message_at = time.time()
+                if await self._stream(client):
+                    print(
+                        "Order book desync "
+                        f"({self.book.last_gap_reason}) - resyncing."
+                    )
 
             except asyncio.CancelledError:
                 raise
@@ -177,6 +184,43 @@ class MicrostructureFeed:
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
+
+    async def _stream(self, client: Any) -> bool:
+        """Pump messages until the feed desyncs, ends, or goes silent.
+
+        Returns True if the book desynced (the caller reports the reason).
+
+        The silence check is the point of this method existing. `async for
+        message in client.listen()` has no deadline, so a subscription that
+        stops delivering while the socket stays open blocks here forever: no
+        exception, so `supervise` sees a healthy loop, and the recorder writes
+        nothing until someone notices by hand. That is strictly worse than the
+        crash this project already fixed: a crash at least leaves a mark.
+
+        Cancelling `__anext__` mid-await is safe precisely because we never
+        resume the iterator afterwards - the caller closes the client and
+        reconnects, which is the only honest response to a feed we can no
+        longer account for.
+        """
+        messages = client.listen().__aiter__()
+        while True:
+            try:
+                message = await asyncio.wait_for(
+                    messages.__anext__(), timeout=self.stall_timeout_s
+                )
+            except asyncio.TimeoutError:
+                self.stalls += 1
+                print(
+                    f"Microstructure feed stalled: no message in "
+                    f"{self.stall_timeout_s:g}s (socket still open) - "
+                    f"reconnecting."
+                )
+                return False
+            except StopAsyncIteration:
+                return False
+
+            if self.handle_message(message):
+                return True
 
     def close(self) -> None:
         self.recorder.close()
@@ -196,6 +240,12 @@ class MicrostructureFeed:
             "seqId": self.book.seq_id,
             "resyncs": self.book.resync_count,
             "reconnects": self.reconnects,
+            "stalls": self.stalls,
+            "stallTimeoutSeconds": self.stall_timeout_s,
+            "silenceSeconds": (
+                None if self.last_message_at is None
+                else round(time.time() - self.last_message_at, 1)
+            ),
             "messages": self.messages,
             "uptimeSeconds": round(time.time() - self.started_at, 1),
             "tape": self.tape.snapshot(),

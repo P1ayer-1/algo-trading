@@ -73,7 +73,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (298 tests)
+│   └── tests/                 # pytest suite (308 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── features-*.csv         #   labelled features — regenerable
 │   └── raw/                   #   raw events — IRREPLACEABLE
@@ -148,6 +148,7 @@ Useful environment variables (set in `.env` or the shell):
 | `BLOFIN_CHART_HTTP_PORT` / `BLOFIN_CHART_WS_PORT` | Local server ports | `8765` / `8766` |
 | `BLOFIN_MICRO_ENABLED` | Run the order book / feature feed | `true` |
 | `BLOFIN_BOOK_DEPTH` | `books` (200 levels) or `books5` | `books` |
+| `BLOFIN_FEED_STALL_TIMEOUT_S` | Silence before the feed is reconnected | `30` |
 | `BLOFIN_RECORD_FEATURES` | Write labelled features to `data/` | `true` |
 | `BLOFIN_FEATURE_SAMPLE_MS` | How often to persist a row | `1000` |
 | `BLOFIN_LABEL_HORIZONS` | Forward label horizons, seconds | `300,900,1800` |
@@ -215,12 +216,21 @@ intact. Worth knowing the shape of the loss, though: the raw archive is the
 irreplaceable half, and a crash is only ever as expensive as the time before
 someone notices.
 
-One gap remains, and it is worth knowing about. A *stalled* feed — TCP still
-open, no messages arriving — is not currently detected, and no exception is
-raised to restart. `feed.status()` already exposes `tape_staleness_s` and
-`book_age_ms`, so a watchdog that forces a reconnect when those go quiet is
-the obvious next hardening step. Until then, glance at the row count on the
-chart's Microstructure panel.
+The other half of that lesson — a *stalled* feed, TCP still open and no
+messages arriving — is now handled too. It was the more dangerous of the two,
+because it raises nothing: `supervise` restarts loops that fail, and a loop
+waiting on a silent socket has not failed. The SDK cannot catch it either;
+its receive loop swallows its own read timeout with `continue`, and
+`listen()` then blocks forever on an empty queue.
+
+So the feed now measures silence directly (`backend/trading/ingest.py`,
+`_stream`): each message is awaited with a deadline, and
+`BLOFIN_FEED_STALL_TIMEOUT_S` seconds without one tears the connection down
+and reconnects, which is the only honest response to a feed we can no longer
+account for. The deadline is per message, not per stream, so a slow feed is
+never mistaken for a dead one. `feed.status()` reports `silenceSeconds` and a
+`stalls` count, so the condition is visible on the chart's Microstructure
+panel before the watchdog acts on it.
 
 ## Checking whether it predicts anything
 
@@ -242,12 +252,14 @@ cd backend
 python -m pytest
 ```
 
-298 tests covering the order book's gap handling, the OFI recursion, the
+308 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
 queue bracket, the maker-fee gate, the loop supervisor that keeps an
-overnight run alive, and the evaluation statistics. They need no network,
+overnight run alive, the stall watchdog that reconnects a silent feed, the
+loader that refuses to concatenate CSVs from two label generations, and the
+evaluation statistics. They need no network,
 credentials, or SDK.
 
 ## Roadmap toward the actual bot
