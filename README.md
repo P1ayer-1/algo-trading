@@ -503,12 +503,14 @@ Next, in order:
    fetches, so this came from search results quoting it — **confirm against
    your own account**):
 
-   | tier | maker | taker | qualification |
-   |---|---|---|---|
-   | VIP 0 | 0.0200% | 0.0600% | default |
-   | VIP 1 | 0.0060% | 0.0500% | 50k USDT held, or 10M 30d futures, or 1M 30d spot |
-   | VIP 2 | 0.0040% | 0.0450% | 2M USDT 30d spot |
-   | VIP 5 | 0.0000% | 0.0350% | — |
+   | VIP Tier | Futures Maker Fee | Futures Taker Fee | Spot Maker Fee | Spot Taker Fee | Requirement                                       |
+   | -------- | ----------------: | ----------------: | -------------: | -------------: | ------------------------------------------------- |
+   | VIP 0    |           0.0200% |           0.0600% |        0.1000% |        0.1000% | default                                           |
+   | VIP 1    |           0.0060% |           0.0500% |        0.0350% |        0.0600% | 50k USDT held, or 10M 30d futures, or 1M 30d spot |
+   | VIP 2    |           0.0040% |           0.0450% |        0.0200% |        0.0500% | 2M USDT 30d spot                                  |
+   | VIP 3    |           0.0020% |           0.0425% |        0.0150% |        0.0450% | —                                                 |
+   | VIP 4    |           0.0010% |           0.0400% |        0.0125% |        0.0375% | —                                                 |
+   | VIP 5    |           0.0000% |           0.0350% |        0.0100% |        0.0325% | —                                                 |
 
    Two findings, and the second is the one that matters.
 
