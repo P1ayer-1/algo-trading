@@ -53,6 +53,7 @@ first. Recording is therefore step one, not step four.
 │   ├── live-chart.py        # entrypoint: chart + one instrument's recorder
 │   ├── record.py             # entrypoint: N instruments, headless, no ports
 │   ├── record_oi.py          # entrypoint: open interest, alongside a live run
+│   ├── plan_carry.py         # entrypoint: what a carry WOULD do. Sends nothing.
 │   ├── record_oi.py          # entrypoint: open interest, addable to a live run
 │   ├── config.py             # all settings: env vars, paths, ports
 │   ├── market_data.py        # fetch/parse BloFin candles & prices
@@ -315,7 +316,7 @@ cd backend
 python -m pytest
 ```
 
-431 tests covering the order book's gap handling, the OFI recursion, the
+456 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -807,6 +808,49 @@ ecord.py` runs N instruments headless in one process.
    these markets, so entry and exit cost is today's spread held constant. It
    is the smaller assumption, since the four-leg cost is tens of bps against
    funding swings of hundreds.
+
+9g. ~~**Plan the carry**~~ — `backend	rading\carry.py` and
+   `backend\plan_carry.py`. The analysis says which instruments to carry and
+   what they earned; neither says what to *do*. This computes the orders,
+   the capital, the liquidation price and the expected return, and prints
+   them. **It sends nothing** — there is no code path from it to
+   `placeOrder`, which is checkable with a grep and is checked that way.
+
+   ```
+   python backend\plan_carry.py --instrument SUI-USDT --notional 2000 --leverage 3
+   ```
+
+   | | |
+   |---|---|
+   | BUY spot | 2534 SUI @ ~0.7896 ($2,000.85) |
+   | SELL perp | 2534 contracts @ ~0.789, isolated 3x |
+   | capital | $2,000.85 spot + $666.57 margin |
+   | liquidation | 1.0461, **32.6% away** |
+   | round trip | 32.14 bps, break-even 4.9 days |
+   | expected 30d | +164.1 bps = $32.81 |
+
+   Three things the planner exists to get right, none of which the analysis
+   layer touches:
+
+   - **Delta neutrality has to survive rounding.** The spot leg trades in base
+     units on one lot size and the perp leg in contracts on another. Rounding
+     them independently leaves the position quietly directional, so the perp
+     leg is sized first in whole lots, spot is derived from it, and any
+     residual the spot lot forces is reported in base and dollars.
+   - **The short leg is liquidatable on its own.** Delta-neutral is not
+     risk-neutral — the legs margin separately, and a rally that leaves the
+     pair flat can still take the short out, leaving an unhedged long. The
+     liquidation price uses the MMR and fee buffer measured in step 1's
+     validation. Isolated margin, deliberately: cross would back the short
+     with the spot leg's cash, which reads as a wider buffer and is really a
+     bigger blast radius.
+   - **Refusals are plural.** Every failing gate is listed, not the first.
+     `--leverage 10` returns both "liquidation only 9.4% away, needs 15.0%"
+     and "leverage 10 exceeds the 5 limit".
+
+   What it deliberately does not decide: which leg to send first. Whichever
+   fills leaves you directional until the other does, and that belongs to the
+   executor that sends them.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
