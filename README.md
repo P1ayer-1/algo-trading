@@ -73,12 +73,14 @@ first. Recording is therefore step one, not step four.
 │   │   ├── passive_sim.py     # markout curves + bracketed passive fill rates
 │   │   ├── spread_survey.py   # which instruments' spreads cover the maker fee
 │   │   ├── venue_compare.py   # adverse selection: BloFin vs Binance, paired
+│   │   ├── blofin_spot.py     # the spot endpoints the SDK omits
+│   │   ├── funding_carry.py   # long spot + short perp: does funding pay?
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (360 tests)
+│   └── tests/                 # pytest suite (381 tests)
 ├── data/                      # recorded data (gitignored)
 │   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
 │       ├── features-*.csv     #     labelled features — regenerable
@@ -292,7 +294,7 @@ cd backend
 python -m pytest
 ```
 
-360 tests covering the order book's gap handling, the OFI recursion, the
+381 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -669,6 +671,53 @@ ecord.py` runs N instruments headless in one process.
    BTC-USDT is in the first group twice over: it is the tick-bound control
    that made the venue comparison credible, and it carries the existing
    prediction-branch history, which now lives in `data/BTC-USDT/`.
+
+9e. **Funding carry** — `backendnalysisunding_carry.py`. Every branch so
+   far died on execution cost against a forecast that was too small. Carry
+   needs no forecast: hold spot, short the perp against it, collect funding
+   while delta-neutral.
+
+   The vendored SDK is futures-only and `getInstruments()` returns 487 SWAPs,
+   which made this look impossible. It is not — BloFin's spot endpoints are
+   simply unwrapped, and answer fine when given `instType=SPOT`:
+   **242 spot pairs, 175 of them with a matching linear perp.**
+
+   One asymmetry shapes everything: there is no borrow, so **the spot leg can
+   only be long**, and only POSITIVE funding is harvestable. That rules out
+   BTC-USDT immediately — its median funding is below zero.
+
+   **Run, and for the first time in this project something clears its cost by
+   a wide margin.** 42 of 175 pairs clear a four-leg round trip over 30 days
+   while crossing every leg:
+
+   | | fund/day | pos% | spot spr | perp spr | cross RT | b/e days | net 30d | net after convergence |
+   |---|---|---|---|---|---|---|---|---|
+   | XRP-USDC | 8.40 | 100% | 3.52 | 1.41 | 24.93 | 3.0 | +227.1 | +218.3 |
+   | SUI-USDT | 7.29 | 99% | 6.15 | 6.15 | 32.30 | 4.4 | +186.4 | +179.0 |
+   | XRP-USDT | 6.93 | 100% | 4.93 | 0.70 | 25.64 | 3.7 | +182.3 | +175.2 |
+   | LINK-USDT | 6.60 | 92% | 4.01 | 0.80 | 24.81 | 3.8 | +173.2 | +167.6 |
+   | BTC-USDT | −0.60 | 42% | 0.23 | 0.01 | 20.24 | never | −38.2 | −41.2 |
+
+   The constraint is the **spot spread**, not the funding rate: the perp side
+   is often under 2 bps while the spot side runs 4-50, and a four-leg round
+   trip is days of carry before the position is flat. That is why the gate is
+   a break-even in days rather than a rate.
+
+   Reasons this is not yet a result, in order of how much they could move it:
+
+   - **The spot fee schedule has never been read off the account.** It
+     defaults to the futures rates, which is almost certainly wrong and
+     flatters the answer, because spot fees are usually higher. This is the
+     single biggest unknown and it is one login away.
+   - **33 days of funding history is one regime.** Positive-share and worst
+     cumulative drawdown are reported per instrument for exactly this reason:
+     RAY-USDT pays 76% of periods and has given back 27 bps in a run.
+   - **The basis is a real exposure.** The perp trades *below* spot on every
+     instrument measured, so the hedge buys the expensive leg and shorts the
+     cheap one; `net-conv` is the result if that gap closes completely.
+   - **Returns are on notional, not capital**, and liquidation is not modelled
+     at all — a delta-neutral position still has a leveraged leg that can be
+     liquidated.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
