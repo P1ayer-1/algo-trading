@@ -706,6 +706,36 @@ def markout_table(
     return table
 
 
+def adverse_selection(
+    table: Dict[str, Tuple[np.ndarray, np.ndarray, int]],
+    horizons_s: Sequence[float],
+    model: str,
+    horizon: float,
+) -> Tuple[float, float]:
+    """(bps of markout lost between the fill and `horizon`, standard error).
+
+    Positive means the price moved against the fill: you captured a half
+    spread and then gave some of it back. That decay IS adverse selection —
+    the counterparty knew something, or the level was being swept — and it is
+    the number the whole passive branch turns on, so it gets defined once here
+    rather than recomputed by eye from a printed table.
+
+    The two horizons come from the same fills (`observable` guarantees it), so
+    this is a paired difference and the errors are correlated. Adding them in
+    quadrature therefore OVERSTATES the interval, which is the safe direction
+    for a number used to decide whether to trade.
+    """
+    mean, error, count = table[model]
+    if count == 0:
+        return float("nan"), float("nan")
+    columns = list(horizons_s)
+    start = columns.index(0.0) if 0.0 in columns else 0
+    end = min(range(len(columns)), key=lambda i: abs(columns[i] - horizon))
+    decay = float(mean[start] - mean[end])
+    stderr = float(np.hypot(error[start], error[end]))
+    return decay, stderr
+
+
 def report_markout(table: Dict[str, Tuple[np.ndarray, np.ndarray, int]],
                    horizons_s: Sequence[float]) -> None:
     print("\n" + "=" * 72)

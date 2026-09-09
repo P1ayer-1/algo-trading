@@ -49,6 +49,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import sys
+import zlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -191,17 +193,45 @@ class RawEventLog:
         }
 
 
-def iter_events(path: Path):
+def iter_events(path: Path, *, warn: bool = True):
     """Read back one raw log file, yielding (receive_ms, sequence, message).
 
     Sort merged streams on the (receive_ms, sequence) pair — see the module
     docstring for why the timestamp alone is not sufficient.
 
-    Tolerates a truncated final line, which is the normal result of the
-    process being killed mid-write — one lost message, not a lost file.
+    Tolerates an incomplete tail in both the forms it actually takes:
+
+    **A truncated JSON line**, from the process being killed mid-write. One
+    lost message, not a lost file.
+
+    **An unterminated gzip stream**, which is what the CURRENT hour's file
+    looks like the entire time it is being appended to. This is the normal
+    case, not the exceptional one: analysis runs while recording continues,
+    and the newest file is always mid-block. Without this, every tool reading
+    the archive dies on `zlib.error: invalid block type` the moment a recorder
+    is live — which is precisely when you want to look.
+
+    Either way the rule is the same: yield every complete record and stop at
+    the tear. The bytes after it are not data yet.
     """
     with gzip.open(path, "rt", encoding="utf-8") as handle:
-        for line in handle:
+        lines = iter(handle)
+        while True:
+            try:
+                line = next(lines)
+            except StopIteration:
+                return
+            except (EOFError, zlib.error, OSError) as exc:
+                # Reaching here mid-file is expected for the hour currently
+                # being written. It is also what a genuinely corrupt archive
+                # looks like, and those must not be indistinguishable, so say
+                # which file stopped early and let the caller judge.
+                if warn:
+                    print(f"  {path.name}: stopped at an incomplete tail "
+                          f"({type(exc).__name__}) - still being written, or "
+                          f"truncated.", file=sys.stderr)
+                return
+
             line = line.strip()
             if not line:
                 continue

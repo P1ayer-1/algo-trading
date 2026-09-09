@@ -72,12 +72,13 @@ first. Recording is therefore step one, not step four.
 │   │   ├── train_model.py     # LightGBM + shuffled-label control + paired test
 │   │   ├── passive_sim.py     # markout curves + bracketed passive fill rates
 │   │   ├── spread_survey.py   # which instruments' spreads cover the maker fee
+│   │   ├── venue_compare.py   # adverse selection: BloFin vs Binance, paired
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (346 tests)
+│   └── tests/                 # pytest suite (360 tests)
 ├── data/                      # recorded data (gitignored)
 │   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
 │       ├── features-*.csv     #     labelled features — regenerable
@@ -291,7 +292,7 @@ cd backend
 python -m pytest
 ```
 
-346 tests covering the order book's gap handling, the OFI recursion, the
+360 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -630,8 +631,18 @@ Next, in order:
      6.30 bps bracket on ADA against a 4.00 bps total fee ladder.
 
    Both need exactly what `recorder.py` already produces, pointed at one of
-   these instruments instead of BTC-USDT. That is step 9d, and there is a data
-   hazard to fix first — see below.
+   these instruments instead of BTC-USDT. That is step 9d, and
+   `backendnalysisenue_compare.py` is the tool that reads the answer out:
+   it runs the identical `passive_sim` pipeline over both venues for the same
+   instruments and reports the paired difference in adverse selection, with
+   BTC-USDT as a control for the fact that the two sides are different days.
+
+   **First run, 42 minutes in, and the control did its job:** BTC showed
+   −2.901 bps `[-4.21, -1.59]` on an instrument that is tick-bound and
+   identically priced on both venues and therefore cannot carry a venue
+   effect. So the tool refused to draw a venue conclusion and said the
+   comparison is date-confounded, which is correct. Re-run once there are
+   6+ hours per instrument.
 
    The dates are eight days apart, which is the honest caveat on the ratio
    column. A consistent 2.7x across three independent instruments is larger
