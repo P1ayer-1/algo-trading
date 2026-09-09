@@ -54,6 +54,7 @@ first. Recording is therefore step one, not step four.
 │   ├── record.py             # entrypoint: N instruments, headless, no ports
 │   ├── record_oi.py          # entrypoint: open interest, alongside a live run
 │   ├── plan_carry.py         # entrypoint: what a carry WOULD do. Sends nothing.
+│   ├── run_carry.py          # entrypoint: opens it. Dry unless --confirm.
 │   ├── record_oi.py          # entrypoint: open interest, addable to a live run
 │   ├── config.py             # all settings: env vars, paths, ports
 │   ├── market_data.py        # fetch/parse BloFin candles & prices
@@ -316,7 +317,7 @@ cd backend
 python -m pytest
 ```
 
-456 tests covering the order book's gap handling, the OFI recursion, the
+476 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
