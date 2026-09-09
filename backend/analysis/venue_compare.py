@@ -172,6 +172,36 @@ def measure(events: Iterable[dict], *, venue: str, symbol: str,
     )
 
 
+def difference_in_differences(
+    instrument: Tuple[str, Measurement, Measurement],
+    control: Tuple[str, Measurement, Measurement],
+) -> Tuple[float, float]:
+    """The instrument's venue difference NET of the control's.
+
+    The control measures what this comparison reports when there is nothing to
+    report: BTC-USDT is tick-bound with an identical spread on both venues, so
+    any difference it shows is the date gap, the regime, and whatever else
+    separates two samples that are not the same day.
+
+    Subtracting it is the standard use of a control, and it is strictly better
+    than the threshold test this replaced. That test compared the control's
+    POINT estimate against a fixed bar and ignored its interval entirely -
+    which, in a tool whose whole discipline is refusing to read a number
+    without one, was the inconsistent step. At 42 minutes the control sat at
+    -2.901 [-4.21, -1.59] and vetoed everything; at 16 hours it sits at
+    -0.351 [-0.95, +0.25], indistinguishable from zero, and a threshold on
+    0.351 would still have vetoed everything.
+
+    Errors add in quadrature: the control and the instrument are measured on
+    different instruments and different quotes, so they are independent.
+    """
+    instrument_difference, instrument_stderr = paired_difference(
+        instrument[1], instrument[2])
+    control_difference, control_stderr = paired_difference(control[1], control[2])
+    return (instrument_difference - control_difference,
+            float(np.hypot(instrument_stderr, control_stderr)))
+
+
 def paired_difference(blofin: Measurement,
                       binance: Measurement) -> Tuple[float, float]:
     """(BloFin adverse selection minus Binance's, standard error).
@@ -261,31 +291,42 @@ def report(rows: List[Tuple[str, Measurement, Measurement]], *,
     print(f"  Control ({CONTROL}): {control_difference:+.3f} bps "
           f"+-{1.96 * control_stderr:.3f}")
 
-    if abs(control_difference) > NEGLIGIBLE_BPS:
-        print("\n  THE CONTROL MOVED, so this comparison is date-confounded.")
-        print("  An instrument that is tick-bound and identically priced on "
-              "both venues should\n  show no venue effect. It shows "
-              f"{control_difference:+.3f} bps, which is the size of the "
-              "date gap\n  and regime difference between the two samples. "
-              "Differences below that are not\n  readable as venue effects.")
-        return
+    control_significant = abs(control_difference) > 1.96 * control_stderr
+    if control_significant:
+        print("  The control's interval EXCLUDES zero, so there is a real "
+              "systematic bias\n  between these two samples. Subtracting it is "
+              "the only way to read the rest.")
+    else:
+        print("  The control's interval includes zero: no measurable bias "
+              "between the samples.")
 
     others = [row for row in usable if row[0] != CONTROL]
     if not others:
         print("\n  Control only. Nothing to compare it against yet.")
         return
 
-    print("  The control is flat, so the date gap is not doing much and the "
-          "differences\n  below are more likely about the venue.\n")
+    print("\n  Each instrument NET of the control (difference-in-differences), "
+          "which is what\n  isolates the venue from the dates:\n")
+    print(f"  {'instrument':<14}{'raw diff':>10}{'net of control':>28}")
+    print("  " + "-" * 54)
 
     significant = []
-    for name, blofin, binance in others:
-        difference, stderr = paired_difference(blofin, binance)
-        if abs(difference) > 1.96 * stderr and abs(difference) > NEGLIGIBLE_BPS:
-            significant.append((name, difference))
+    for row in others:
+        name = row[0]
+        raw, _ = paired_difference(row[1], row[2])
+        effect, stderr = difference_in_differences(row, control)
+        low, high = effect - 1.96 * stderr, effect + 1.96 * stderr
+        clears = abs(effect) > 1.96 * stderr and abs(effect) > NEGLIGIBLE_BPS
+        print(f"  {name:<14}{raw:>+10.3f}{effect:>+16.3f} "
+              f"[{low:+.2f},{high:+.2f}]{'  *' if clears else ''}")
+        if clears:
+            significant.append((name, effect))
+    print("\n  * clears its own interval and the 0.2 bps floor below which a "
+          "difference is\n    smaller than the spread of this quantity on one "
+          "venue alone.\n")
 
     if not significant:
-        print("  NO INSTRUMENT SHOWS A DIFFERENCE THAT CLEARS ITS OWN INTERVAL.")
+        print("  NO INSTRUMENT SHOWS A VENUE EFFECT THAT CLEARS ITS OWN INTERVAL.")
         print("  On this evidence the 0.5 bps/leg assumption carried over from "
               "Binance is not\n  contradicted, which is the most useful thing "
               "a null result here can say -\n  every gate in the repo depends "

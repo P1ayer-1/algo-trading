@@ -80,7 +80,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (381 tests)
+│   └── tests/                 # pytest suite (384 tests)
 ├── data/                      # recorded data (gitignored)
 │   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
 │       ├── features-*.csv     #     labelled features — regenerable
@@ -161,7 +161,7 @@ Useful environment variables (set in `.env` or the shell):
 | `BLOFIN_FEATURE_SAMPLE_MS` | How often to persist a row | `1000` |
 | `BLOFIN_LABEL_HORIZONS` | Forward label horizons, seconds | `300,900,1800` |
 | `BLOFIN_LABEL_THRESHOLD_BPS` | Move size counted as a signal | `10` |
-| `BLOFIN_VIP_TIER` | BloFin fee tier (0, 1, 2, 5) | `0` |
+| `BLOFIN_VIP_TIER` | BloFin fee tier (0, 1, 2, 3, 5) | `0` |
 | `BLOFIN_MAKER_FEE_RATE` / `BLOFIN_TAKER_FEE_RATE` | Override the tier's rates, per side | from tier |
 | `BLOFIN_ROUND_TRIP_COST_BPS` | Cost the edge gate must clear | `10` |
 | `BLOFIN_MAX_LEVERAGE` | Risk engine leverage cap | `5` |
@@ -294,7 +294,7 @@ cd backend
 python -m pytest
 ```
 
-381 tests covering the order book's gap handling, the OFI recursion, the
+384 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and

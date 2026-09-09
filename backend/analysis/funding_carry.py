@@ -69,22 +69,26 @@ from analysis.blofin_spot import (  # noqa: E402
 )
 
 try:  # Single source of truth for fees; see backend/config.py.
-    from config import MAKER_FEE_BPS, TAKER_FEE_BPS, VIP_TIER
+    from config import (
+        MAKER_FEE_BPS,
+        SPOT_MAKER_FEE_BPS,
+        SPOT_TAKER_FEE_BPS,
+        TAKER_FEE_BPS,
+        VIP_TIER,
+    )
 
     PERP_MAKER_BPS = float(MAKER_FEE_BPS)
     PERP_TAKER_BPS = float(TAKER_FEE_BPS)
     TIER = VIP_TIER
+    # None on a tier whose spot rates were never confirmed. Left as None so
+    # the caller has to supply them rather than inherit a guess.
+    DEFAULT_SPOT_MAKER_BPS = (float(SPOT_MAKER_FEE_BPS)
+                              if SPOT_MAKER_FEE_BPS is not None else None)
+    DEFAULT_SPOT_TAKER_BPS = (float(SPOT_TAKER_FEE_BPS)
+                              if SPOT_TAKER_FEE_BPS is not None else None)
 except Exception:  # pragma: no cover - keeps the analysis tools standalone
     PERP_MAKER_BPS, PERP_TAKER_BPS, TIER = 0.6, 5.0, 1
-
-# BloFin's SPOT fee schedule is NOT the futures one and is not in config.py,
-# because it has never been read off the account. These default to the futures
-# rates purely so the arithmetic runs; they are almost certainly wrong, and
-# the report says so. Override with --spot-maker-bps / --spot-taker-bps once
-# the real numbers are known. Spot fees are typically HIGHER than futures, so
-# the defaults flatter the result, which is the dangerous direction.
-DEFAULT_SPOT_MAKER_BPS = PERP_MAKER_BPS
-DEFAULT_SPOT_TAKER_BPS = PERP_TAKER_BPS
+    DEFAULT_SPOT_MAKER_BPS, DEFAULT_SPOT_TAKER_BPS = None, None
 
 # Funding is paid every 8 hours on BloFin, so three periods a day.
 PERIODS_PER_DAY = 3
@@ -160,6 +164,43 @@ class Carry:
     def harvestable(self) -> bool:
         """Positive funding only. The spot leg cannot be shorted."""
         return self.funding_median_bps > 0
+
+
+def fetch_funding_history(api, inst_id: str, *, pages: int = 1,
+                          per_page: int = 100) -> List[dict]:
+    """Funding history, paged backwards through time.
+
+    The endpoint caps at 100 records — 33 days at three periods a day, which
+    is one regime and the binding unknown behind every carry number here. Its
+    `after` parameter returns records OLDER than a timestamp, so walking it
+    backwards buys months instead.
+
+    Stops early when a page comes back short or repeats a timestamp already
+    seen, because an endpoint that ignores an out-of-range cursor by returning
+    the newest page again would otherwise loop forever collecting duplicates.
+    """
+    collected: List[dict] = []
+    seen = set()
+    cursor: Optional[str] = None
+
+    for _ in range(max(1, pages)):
+        try:
+            payload = api.getFundingRateHistory(
+                inst_id, after=cursor, limit=str(per_page))
+        except Exception:  # noqa: BLE001 - a short history is still a history
+            break
+        page = payload.get("data") or []
+        fresh = [row for row in page
+                 if row.get("fundingTime") and row["fundingTime"] not in seen]
+        if not fresh:
+            break
+        seen.update(row["fundingTime"] for row in fresh)
+        collected.extend(fresh)
+        if len(page) < per_page:
+            break
+        cursor = min(row["fundingTime"] for row in fresh)
+
+    return collected
 
 
 def funding_stats(history: Sequence[dict]) -> Dict[str, float]:
@@ -354,6 +395,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "pair with both a spot and a linear perp market.")
     parser.add_argument("--hold-days", type=float, default=DEFAULT_HOLD_DAYS)
     parser.add_argument("--top", type=int, default=20)
+    parser.add_argument("--funding-pages", type=int, default=1,
+                        help="Pages of funding history to walk back, 100 "
+                             "periods (~33 days) each. The default single "
+                             "page is one regime; 6 is most of a year.")
     parser.add_argument("--min-volume-usd", type=float, default=1e6,
                         help="Drop thin spot books; a carry you cannot size "
                              "is not an opportunity.")
@@ -401,24 +446,30 @@ def main(argv: Optional[List[str]] = None) -> int:
             if volume < args.min_volume_usd:
                 rows.append(Carry(inst_id, unavailable="spot volume below floor"))
                 continue
-        try:
-            history = api.getFundingRateHistory(inst_id).get("data") or []
-        except Exception as exc:  # noqa: BLE001 - reported, not raised
-            rows.append(Carry(inst_id, unavailable=f"funding history: {exc}"))
+        history = fetch_funding_history(api, inst_id, pages=args.funding_pages)
+        if not history:
+            rows.append(Carry(inst_id, unavailable="no funding history"))
             continue
         rows.append(build(inst_id, history, spot_ticker,
                           live_perp_tickers.get(inst_id)))
         if index % 20 == 0:
             print(f"  {index}/{len(wanted)}...", flush=True)
 
-    report(rows,
-           spot_maker=args.spot_maker_bps if args.spot_maker_bps is not None
-           else DEFAULT_SPOT_MAKER_BPS,
-           spot_taker=args.spot_taker_bps if args.spot_taker_bps is not None
-           else DEFAULT_SPOT_TAKER_BPS,
+    spot_maker = (args.spot_maker_bps if args.spot_maker_bps is not None
+                  else DEFAULT_SPOT_MAKER_BPS)
+    spot_taker = (args.spot_taker_bps if args.spot_taker_bps is not None
+                  else DEFAULT_SPOT_TAKER_BPS)
+    if spot_maker is None or spot_taker is None:
+        raise SystemExit(
+            f"No spot fee schedule for VIP {TIER}. config.SPOT_VIP_TIERS only "
+            "holds tiers read off an\naccount, and guessing the rest would "
+            "move every verdict below silently.\nPass --spot-maker-bps and "
+            "--spot-taker-bps, or add the tier to config.py."
+        )
+
+    report(rows, spot_maker=spot_maker, spot_taker=spot_taker,
            hold_days=args.hold_days, top=args.top,
-           spot_fees_confirmed=args.spot_maker_bps is not None
-           and args.spot_taker_bps is not None)
+           spot_fees_confirmed=True)
     return 0
 
 

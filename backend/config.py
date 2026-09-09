@@ -232,6 +232,28 @@ COST_MAKER_MAKER_BPS = MAKER_FEE_BPS * 2                # 4.0  passive in, passi
 COST_MAKER_TAKER_BPS = MAKER_FEE_BPS + TAKER_FEE_BPS    # 8.0  passive in, market out
 COST_TAKER_TAKER_BPS = TAKER_FEE_BPS * 2                # 12.0 crossing both ways
 
+# --- SPOT fees, which are a different schedule entirely ---------------------
+# Read off the account on 2026-09-09 at VIP 1. This is NOT the futures table:
+# the spot maker fee is 3.5bps against 0.6 on futures, nearly six times as
+# much, so anything quoting a spot leg is paying a fee that has no futures
+# equivalent. A delta-neutral funding carry crosses FOUR legs -- two perp, two
+# spot -- and using the futures numbers for all four understates the cost of
+# half the trade.
+#
+# Only VIP 1 is account-confirmed. Other tiers are deliberately absent rather
+# than interpolated, exactly like VIP 4 in the futures table: a guessed fee
+# here silently moves every carry verdict downstream.
+SPOT_VIP_TIERS: Dict[int, Tuple[Decimal, Decimal]] = {
+    # tier: (maker, taker)
+    1: (Decimal("0.00035"), Decimal("0.00060")),  # 0.0350% / 0.0600%
+}
+
+_SPOT_RATES = SPOT_VIP_TIERS.get(VIP_TIER)
+# None rather than a fallback, so a caller on an unconfirmed tier has to say
+# what it is assuming instead of inheriting a number that was never checked.
+SPOT_MAKER_FEE_BPS = _bps(_SPOT_RATES[0]) if _SPOT_RATES else None
+SPOT_TAKER_FEE_BPS = _bps(_SPOT_RATES[1]) if _SPOT_RATES else None
+
 # The cost the risk engine's edge gate and the analysis tooling assume by
 # default. Taker/taker deliberately: it is a *veto* threshold, and the
 # conservative assumption is that you cross the spread on both sides. Set

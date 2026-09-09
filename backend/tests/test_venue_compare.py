@@ -20,6 +20,7 @@ from analysis.venue_compare import (
     MIN_HOURS,
     Measurement,
     binance_symbol,
+    difference_in_differences,
     latest_free_sample_day,
     paired_difference,
     report,
@@ -99,20 +100,62 @@ def test_the_difference_interval_widens_with_both_sides():
 # ---------------------------------------------------------------------------
 
 
-def test_a_moved_control_vetoes_the_whole_comparison():
-    """The point of the control.
+def test_the_control_is_subtracted_not_used_as_a_veto():
+    """The point of the control, and the fix to how it was used.
 
     BTC is tick-bound with an identical spread on both venues, so it cannot
-    carry a venue effect. If it shows one anyway, the difference is the dates,
-    and every other row is unreadable.
+    carry a venue effect: whatever it shows is the date gap. Subtracting it is
+    what isolates the venue. The earlier version tested the control's POINT
+    estimate against a threshold and vetoed everything above it, which threw
+    away both the control's information and its uncertainty.
     """
-    report_text = run_report([
-        pair(CONTROL, 3.0, 0.5),          # the control moved a lot
-        pair("ADA-USDT", 4.0, 0.5),
-    ])
+    control = pair(CONTROL, 3.0, 0.5)     # control shifted by +2.5
+    instrument = pair("ADA-USDT", 4.0, 0.5)   # raw +3.5, so +1.0 net
 
-    assert "date-confounded" in report_text
-    assert "selects HARDER" not in report_text, "must not conclude past a bad control"
+    effect, _ = difference_in_differences(instrument, control)
+    assert effect == pytest.approx(1.0)
+
+    report_text = run_report([control, instrument])
+    assert "net of control" in report_text
+    assert "selects HARDER on: ADA-USDT" in report_text
+
+
+def test_a_shifted_control_removes_the_shift_from_every_instrument():
+    """An instrument that moved exactly as much as the control has no effect."""
+    control = pair(CONTROL, 3.0, 0.5)
+    instrument = pair("ADA-USDT", 3.0, 0.5)   # identical raw difference
+
+    effect, _ = difference_in_differences(instrument, control)
+    assert effect == pytest.approx(0.0)
+
+    report_text = run_report([control, instrument])
+    assert "NO INSTRUMENT SHOWS A VENUE EFFECT" in report_text
+
+
+def test_an_uncertain_control_widens_every_interval():
+    """A noisy control must suppress conclusions, without a special case.
+
+    This is what replaces the veto: uncertainty propagates, so a control that
+    cannot be pinned down makes every difference-in-differences interval wide
+    enough to include zero on its own.
+    """
+    control = pair(CONTROL, 0.5, 0.5, stderr=10.0)
+    instrument = pair("ADA-USDT", 3.0, 0.5, stderr=0.05)
+
+    effect, stderr = difference_in_differences(instrument, control)
+    assert effect == pytest.approx(2.5)
+    assert 1.96 * stderr > abs(effect), "a noisy control must not permit a claim"
+
+    report_text = run_report([control, instrument])
+    assert "NO INSTRUMENT SHOWS A VENUE EFFECT" in report_text
+
+
+def test_a_significant_control_is_announced_as_systematic_bias():
+    report_text = run_report([pair(CONTROL, 3.0, 0.5), pair("ADA-USDT", 4.0, 0.5)])
+    assert "EXCLUDES zero" in report_text
+
+    report_text = run_report([pair(CONTROL, 0.5, 0.5), pair("ADA-USDT", 4.0, 0.5)])
+    assert "includes zero" in report_text
 
 
 def test_a_flat_control_lets_a_real_difference_through():
@@ -121,7 +164,6 @@ def test_a_flat_control_lets_a_real_difference_through():
         pair("ADA-USDT", 2.00, 0.50),     # +1.5 bps, far outside +-0.14
     ])
 
-    assert "date-confounded" not in report_text
     assert "selects HARDER on: ADA-USDT" in report_text
 
 
@@ -143,7 +185,7 @@ def test_a_difference_inside_its_own_interval_is_not_an_effect():
         pair("ADA-USDT", 1.00, 0.50, stderr=2.0),   # +0.5 against +-3.9
     ])
 
-    assert "NO INSTRUMENT SHOWS A DIFFERENCE" in report_text
+    assert "NO INSTRUMENT SHOWS A VENUE EFFECT" in report_text
     assert "null result" in report_text
 
 
@@ -158,7 +200,7 @@ def test_a_tiny_but_significant_difference_is_still_ignored():
         pair("ADA-USDT", 0.55, 0.50, stderr=0.001),
     ])
 
-    assert "NO INSTRUMENT SHOWS A DIFFERENCE" in report_text
+    assert "NO INSTRUMENT SHOWS A VENUE EFFECT" in report_text
 
 
 def test_a_thin_blofin_sample_is_labelled_before_anything_else():
