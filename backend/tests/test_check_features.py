@@ -354,3 +354,95 @@ def test_build_matrix_keeps_only_columns_every_row_has(tmp_path):
     assert "obi_1" in names, "columns shared by every row must survive"
     assert len(X) == len(y) == 1000, "no row should be dropped for this"
     assert "2 different headers" in buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# One instrument per matrix
+# ---------------------------------------------------------------------------
+#
+# The hazard the label-generation guard cannot see. Rows for two symbols have
+# identical columns in identical order, so concatenating them produces a
+# matrix nothing can object to on schema grounds - and a verdict about no
+# instrument in particular. Directory layout is the only separation there is.
+
+from analysis.check_features import resolve_files  # noqa: E402
+
+
+def test_a_single_instrument_directory_is_used(tmp_path):
+    (tmp_path / "ADA-USDT").mkdir()
+    write_csv(tmp_path / "ADA-USDT" / "features-2026-01-01.csv",
+              synth_rows(600, signal_strength=1.0, seed=20))
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        files = resolve_files(tmp_path)
+
+    assert len(files) == 1
+    assert "ADA-USDT" in files[0]
+    assert "Instrument: ADA-USDT" in buffer.getvalue()
+
+
+def test_two_instruments_are_refused_with_both_named(tmp_path):
+    for symbol in ("ADA-USDT", "BTC-USDT"):
+        (tmp_path / symbol).mkdir()
+        write_csv(tmp_path / symbol / "features-2026-01-01.csv",
+                  synth_rows(300, signal_strength=1.0, seed=21))
+
+    with pytest.raises(SystemExit, match="more than one instrument"):
+        resolve_files(tmp_path)
+
+
+def test_the_refusal_names_a_usable_data_dir(tmp_path):
+    """An error that does not say what to do instead is half an error."""
+    for symbol in ("ADA-USDT", "BTC-USDT"):
+        (tmp_path / symbol).mkdir()
+        write_csv(tmp_path / symbol / "features-2026-01-01.csv",
+                  synth_rows(300, signal_strength=1.0, seed=22))
+
+    with pytest.raises(SystemExit) as caught:
+        resolve_files(tmp_path)
+    message = str(caught.value)
+    assert "--data-dir" in message
+    assert str(tmp_path / "ADA-USDT") in message
+
+
+def test_mixing_scoped_and_unscoped_files_is_refused(tmp_path):
+    """The unscoped ones record their symbol nowhere, so they cannot be placed.
+
+    Guessing that they belong to whichever instrument sits beside them is
+    exactly the kind of silent assumption this whole layout exists to prevent.
+    """
+    write_csv(tmp_path / "features-2026-01-01.csv",
+              synth_rows(300, signal_strength=1.0, seed=23))
+    (tmp_path / "ADA-USDT").mkdir()
+    write_csv(tmp_path / "ADA-USDT" / "features-2026-01-02.csv",
+              synth_rows(300, signal_strength=1.0, seed=24))
+
+    with pytest.raises(SystemExit, match="both unscoped files and"):
+        resolve_files(tmp_path)
+
+
+def test_the_legacy_flat_layout_still_works(tmp_path):
+    """Everything recorded before 2026-09-09 is flat and single-instrument."""
+    write_csv(tmp_path / "features-2026-01-01.csv",
+              synth_rows(400, signal_strength=1.0, seed=25))
+    write_csv(tmp_path / "features-2026-01-02.csv",
+              synth_rows(400, signal_strength=1.0, seed=26))
+
+    assert len(resolve_files(tmp_path)) == 2
+
+
+def test_the_raw_archive_directory_is_not_mistaken_for_an_instrument(tmp_path):
+    (tmp_path / "ADA-USDT").mkdir()
+    write_csv(tmp_path / "ADA-USDT" / "features-2026-01-01.csv",
+              synth_rows(600, signal_strength=1.0, seed=27))
+    (tmp_path / "raw").mkdir()
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        assert len(resolve_files(tmp_path)) == 1
+
+
+def test_an_empty_directory_says_how_to_get_data(tmp_path):
+    with pytest.raises(SystemExit, match="Run the bot first"):
+        resolve_files(tmp_path)

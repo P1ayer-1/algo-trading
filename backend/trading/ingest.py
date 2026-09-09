@@ -59,8 +59,17 @@ class MicrostructureFeed:
         self.book = OrderBook()
         self.tape = TradeTape(window_seconds=tape_window_seconds)
         self.engine = FeatureEngine()
+
+        # BOTH writers are scoped to the instrument, and that is not tidiness.
+        # The rows for two symbols are structurally identical - same columns,
+        # same order, same dtypes - and differ only in which instrument they
+        # describe. Written to a shared path they concatenate into one matrix
+        # that no schema check can object to, because nothing about the schema
+        # is wrong. The only thing that separates them is where they live.
+        self.data_root = Path(data_dir or Path("data"))
+        self.instrument_dir = self.data_root / inst_id
         self.recorder = FeatureRecorder(
-            data_dir or Path("data"),
+            self.instrument_dir,
             label_config=label_config,
             sample_interval_ms=sample_interval_ms,
             enabled=record,
@@ -68,7 +77,7 @@ class MicrostructureFeed:
         # The raw archive. Written before any parsing, so a bug in the feature
         # code can never corrupt or lose the source data — the archive can
         # always be replayed once the bug is fixed.
-        self.raw_log = RawEventLog(data_dir or Path("data"), enabled=record_raw)
+        self.raw_log = RawEventLog(self.instrument_dir, enabled=record_raw)
 
         self.latest: FeatureSnapshot = FeatureSnapshot()
         self.connected = False

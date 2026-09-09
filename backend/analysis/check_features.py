@@ -34,6 +34,7 @@ import csv
 import glob
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -119,6 +120,75 @@ except Exception:  # pragma: no cover - keeps the analysis tools standalone
     MAKER_ONLY_COST_BPS = 1.2
 
 
+# What an instrument directory looks like: a BloFin instId, `BASE-QUOTE`,
+# uppercase (`1000BONK-USDT` included). Matching the shape rather than keeping
+# a deny-list of tool directories means `data/replayed`, `data/bars`,
+# `data/cache` and anything added later are excluded for a reason that stays
+# true, instead of until someone forgets to update the list.
+INSTRUMENT_DIR = re.compile(r"[A-Z0-9]+-[A-Z0-9]+")
+
+
+def resolve_files(data_dir: Path, pattern: str = "features-*.csv") -> List[str]:
+    """The feature CSVs to read, from ONE instrument.
+
+    `recorder.py` writes to `data/<INST-ID>/`, because rows for two symbols are
+    structurally identical - same columns, same order, same dtypes - and differ
+    only in which instrument they describe. Concatenated, they make a matrix
+    that no schema check can object to, because nothing about the schema is
+    wrong. Directory layout is the only thing separating them, so this refuses
+    to cross a directory boundary rather than quietly averaging two
+    instruments into one verdict.
+
+    Flat files directly in `data/` are the pre-2026-09-09 layout, from before
+    the recorder scoped its output. They are accepted on their own, since
+    everything written that way came from a single instrument.
+    """
+    direct = sorted(glob.glob(str(data_dir / pattern)))
+    scoped = {}
+    if data_dir.is_dir():
+        for child in sorted(data_dir.iterdir()):
+            if not child.is_dir() or not INSTRUMENT_DIR.fullmatch(child.name):
+                continue
+            found = sorted(glob.glob(str(child / pattern)))
+            if found:
+                scoped[child.name] = found
+
+    if direct and scoped:
+        raise SystemExit(
+            f"{data_dir} holds both unscoped files and per-instrument "
+            f"directories ({', '.join(scoped)}).\n"
+            "The unscoped ones predate instrument-scoped recording and their "
+            "symbol is recorded\nnowhere, so they cannot be safely combined "
+            "with anything. Move them into the\ndirectory for whichever "
+            "instrument produced them, then re-run."
+        )
+
+    if len(scoped) > 1:
+        listing = "\n".join(
+            f"  {name:<16} {len(paths)} file(s)" for name, paths in scoped.items()
+        )
+        raise SystemExit(
+            f"{data_dir} holds more than one instrument:\n{listing}\n\n"
+            "Averaging them into one matrix would produce a verdict about no "
+            "instrument in\nparticular. Point --data-dir at one of them, e.g. "
+            f"--data-dir {data_dir / next(iter(scoped))}"
+        )
+
+    if scoped:
+        name, paths = next(iter(scoped.items()))
+        print(f"Instrument: {name}")
+        return paths
+
+    if direct:
+        return direct
+
+    raise SystemExit(
+        f"No files matching {pattern} in {data_dir} or its instrument "
+        f"subdirectories.\n"
+        "Run the bot first (python backend/live-chart.py) to record data."
+    )
+
+
 def horizons_in(fieldnames: List[str]) -> List[str]:
     """The forward horizons a header actually carries, as `300s`-style tags."""
     return [name[len("fwd_ret_bps_"):] for name in fieldnames
@@ -143,12 +213,7 @@ def load_rows(data_dir: Path, pattern: str = "features-*.csv",
     half the size the banner implies" is exactly the kind of thing that must
     not be discovered after the conclusion has been drawn.
     """
-    files = sorted(glob.glob(str(data_dir / pattern)))
-    if not files:
-        raise SystemExit(
-            f"No files matching {pattern} in {data_dir}.\n"
-            "Run the bot first (python backend/live-chart.py) to record data."
-        )
+    files = resolve_files(data_dir, pattern)
 
     rows: List[dict] = []
     kept: List[Tuple[str, int]] = []

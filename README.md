@@ -49,7 +49,8 @@ first. Recording is therefore step one, not step four.
 ```
 .
 ├── backend/
-│   ├── live-chart.py        # entrypoint: run this. Wires the pieces below together.
+│   ├── live-chart.py        # entrypoint: chart + one instrument's recorder
+│   ├── record.py             # entrypoint: N instruments, headless, no ports
 │   ├── config.py             # all settings: env vars, paths, ports
 │   ├── market_data.py        # fetch/parse BloFin candles & prices
 │   ├── support_resistance.py # swing-detection + clustering (the only "analysis" so far)
@@ -75,8 +76,9 @@ first. Recording is therefore step one, not step four.
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
 │   └── tests/                 # pytest suite (308 tests)
 ├── data/                      # recorded data (gitignored)
-│   ├── features-*.csv         #   labelled features — regenerable
-│   └── raw/                   #   raw events — IRREPLACEABLE
+│   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
+│       ├── features-*.csv     #     labelled features — regenerable
+│       └── raw/               #     raw events — IRREPLACEABLE
 ├── frontend/
 │   ├── live-chart.html     # thin page shell
 │   ├── styles.css          # all page styling
@@ -158,7 +160,7 @@ Useful environment variables (set in `.env` or the shell):
 | `BLOFIN_ROUND_TRIP_COST_BPS` | Cost the edge gate must clear | `10` |
 | `BLOFIN_MAX_LEVERAGE` | Risk engine leverage cap | `5` |
 | `BLOFIN_MIN_LIQ_BUFFER_PCT` | Required distance to liquidation | `0.15` |
-| `BLOFIN_RECORD_RAW` | Archive raw events to `data/raw/` | `true` |
+| `BLOFIN_RECORD_RAW` | Archive raw events to `data/<INST-ID>/raw/` | `true` |
 
 See `backend/config.py` for the full list — every setting lives there.
 
@@ -166,11 +168,45 @@ Run with `--no-microstructure` to start only the chart.
 
 ## Collecting data
 
-Just run the bot and leave it. Recording is on by default:
+For one instrument with a chart to watch, run the bot and leave it — recording
+is on by default:
 
 ```
 python backend\live-chart.py
 ```
+
+For a **dataset**, which is usually what you want, record several instruments
+at once with no chart, no HTTP server and no ports:
+
+```
+python backend\record.py --instruments BTC-USDT,ADA-USDT,PUMP-USDT
+python backend\record.py --list-cost --instruments BTC-USDT,ADA-USDT   # disk only
+```
+
+Each feed opens its own websocket and writes to its own `data/<INST-ID>/`, so
+one instrument desyncing, stalling or reconnecting cannot touch another's
+data. Every feed runs under the same `supervise` wrapper as the chart's loops,
+so no single failure can end the run. Measured cost is ~140 MB/day for
+BTC-USDT; thinner instruments are a small fraction of that, so `--list-cost`
+is an upper bound rather than an estimate.
+
+### One directory per instrument, and why it matters
+
+`data/<INST-ID>/` is not tidiness. Rows for two symbols are **structurally
+identical** — same columns, same order, same dtypes — and differ only in which
+instrument they describe. Written to a shared path they concatenate into a
+matrix that no schema check can object to, because nothing about the schema is
+wrong, and the result is a verdict about no instrument in particular. Layout
+is the only thing that separates them.
+
+So `check_features.py` refuses to cross a directory boundary. Point it at one:
+
+```
+python backend\analysis\check_features.py --horizon 900 --data-dir data\BTC-USDT
+```
+
+Given `--data-dir data` with several instruments beneath it, it names them and
+stops rather than averaging them.
 
 Startup confirms both writers, and the chart page's Microstructure panel shows
 a live row count. **Nothing is written for the first 30 minutes** — the
@@ -598,15 +634,25 @@ Next, in order:
    than typical day-to-day variation, but it is not the same as a same-day
    comparison.
 
-9d. **Record a wide instrument — but fix the filename first.** `recorder.py`
-   writes `features-<date>.csv` with **no instrument in the name and no
-   instrument column in the rows**. Two recorders on different symbols would
-   land in files distinguishable only by the collision suffix, and a later
-   `check_features.py` run would concatenate BTC-USDT and ADA-USDT rows into
-   one matrix without complaint — the columns are identical, so the
-   schema-intersection guard added for the label-generation bug cannot see
-   this one. Put the instrument in the path before pointing the recorder
-   anywhere new.
+9d. **Record the shortlist.** ~~Fix the filename first~~ — `recorder.py` used
+   to write `features-<date>.csv` with no instrument in the name and no
+   instrument column, so two symbols would have merged into one matrix that
+   nothing downstream could object to. Both writers are now scoped to
+   `data/<INST-ID>/`, `check_features.py` refuses to cross that boundary, and
+   `backendecord.py` runs N instruments headless in one process.
+
+   **Running since 2026-09-09, 15 instruments**, chosen so the data answers
+   two different questions:
+
+   | group | instruments | what it buys |
+   |---|---|---|
+   | paired with Binance | BTC, ADA, DOGE, LTC, AVAX | `passive_sim.py` has already measured adverse selection on these five *on Binance*. The same five on BloFin make the venue comparison paired rather than anecdotal — and adverse selection at 0.5 bps/leg is the assumption the whole branch rests on. |
+   | wide with real volume | PUMP, PEPE, 1000BONK, WLD, SUI, INJ, IOST | the actual passive candidates: 3.7-9.8 bps against a 2.20 bps bar, on $2-8M/day |
+   | wide and thin | ATOM, CNPY, FARTCOIN | 16-18 bps on ~$1.2M/day. The widest spreads on the venue sit on the *lowest* volume, which is the signature of nobody quoting rather than money waiting. Recording them is how that gets settled instead of assumed. |
+
+   BTC-USDT is in the first group twice over: it is the tick-bound control
+   that made the venue comparison credible, and it carries the existing
+   prediction-branch history, which now lives in `data/BTC-USDT/`.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
