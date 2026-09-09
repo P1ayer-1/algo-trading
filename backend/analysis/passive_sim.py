@@ -80,6 +80,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from analysis.layout import resolve_raw_dir  # noqa: E402
 from analysis.stats import effective_sample_size  # noqa: E402
 from trading.features import FeatureEngine  # noqa: E402
 from trading.orderbook import OrderBook  # noqa: E402
@@ -1090,8 +1091,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Only simulate the first N hours. Start with 2.")
     parser.add_argument("--cache", type=Path, default=None,
                         help="Tardis download dir (default data/tardis/raw).")
+    parser.add_argument("--instrument", default=None,
+                        help="With --source raw: instrument id, e.g. ADA-USDT. "
+                             "Omit when only one instrument was recorded.")
+    parser.add_argument("--data-dir", type=Path, default=None,
+                        help="With --source raw: recording root (default "
+                             "data/); the archive is resolved beneath it as "
+                             "<data-dir>/<INST-ID>/raw.")
     parser.add_argument("--raw-dir", type=Path, default=None,
-                        help="Raw archive root (default data/raw).")
+                        help="Archive directory outright, bypassing "
+                             "--instrument resolution.")
     parser.add_argument("--quote-interval", type=int, default=1000,
                         help="Milliseconds between hypothetical quote pairs.")
     parser.add_argument("--timeout", type=float, default=60.0,
@@ -1129,8 +1138,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             cache, args.exchange, args.symbol, args.date, args.depth,
             args.hours, args.api_key)
     else:
-        raw_dir = args.raw_dir or repo_root / "data" / "raw"
-        print(f"Passive fill simulation - raw archive {args.date or 'all dates'}")
+        raw_dir = args.raw_dir or resolve_raw_dir(
+            args.data_dir or repo_root / "data", args.instrument)
+        instrument = raw_dir.parent.name
+        print(f"Passive fill simulation - {instrument} raw archive "
+              f"{args.date or 'all dates'}")
         print("=" * 72)
         events = raw_archive_events(raw_dir, args.date)
 

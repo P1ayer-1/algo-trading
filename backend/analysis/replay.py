@@ -28,6 +28,7 @@ from typing import Iterator, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from analysis.layout import resolve_raw_dir  # noqa: E402
 from trading.features import FeatureEngine  # noqa: E402
 from trading.orderbook import OrderBook  # noqa: E402
 from trading.rawlog import iter_events  # noqa: E402
@@ -125,7 +126,15 @@ def replay(
 def main(argv: Optional[List[str]] = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent.parent
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--raw-dir", type=Path, default=repo_root / "data" / "raw")
+    parser.add_argument("--instrument", default=None,
+                        help="Instrument id, e.g. ADA-USDT. Omit when only "
+                             "one instrument has been recorded.")
+    parser.add_argument("--data-dir", type=Path, default=repo_root / "data",
+                        help="Recording root; the archive is resolved beneath "
+                             "it as <data-dir>/<INST-ID>/raw.")
+    parser.add_argument("--raw-dir", type=Path, default=None,
+                        help="Archive directory outright, bypassing "
+                             "--instrument resolution.")
     parser.add_argument("--out", type=Path, default=repo_root / "data" / "replayed")
     parser.add_argument("--date", default=None, help="YYYY-MM-DD; omit for all.")
     parser.add_argument("--sample-ms", type=int, default=1000)
@@ -136,8 +145,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     horizons = tuple(float(part) for part in args.horizons.split(",") if part.strip())
 
+    raw_dir = args.raw_dir or resolve_raw_dir(args.data_dir, args.instrument)
+    # Replayed features inherit the instrument of the archive they came from,
+    # and nothing in the CSV records which that was -- so keep them apart the
+    # same way the recorder does, rather than overwriting one instrument's
+    # replay with the next.
+    out = args.out
+    if args.raw_dir is None and raw_dir.parent != args.data_dir:
+        out = out / raw_dir.parent.name
+    print(f"Replaying {raw_dir} -> {out}")
+
     result = replay(
-        args.raw_dir, args.out,
+        raw_dir, out,
         date=args.date, sample_ms=args.sample_ms,
         horizons=horizons, threshold_bps=args.threshold_bps,
     )
@@ -149,8 +168,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  desync events   {result['desyncs']:,}")
     print(f"  rows written    {result['rowsWritten']:,}")
     print(f"  rows dropped    {result['rowsDropped']:,} (no observable future)")
-    print(f"\nOutput: {args.out}")
-    print("Run the predictiveness check against it with --data-dir", args.out)
+    print(f"\nOutput: {out}")
+    print("Run the predictiveness check against it with --data-dir", out)
     return 0
 
 

@@ -34,7 +34,6 @@ import csv
 import glob
 import math
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -43,6 +42,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from analysis.layout import instrument_dirs  # noqa: E402
 from analysis.stats import (  # noqa: E402
     auc,
     correlation_tstat,
@@ -120,14 +120,6 @@ except Exception:  # pragma: no cover - keeps the analysis tools standalone
     MAKER_ONLY_COST_BPS = 1.2
 
 
-# What an instrument directory looks like: a BloFin instId, `BASE-QUOTE`,
-# uppercase (`1000BONK-USDT` included). Matching the shape rather than keeping
-# a deny-list of tool directories means `data/replayed`, `data/bars`,
-# `data/cache` and anything added later are excluded for a reason that stays
-# true, instead of until someone forgets to update the list.
-INSTRUMENT_DIR = re.compile(r"[A-Z0-9]+-[A-Z0-9]+")
-
-
 def resolve_files(data_dir: Path, pattern: str = "features-*.csv") -> List[str]:
     """The feature CSVs to read, from ONE instrument.
 
@@ -145,13 +137,10 @@ def resolve_files(data_dir: Path, pattern: str = "features-*.csv") -> List[str]:
     """
     direct = sorted(glob.glob(str(data_dir / pattern)))
     scoped = {}
-    if data_dir.is_dir():
-        for child in sorted(data_dir.iterdir()):
-            if not child.is_dir() or not INSTRUMENT_DIR.fullmatch(child.name):
-                continue
-            found = sorted(glob.glob(str(child / pattern)))
-            if found:
-                scoped[child.name] = found
+    for name, child in instrument_dirs(data_dir).items():
+        found = sorted(glob.glob(str(child / pattern)))
+        if found:
+            scoped[name] = found
 
     if direct and scoped:
         raise SystemExit(
