@@ -705,13 +705,33 @@ ecord.py` runs N instruments headless in one process.
 
    Reasons this is not yet a result, in order of how much they could move it:
 
-   - **The spot fee schedule has never been read off the account.** It
-     defaults to the futures rates, which is almost certainly wrong and
-     flatters the answer, because spot fees are usually higher. This is the
-     single biggest unknown and it is one login away.
-   - **33 days of funding history is one regime.** Positive-share and worst
-     cumulative drawdown are reported per instrument for exactly this reason:
-     RAY-USDT pays 76% of periods and has given back 27 bps in a run.
+   - ~~**The spot fee schedule has never been read off the account.**~~ It
+     still has not been, but a sensitivity sweep settled whether that matters
+     and the answer is no. Pushing the spot taker from 0.6 to 30 bps — five
+     times the futures taker — moves the count of clearing pairs from 38 to
+     29 and the best net over 30 days from +219 to +160 bps:
+
+     | spot taker bps | pairs clearing | best net 30d | best b/e days |
+     |---|---|---|---|
+     | 0.6 | 38 | +219.0 | 2.3 |
+     | 5.0 | 37 | +210.2 | 3.4 |
+     | 10.0 | 35 | +200.2 | 4.6 |
+     | 20.0 | 31 | +180.2 | 6.9 |
+     | 30.0 | 29 | +160.2 | 9.3 |
+
+     A four-leg round trip is tens of bps and a 30-day hold collects hundreds,
+     so fees are simply not the binding term over that horizon. Worth
+     confirming before trading; not worth waiting for.
+   - **33 days of funding history is one regime, and this is now the binding
+     unknown.** The whole result is "funding stays roughly where it has been
+     for a month". Positive-share and worst cumulative drawdown are reported
+     per instrument for exactly this reason: RAY-USDT pays 76% of periods and
+     has given back 27 bps in a run. Nothing here forecasts funding, and a
+     regime where these rates compress or invert removes the entire return
+     while leaving all four legs of cost in place.
+   - **Size is not modelled.** Every number comes off the top of book, and the
+     spot side of this venue trades $1-8M/day. A carry you can only put on in
+     small size is a different proposition from the basis-point figures here.
    - **The basis is a real exposure.** The perp trades *below* spot on every
      instrument measured, so the hedge buys the expensive leg and shorts the
      cheap one; `net-conv` is the result if that gap closes completely.
