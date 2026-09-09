@@ -75,12 +75,13 @@ first. Recording is therefore step one, not step four.
 │   │   ├── venue_compare.py   # adverse selection: BloFin vs Binance, paired
 │   │   ├── blofin_spot.py     # the spot endpoints the SDK omits
 │   │   ├── funding_carry.py   # long spot + short perp: does funding pay?
+│   │   ├── carry_backtest.py  # the same position, run from every entry
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (384 tests)
+│   └── tests/                 # pytest suite (400 tests)
 ├── data/                      # recorded data (gitignored)
 │   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
 │       ├── features-*.csv     #     labelled features — regenerable
@@ -294,7 +295,7 @@ cd backend
 python -m pytest
 ```
 
-384 tests covering the order book's gap handling, the OFI recursion, the
+400 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -738,6 +739,47 @@ ecord.py` runs N instruments headless in one process.
    - **Returns are on notional, not capital**, and liquidation is not modelled
      at all — a delta-neutral position still has a leveraged leg that can be
      liquidated.
+
+9f. ~~**Backtest the carry**~~ — `backendnalysis\carry_backtest.py`. The
+   screen in 9e answers "does the median funding rate cover the round trip?",
+   which is not a P&L: it assumes you enter today at today's spread and that
+   funding behaves like its median for a month. This runs the position from
+   **every** entry in 200 days, collecting the funding that actually printed
+   and applying the basis move that actually happened.
+
+   | instrument | median | p5 | worst | best | profit% | fund | basis | cost | eff N |
+   |---|---|---|---|---|---|---|---|---|---|
+   | CRV-USDT | +167.5 | +117.3 | +82.6 | +239.2 | 100% | +201.3 | +0.0 | 38.6 | 5 |
+   | XRP-USDT | +121.4 | +79.4 | +66.1 | +180.9 | 100% | +153.9 | −0.2 | 32.5 | 5 |
+   | DOGE-USDT | +149.3 | +76.9 | +63.9 | +190.5 | 100% | +180.4 | −0.0 | 29.9 | 5 |
+   | SUI-USDT | +151.5 | +64.6 | +48.5 | +190.7 | 100% | +179.5 | −0.1 | 28.2 | 5 |
+   | LTC-USDT | +93.7 | +30.6 | +14.6 | +163.3 | 100% | +135.0 | −0.1 | 40.4 | 5 |
+   | **DOT-USDT** | **+92.3** | **−157.9** | **−195.3** | +201.3 | 70% | +146.3 | −0.2 | 49.6 | 5 |
+   | BTC-USDT | −46.0 | −99.5 | −110.2 | +46.1 | 32% | −22.6 | −0.1 | 23.7 | 5 |
+
+   **Five instruments were profitable from every entry point in the history**,
+   which is the strongest statement this data can make. And DOT-USDT is why
+   the backtest was worth building rather than trusting the screen: **+92 bps
+   on median and −158 at the 5th percentile.** The screen would have sold you
+   that one.
+
+   Three things the table is built to stop you misreading:
+
+   - **`eff N` is 5, not 510.** Adjacent windows share 89 of their 90 periods,
+     so 200 days contains about five independent 30-day holds. "Profitable in
+     100% of 510 windows" is one window counted 500 times, and the report says
+     so beside every distribution.
+   - **Ranked by p5, not median.** A carry is a position held through whatever
+     arrives, so the bad entries are the question.
+   - **The basis is variance, not a cost.** Its median 30-day move is ~0 —
+     SUI's gap ranges −17.7 to +17.3 bps and mean-reverts — but the tail runs
+     to ±56 bps on DOT, and that tail is already inside the p5 and worst
+     columns rather than being bolted on as a worst case.
+
+   Spreads remain the one assumption: there is no historical top of book for
+   these markets, so entry and exit cost is today's spread held constant. It
+   is the smaller assumption, since the four-leg cost is tens of bps against
+   funding swings of hundreds.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
