@@ -96,6 +96,40 @@ print(compare_to_exchange(estimate=estimate, exchange_reported=D("...")))
 If the relative error is above ~1%, the MMR tier or fee assumptions are wrong.
 Fix them before increasing leverage, not after.
 
+**Done, 2026-09-09.** `backend/analysis/validate_liquidation.py` automates the
+whole check: it reads open positions off the account, derives the MMR actually
+applied from `maintenanceMargin / (quantity * mark)`, and runs
+`compare_to_exchange` per position. It places no orders - the API will not
+quote a liquidation price for a position that does not exist, but an existing
+one reports its own, which is all this needs.
+
+Against a real demo position (SOL-USDT, short, 75x, cross):
+
+| | |
+|---|---|
+| MMR applied at that size | **0.00500** exactly |
+| model | 253.8883 |
+| exchange | 253.7441 |
+| relative error | **0.0568%** |
+
+So the formula is right and the 0.5% default MMR is the tier being applied at
+that notional. The residual is 5.68 bps and it is the **liquidation fee rate**
+BloFin carries in the denominator beside MMR, which the clean derivation
+omits. Two things follow:
+
+- It points the *unsafe* way. Our estimate sits slightly further from entry
+  than the exchange's, so liquidation looks marginally more distant than it
+  is.
+- `fee_buffer_bps` exists to absorb exactly this, and the implied rate says to
+  set it to about **6**, measured, rather than the "10-20 bps is reasonable"
+  its docstring guesses at.
+
+Two caveats worth keeping. MMR is **tiered by size**, so 0.5% is the tier for
+that position's notional and a larger one lands elsewhere - the script reads
+it per position rather than assuming. And this was a *cross* position, where
+the whole account balance backs the trade; the isolated path is exercised by
+the tests but has not been checked against a live isolated position.
+
 ## Whose liquidation levels, exactly
 
 `risk.py` models **ours**, and only prospectively — where a position we are

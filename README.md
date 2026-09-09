@@ -80,6 +80,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── blofin_spot.py     # the spot endpoints the SDK omits
 │   │   ├── funding_carry.py   # long spot + short perp: does funding pay?
 │   │   ├── carry_backtest.py  # the same position, run from every entry
+│   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
 │   │   ├── replay.py          # rebuild features from raw events
@@ -314,7 +315,7 @@ cd backend
 python -m pytest
 ```
 
-421 tests covering the order book's gap handling, the OFI recursion, the
+431 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -330,8 +331,13 @@ credentials, or SDK.
 Done:
 
 1. ~~**Risk/liquidation module**~~ — `backend/trading/risk.py`. Standalone and
-   tested, as planned. **Its MMR assumption still needs validating against
-   BloFin's real tier table** — see `backend/trading/README.md`.
+   tested, as planned. ~~Its MMR assumption still needs validating against
+   BloFin's real tier table.~~ **Validated 2026-09-09** against a real demo
+   position via `backendnalysisalidate_liquidation.py`: 0.0568% relative
+   error, and the MMR actually applied read out as exactly 0.500%. The 5.68
+   bps residual is BloFin's liquidation fee rate, which the clean derivation
+   omits and `fee_buffer_bps` should be set to ~6 to absorb. See
+   `backend/trading/README.md`.
 2. ~~**Microstructure feature layer**~~ — `backend/trading/features.py`.
    Replaced the original "indicator layer" idea: on a 15m candle, RSI and MACD
    say nothing useful about the next few seconds. Order-book and trade-flow
