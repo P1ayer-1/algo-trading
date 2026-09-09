@@ -59,6 +59,7 @@ from config import (  # noqa: E402
 )
 from server import log, supervise  # noqa: E402
 from trading.ingest import MicrostructureFeed  # noqa: E402
+from trading.openinterest import OpenInterestPoller  # noqa: E402
 from trading.recorder import LabelConfig  # noqa: E402
 
 # Measured, in analysis/README.md. Raw dominates and scales with message rate,
@@ -103,6 +104,18 @@ def report_cost(instruments: List[str], data_dir: Path) -> None:
 
 async def run(instruments: List[str], data_dir: Path) -> None:
     feeds = [(inst_id, build_feed(inst_id, data_dir)) for inst_id in instruments]
+    # Open interest, one HTTP request per poll for the whole set. It is the
+    # only public input to estimating where OTHER traders are liquidated, and
+    # BloFin serves a snapshot with no history endpoint - so it is collected
+    # live or not at all. `record_oi.py` runs the same poller standalone, for
+    # adding it to a run that is already going without restarting this one.
+    #
+    # None when the raw archive is off: a poller that polled and discarded
+    # would spend requests to write nothing.
+    oi_poller = (
+        OpenInterestPoller(instruments, data_dir=data_dir)
+        if RECORD_RAW else None
+    )
 
     log(f"Recording {len(feeds)} instrument(s), headless. No chart, no ports.")
     for inst_id, feed in feeds:
@@ -113,6 +126,12 @@ async def run(instruments: List[str], data_dir: Path) -> None:
             writers.append("raw")
         log(f"  {inst_id:<18} -> {feed.instrument_dir}  "
             f"[{', '.join(writers) if writers else 'NOTHING ENABLED'}]")
+    if oi_poller is not None:
+        log(f"  open interest      one poll every "
+            f"{oi_poller.poll_seconds:.0f}s for all {len(instruments)} "
+            f"[raw]")
+    else:
+        log("  open interest      DISABLED (BLOFIN_RECORD_RAW)")
 
     if not any(feed.recorder.enabled or feed.raw_log.enabled
                for _, feed in feeds):
@@ -130,10 +149,19 @@ async def run(instruments: List[str], data_dir: Path) -> None:
     try:
         # Supervised, so a failure in one instrument's loop restarts that loop
         # instead of ending the process and every other instrument with it.
-        await asyncio.gather(*(
-            supervise(f"feed:{inst_id}", feed.run) for inst_id, feed in feeds
-        ))
+        tasks = [supervise(f"feed:{inst_id}", feed.run)
+                 for inst_id, feed in feeds]
+        if oi_poller is not None:
+            tasks.append(
+                supervise("open-interest", lambda: oi_poller.run(on_log=log))
+            )
+        await asyncio.gather(*tasks)
     finally:
+        if oi_poller is not None:
+            try:
+                oi_poller.close()
+            except Exception as exc:  # pragma: no cover - shutdown path
+                log(f"  open-interest: close failed: {exc}")
         # Flush every writer, even on Ctrl-C. The pending-row buffer is lost
         # either way - those rows have no closed forward window yet - but what
         # is already labelled belongs on disk.

@@ -52,6 +52,8 @@ first. Recording is therefore step one, not step four.
 ├── backend/
 │   ├── live-chart.py        # entrypoint: chart + one instrument's recorder
 │   ├── record.py             # entrypoint: N instruments, headless, no ports
+│   ├── record_oi.py          # entrypoint: open interest, alongside a live run
+│   ├── record_oi.py          # entrypoint: open interest, addable to a live run
 │   ├── config.py             # all settings: env vars, paths, ports
 │   ├── market_data.py        # fetch/parse BloFin candles & prices
 │   ├── support_resistance.py # swing-detection + clustering (the only "analysis" so far)
@@ -63,7 +65,9 @@ first. Recording is therefore step one, not step four.
 │   │   ├── features.py        # OBI / OFI / microprice / volatility
 │   │   ├── recorder.py        # labelled feature rows -> CSV
 │   │   ├── ingest.py          # live book/trade websocket loop
+│   │   ├── openinterest.py    # OI poller — the input for others' liquidation levels
 │   │   ├── rawlog.py          # raw event archive (gzipped JSONL)
+│   │   ├── openinterest.py    # OI snapshots -> archive; capture-or-lose
 │   │   └── risk.py            # liquidation math, sizing, hard limits
 │   ├── analysis/              # offline tooling (see analysis/README.md)
 │   │   ├── bars_import.py     # free Binance bar/OI/funding history -> dataset
@@ -81,7 +85,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (400 tests)
+│   └── tests/                 # pytest suite (413 tests)
 ├── data/                      # recorded data (gitignored)
 │   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
 │       ├── features-*.csv     #     labelled features — regenerable
@@ -190,6 +194,21 @@ python backend\record.py --instruments BTC-USDT,ADA-USDT,PUMP-USDT
 python backend\record.py --list-cost --instruments BTC-USDT,ADA-USDT   # disk only
 ```
 
+`record.py` also polls open interest for the whole set — one HTTP request per
+poll, one row per instrument per minute. To add it to a recorder that is
+*already running*, without restarting it and losing continuity:
+
+```
+python backend\record_oi.py --match-running
+```
+
+That is a separate process writing a separate channel
+(`raw/<day>/open-interest-<HH>.jsonl.gz`), so it cannot touch the `books-` and
+`trades-` files a live recorder holds open. BloFin serves OI as a snapshot with
+no history endpoint, which makes it capture-or-lose like the book — and it is
+the only public input to estimating where *other* traders get liquidated. See
+`trading/README.md` for what is and is not built on top of it.
+
 Each feed opens its own websocket and writes to its own `data/<INST-ID>/`, so
 one instrument desyncing, stalling or reconnecting cannot touch another's
 data. Every feed runs under the same `supervise` wrapper as the chart's loops,
@@ -295,7 +314,7 @@ cd backend
 python -m pytest
 ```
 
-400 tests covering the order book's gap handling, the OFI recursion, the
+421 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and

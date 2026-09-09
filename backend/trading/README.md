@@ -18,6 +18,7 @@ data foundation has to exist before there is anything worth executing on.
 | `features.py` | OBI, OFI, microprice, spread, returns, realised volatility | orderbook, tape |
 | `recorder.py` | Writes feature rows + forward labels to CSV | features |
 | `ingest.py` | The live websocket loop wiring the above together, with a stall watchdog | all of the above, BloFin SDK |
+| `openinterest.py` | Polls and archives open interest, the input a liquidation-cluster model needs | rawlog (stdlib HTTP, no SDK) |
 | `risk.py` | Liquidation math, position sizing, hard limits | **nothing** |
 
 `risk.py` importing nothing from this package is a deliberate constraint: the
@@ -95,6 +96,40 @@ print(compare_to_exchange(estimate=estimate, exchange_reported=D("...")))
 If the relative error is above ~1%, the MMR tier or fee assumptions are wrong.
 Fix them before increasing leverage, not after.
 
+## Whose liquidation levels, exactly
+
+`risk.py` models **ours**, and only prospectively — where a position we are
+about to open would be liquidated, so the engine can refuse it
+(`min_liquidation_buffer_pct`) or trip on it later
+(`min_open_liquidation_buffer_pct`).
+
+Nothing models **anyone else's**. Other traders' liquidation clusters are the
+thing a heatmap shows, and none of `books`, `trades` or `funding-rate` carries
+a single fact about someone else's position, so no amount of work on the
+existing feed could produce one.
+
+Two things stand between here and that, and they are not the same size:
+
+**The data.** Open interest is the only public input, and BloFin serves a
+snapshot with no history endpoint — capture-or-lose, like the book.
+`openinterest.py` now records it, and `record_oi.py` can be started against an
+already-running recorder without restarting it. That part is done.
+
+**The model.** A cluster map is a *reconstruction*, not an observation: you
+bucket the OI added at each price by an assumed leverage mix and roll it
+forward through the same MMR formula above. The leverage distribution, cross
+vs isolated, margin top-ups and partial closes are all unobservable, so the
+output is a heat-shaped prior and must be scored against something real before
+any signal leans on it. BloFin publishes no liquidation feed at all — no
+websocket channel, and `/api/v1/market/liquidation-orders` returns 404 — so
+the only available ground truth is Binance's, via its `forceOrder` stream live
+or Tardis' `liquidations` dataset for history. Note that `forceOrder` is
+throttled to one message per second per symbol, which makes it an event
+intensity series and not a volume series.
+
+None of that is built. What exists is the recording, deliberately, because it
+is the half that expires.
+
 ## Tests
 
 ```
@@ -102,7 +137,7 @@ cd backend
 python -m pytest
 ```
 
-113 tests. The ones that matter most:
+132 tests. The ones that matter most:
 
 - `test_orderbook.py` — a sequence gap must mark the book **stale**, and the
   bad update must not be applied.
@@ -114,6 +149,10 @@ python -m pytest
   `stall_timeout_s` must end the stream, a trickle under it must not, and the
   two must be distinguishable from a desync (skipped if the SDK isn't
   installed).
+- `test_openinterest.py` — the poller writes the `open-interest` channel and
+  nothing else, which is what makes it safe to start against a recorder that
+  is already holding `books-*.jsonl.gz` open. Also: a failed poll is counted,
+  never raised.
 
 ## A silent feed is worse than a crashed one
 
