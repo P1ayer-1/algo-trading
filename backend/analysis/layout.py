@@ -100,3 +100,21 @@ def resolve_raw_dir(data_dir: Path, instrument: Optional[str] = None) -> Path:
         f"No raw archive under {data_dir}. Expected {data_dir}/<INST-ID>/raw/.\n"
         "Run the recorder first: python backend/record.py"
     )
+
+
+def carry_dir(data_dir: Path, instrument: str, *, create: bool = False) -> Path:
+    """Where a live carry's baseline and snapshot history live.
+
+    Under the instrument, for the reason every other path here is: a carry on
+    SUI-USDT and a carry on ADA-USDT have identically shaped snapshots, and a
+    realised-funding series assembled from both would describe neither.
+
+    Separate from `raw/` because this is not recorded market data. It is the
+    record of a position that exists, and it has to outlive the process that
+    opened it - the whole point of a 30-day hold is that no single run of
+    anything spans it.
+    """
+    path = data_dir / instrument / "carry"
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path

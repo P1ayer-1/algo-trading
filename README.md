@@ -55,6 +55,7 @@ first. Recording is therefore step one, not step four.
 │   ├── record_oi.py          # entrypoint: open interest, alongside a live run
 │   ├── plan_carry.py         # entrypoint: what a carry WOULD do. Sends nothing.
 │   ├── run_carry.py          # entrypoint: opens it. Dry unless --confirm.
+│   ├── monitor_carry.py      # entrypoint: scores an open carry. Sends nothing.
 │   ├── record_oi.py          # entrypoint: open interest, addable to a live run
 │   ├── config.py             # all settings: env vars, paths, ports
 │   ├── market_data.py        # fetch/parse BloFin candles & prices
@@ -70,6 +71,10 @@ first. Recording is therefore step one, not step four.
 │   │   ├── openinterest.py    # OI poller — the input for others' liquidation levels
 │   │   ├── rawlog.py          # raw event archive (gzipped JSONL)
 │   │   ├── openinterest.py    # OI snapshots -> archive; capture-or-lose
+│   │   ├── carry.py           # sizes both legs of a carry; sends nothing
+│   │   ├── carry_executor.py  # puts it on, or leaves nothing behind trying
+│   │   ├── carry_monitor.py   # scores an open carry against the plan
+│   │   ├── margin_tiers.py    # MMR for a size, from the account's own host
 │   │   └── risk.py            # liquidation math, sizing, hard limits
 │   ├── analysis/              # offline tooling (see analysis/README.md)
 │   │   ├── bars_import.py     # free Binance bar/OI/funding history -> dataset
@@ -852,6 +857,72 @@ ecord.py` runs N instruments headless in one process.
    What it deliberately does not decide: which leg to send first. Whichever
    fills leaves you directional until the other does, and that belongs to the
    executor that sends them.
+
+9h. ~~**Open the carry**~~ — `backend\trading\carry_executor.py` and
+   `backend\run_carry.py`. Dry unless `--confirm`, demo unless `--production`,
+   and `--production --confirm` together are refused outright. Perp leg first
+   so a failed spot leg leaves a short that closes instantly with a
+   `reduce_only` order rather than a long that has to be sold; a spot leg that
+   fails unwinds the perp instead of retrying. The hedge size is checked
+   against the BALANCE, not the order response, because `targetCurrency`
+   decides whether a market order's size means base or quote and the wrong one
+   fills cleanly at the wrong size.
+
+   **Run live on demo 2026-09-09, and the unwind path fired for real.** The
+   first attempt's spot leg failed, the perp leg was closed automatically, and
+   the second attempt filled both. Cost of the aborted open: $0.265, which is
+   7.8% of the trade's whole 30-day expected profit — the argument for getting
+   leg sequencing right is not theoretical.
+
+9i. ~~**Watch it**~~ — `backend\trading\carry_monitor.py` and
+   `backend\monitor_carry.py`. Everything above finishes in seconds and
+   produces a position that takes a month. Nothing read it back, so
+   "+170.4 bps over 30 days" was a forecast with no scoreboard.
+
+   ```
+   python backend\monitor_carry.py --instrument SUI-USDT
+   ```
+
+   - **Funding is derived, because it cannot be read.** This API version has
+     no account-bills endpoint — `/api/v1/account/bills` and `-archive` both
+     answer "not supported", and `/api/v1/asset/bills` covers transfers.
+     `realizedPnl` on the position accumulates fees, closed-trade PnL and
+     funding together, and everything but funding is observable from the
+     fills, so `funding = realizedPnl + fees - fillPnl`. Checked against the
+     position before any settlement had passed: `realizedPnl` was
+     -0.11975592 and the entry fee was 0.11975592, so it returns exactly zero
+     when zero is the true answer.
+   - **A derived number gets a control.** The same funding is estimated
+     independently from the public funding-rate history and the two are
+     compared. When they disagree the report says so rather than preferring
+     the one it computed itself.
+   - **The baseline is reconstructed, not remembered.** The first carry was
+     opened by a run that persisted nothing. The position carries its entry
+     and creation time, the fills carry their fees, and the executor tagged
+     both legs `carry<hex>p` / `carry<hex>s` — which is the only exact join
+     between a futures position and the spot balance hedging it. Frozen to
+     `data/<INST>/carry/baseline.json` on first run and never rewritten, so
+     the forecast stops moving. Snapshots append beside it.
+   - **The scoreboard is not the plan's.** The plan priced a 25.82 bps round
+     trip off VIP 1; the demo account was charged VIP 0 — 6.0 bps perp and
+     10.0 bps spot, measured from the fills. The real round trip is 32.0 bps
+     and break-even is 4.9 days, not 3.9. Entry spreads are not recoverable
+     after the fact, so this still understates it, and says so.
+   - **It re-validates the liquidation model on every reading**, not once at
+     open. Currently 0.04 bps from BloFin's own number.
+
+   What ends a hold early gets its own alerts: a leg that vanished (either
+   direction is named for what it leaves you holding), liquidation inside
+   `min_open_liquidation_buffer_pct`, delta drift, funding that has gone
+   negative, and funding far enough under forecast that break-even has moved
+   past the hold.
+
+   The delta threshold is deliberately NOT the planner's 0.001. That is a
+   tolerance on lot *rounding*, measured before fees, and the commonest way a
+   carry's delta actually breaks is a spot leg short by exactly its fee —
+   0.1% of base, landing at 0.0997% of notional. A threshold set at 0.001
+   sits a rounding error away from the one failure it most needs to catch,
+   and misses it.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
