@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
-from .carry import CarryPlan
+from .plan import CarryPlan
 
 ZERO = Decimal("0")
 

@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from trading.carry import Market, Wallets, plan_carry, round_down
+from trading.strategies.carry import Market, Wallets, plan_carry, round_down
 from trading.risk import RiskLimits
 
 

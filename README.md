@@ -71,11 +71,14 @@ first. Recording is therefore step one, not step four.
 │   │   ├── openinterest.py    # OI poller — the input for others' liquidation levels
 │   │   ├── rawlog.py          # raw event archive (gzipped JSONL)
 │   │   ├── openinterest.py    # OI snapshots -> archive; capture-or-lose
-│   │   ├── carry.py           # sizes both legs of a carry; sends nothing
-│   │   ├── carry_executor.py  # puts it on, or leaves nothing behind trying
-│   │   ├── carry_monitor.py   # scores an open carry against the plan
 │   │   ├── margin_tiers.py    # MMR for a size, from the account's own host
-│   │   └── risk.py            # liquidation math, sizing, hard limits
+│   │   ├── risk.py            # liquidation math, sizing, hard limits
+│   │   └── strategies/        # one directory per strategy, same three verbs
+│   │       ├── __init__.py    # the plan/execute/monitor contract, as Protocols
+│   │       └── carry/
+│   │           ├── plan.py     # sizes both legs; SENDS NOTHING
+│   │           ├── execute.py  # puts it on, or leaves nothing behind trying
+│   │           └── monitor.py  # scores it against the plan; READ ONLY
 │   ├── analysis/              # offline tooling (see analysis/README.md)
 │   │   ├── bars_import.py     # free Binance bar/OI/funding history -> dataset
 │   │   ├── cross_sectional_import.py  # the same, as a multi-symbol panel
@@ -97,7 +100,8 @@ first. Recording is therefore step one, not step four.
 ├── data/                      # recorded data (gitignored)
 │   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
 │       ├── features-*.csv     #     labelled features — regenerable
-│       └── raw/               #     raw events — IRREPLACEABLE
+│       ├── raw/               #     raw events — IRREPLACEABLE
+│       └── carry/             #     an open carry's frozen baseline + snapshots
 ├── frontend/
 │   ├── live-chart.html     # thin page shell
 │   ├── styles.css          # all page styling
@@ -113,6 +117,33 @@ first. Recording is therefore step one, not step four.
 into the other modules. If you're reading this codebase for the first time,
 read the backend files in the order listed above (config → market_data →
 support_resistance → state → server → live-chart.py).
+
+### Strategies: three verbs, and why they are separate files
+
+Every strategy under `backend/trading/strategies/` is a directory with the
+same three modules, and the split is a safety property rather than filing:
+
+| | contract |
+|---|---|
+| `plan.py` | computes orders and **cannot send them**. No code path to `placeOrder` — checkable with a grep, and checked that way. Returns refusals *plural*: every failing gate, not the first. |
+| `execute.py` | **dry unless a caller says otherwise**, same result shape either way, so rehearsal and live differ by one flag and nothing else. Owns leg ordering and unwinding. |
+| `monitor.py` | no `--confirm`, **no path to `placeOrder` at all**. The one you can run at 3am without reading the source first. Verifies against the *exchange*, not against the plan. |
+
+Every sizing and margin question gets answered and reviewed while the answer
+is still only text; the code that can move money is a separate thing you ask
+for by name.
+
+There is deliberately **no `Strategy` base class**. There is one strategy, and
+an interface extracted from a single example encodes that example's accidents
+— carry has two legs, funding as its entire return source, a hold measured in
+weeks, and no prediction anywhere in it, none of which a directional strategy
+shares. So the lifecycle is stated as Protocols in
+`strategies/__init__.py`, satisfied structurally and inherited from never:
+`CarryPlan`, `ExecutionResult` and `MonitorReport` conform without importing
+them. `tests/test_strategy_contract.py` asserts that, so the shape stays
+load-bearing instead of becoming a stale comment. When a second strategy
+arrives and both genuinely want the same behaviour, that is when to extract
+it.
 
 ## Setup
 

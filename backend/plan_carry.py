@@ -37,7 +37,7 @@ from config import (  # noqa: E402
     TAKER_FEE_BPS,
     VIP_TIER,
 )
-from trading.carry import Market, Wallets, plan_carry  # noqa: E402
+from trading.strategies.carry import Market, Wallets, plan_carry  # noqa: E402
 from trading.margin_tiers import maintenance_margin_rate  # noqa: E402
 from trading.risk import RiskLimits  # noqa: E402
 

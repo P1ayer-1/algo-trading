@@ -57,8 +57,7 @@ from plan_carry import (  # noqa: E402
     report as report_plan,
 )
 from server import log  # noqa: E402
-from trading.carry import plan_carry  # noqa: E402
-from trading.carry_executor import CarryExecutor  # noqa: E402
+from trading.strategies.carry import CarryExecutor, plan_carry  # noqa: E402
 from trading.margin_tiers import maintenance_margin_rate  # noqa: E402
 from trading.risk import RiskLimits  # noqa: E402
 

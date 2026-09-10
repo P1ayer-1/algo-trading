@@ -15,8 +15,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from trading.carry import CarryPlan
-from trading.carry_executor import CarryExecutor
+from trading.strategies.carry import CarryExecutor, CarryPlan
 
 OK = {"code": "0", "data": [{"code": "0", "orderId": "1"}]}
 REJECTED = {"code": "0", "data": [{"code": "103", "msg": "insufficient"}]}

@@ -56,7 +56,7 @@ from plan_carry import (  # noqa: E402
     funding_per_day_bps,
 )
 from server import log  # noqa: E402
-from trading.carry_monitor import (  # noqa: E402
+from trading.strategies.carry import (  # noqa: E402
     Baseline,
     build_snapshot,
     compare,

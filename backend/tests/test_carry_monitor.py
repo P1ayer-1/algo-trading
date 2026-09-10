@@ -13,7 +13,7 @@ from decimal import Decimal
 
 import pytest
 
-from trading.carry_monitor import (
+from trading.strategies.carry import (
     Baseline,
     build_snapshot,
     carry_tag,
