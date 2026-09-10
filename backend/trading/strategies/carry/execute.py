@@ -1,7 +1,19 @@
-"""Opens a planned carry: perp leg first, spot leg second, unwind if either fails.
+"""Puts a carry on and takes it off. Both directions, and the minutes between.
 
-`carry.py` decides what the position should be. This puts it on, and its real
-job is the two minutes in the middle where only one leg exists.
+`plan.py` decides what the position should be. This sends it, and its real job
+is the stretch in the middle where only one leg exists.
+
+Both directions size the legs so that the moment of maximum exposure is as
+short and as cheap as possible, but they reach opposite orderings, because
+opening and closing fail differently:
+
+    open()   perp first  - a failed second leg leaves a short that closes
+                           instantly, and it is unwound automatically
+    close()  spot first  - a failed FIRST leg leaves nothing at all, because
+                           the position is still fully hedged
+
+`close()` carries its own reasoning; the rest of this docstring is about the
+open.
 
 Order of operations, and why
 ----------------------------
@@ -46,7 +58,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
-from .plan import CarryPlan
+from .plan import CarryPlan, round_down
 
 ZERO = Decimal("0")
 
@@ -104,6 +116,13 @@ class ExecutionResult:
     actual_liquidation: Optional[Decimal] = None
     actual_mmr: Optional[Decimal] = None
     spot_acquired: Optional[Decimal] = None
+
+    # Closing
+    closed: bool = False
+    already_flat: bool = False
+    spot_sold: Optional[Decimal] = None
+    perp_closed: Optional[Decimal] = None
+    dust_base: Decimal = ZERO
 
     def add(self, step: Step) -> Step:
         self.steps.append(step)
@@ -267,6 +286,148 @@ class CarryExecutor:
             self._verify(result, plan)
             self._verify_spot(result, plan, base_currency, base_before)
         return result
+
+    def close(self, inst_id: str, *, base_currency: str,
+              spot_lot_size: Decimal = ZERO,
+              retries: int = 2) -> ExecutionResult:
+        """Take the carry off. Spot leg first, then the perp.
+
+        Sized from the EXCHANGE, never from the plan
+        --------------------------------------------
+        The plan that opened this is weeks old and both legs have moved since:
+        fees came out of the spot balance, funding moved the margin, and a
+        partial fill anywhere would have moved the rest. So the close reads
+        what is actually there and closes that.
+
+        The useful consequence is that this is idempotent. Interrupted after
+        one leg, run it again - it sizes from whatever is left and finishes
+        the job, with no memory of the attempt that failed.
+
+        Spot first, and why it is not the open's order
+        ----------------------------------------------
+        The open sends the perp first so a failed spot leg leaves a short that
+        closes instantly. The close sends spot first for a stronger reason:
+        **order the legs so a first-leg failure is a no-op rather than a
+        position.**
+
+        The spot sell is the leg that can actually be refused. It has no
+        `reduce_only` protection, it needs a real balance, and the fee
+        convention on a sell is not yet measured - the BUY was charged in base
+        currency, and if a sell is too, then selling the whole balance is
+        short of its own fee. If that order bounces, nothing has happened:
+        still hedged, still collecting funding, retry costs nothing.
+
+        Once the spot is gone, what remains is a `reduce_only` perp buy, which
+        is the most reliable order this system can send - deepest book, always
+        approved by the risk engine, and it cannot overshoot into a long.
+
+        Never unwind a close
+        --------------------
+        `open()` refuses to leave half a carry on, because half a carry is a
+        directional bet nobody decided to take. This must NOT inherit that:
+        undoing a close means re-opening the position you just decided to
+        exit. So a failed spot leg aborts having sent nothing, and a failed
+        perp leg retries and then screams. Re-buying spot to re-hedge is
+        deliberately not done - an executor that opens risk during a close is
+        a surprise, and if the venue is rejecting orders the re-hedge is as
+        likely to fail as the retry it replaced.
+        """
+        result = ExecutionResult(inst_id=inst_id, dry_run=self.dry_run)
+        tag = uuid.uuid4().hex[:16]
+
+        position = self.broker.perp_position(inst_id)
+        result.perp_position = position
+        contracts = _decimal(position.get("positions")) if position else ZERO
+        contracts = contracts or ZERO
+        balance = self.broker.spot_balance(base_currency)
+
+        sellable = (round_down(balance, spot_lot_size)
+                    if spot_lot_size > 0 else balance)
+        result.dust_base = balance - sellable
+
+        if contracts == 0 and sellable <= 0:
+            result.already_flat = True
+            result.closed = True
+            self.log("  nothing open: no perp position and no spot balance")
+            return result
+
+        self.log(f"  closing {inst_id}: {contracts} contracts, "
+                 f"{sellable} {base_currency}")
+
+        # ---- leg 1: sell the spot, while the pair is still hedged ---------
+        if sellable > 0:
+            spot_step = self._do(
+                result, "spot", f"SELL {sellable} {base_currency}",
+                lambda: self.broker.place_spot(
+                    inst_id=inst_id, side="sell", size=sellable,
+                    client_order_id=f"carry{tag}x"))
+            if not spot_step.ok:
+                # Nothing was sent that changed anything. The carry is intact.
+                result.problems.append(
+                    f"spot leg failed: {spot_step.error}. Nothing else was "
+                    f"sent - the position is untouched and still hedged, so "
+                    f"this is safe to retry.")
+                return result
+            result.spot_sold = sellable
+
+        # ---- leg 2: buy the perp back, reduce_only ------------------------
+        if contracts != 0:
+            size = abs(contracts)
+            side = "buy" if contracts < 0 else "sell"
+            step = None
+            for attempt in range(1, max(1, retries) + 1):
+                step = self._do(
+                    result, "perp",
+                    f"{side.upper()} {size} contracts, reduce_only"
+                    + (f" (attempt {attempt})" if attempt > 1 else ""),
+                    lambda: self.broker.place_perp(
+                        inst_id=inst_id, side=side, size=size,
+                        client_order_id=f"carry{uuid.uuid4().hex[:12]}x",
+                        reduce_only=True))
+                if step.ok:
+                    result.perp_closed = size
+                    break
+                self.log(f"  perp close rejected, retrying ({attempt})")
+            if step is not None and not step.ok:
+                result.problems.append(
+                    f"PERP CLOSE FAILED after {retries} attempts and the spot "
+                    f"leg is already sold. A naked {size} contract short is "
+                    f"open on {inst_id} with nothing hedging it. Close it by "
+                    f"hand now: {side} {size} contracts, reduce_only.")
+                return result
+
+        if self.dry_run:
+            result.closed = True
+            return result
+
+        self.sleep(self.settle_seconds)
+        self._verify_flat(result, inst_id, base_currency)
+        return result
+
+    def _verify_flat(self, result: ExecutionResult, inst_id: str,
+                     base_currency: str) -> None:
+        """Both legs gone, checked against the exchange rather than assumed.
+
+        An accepted order is not a filled one, and a market order that fills
+        partially leaves exactly the exposure this whole exercise was meant to
+        remove.
+        """
+        position = self.broker.perp_position(inst_id)
+        remaining = _decimal(position.get("positions")) if position else ZERO
+        remaining = remaining or ZERO
+        if remaining != 0:
+            result.problems.append(
+                f"perp close was accepted but {remaining} contracts are still "
+                f"open. Re-run to finish, or close by hand.")
+
+        left = self.broker.spot_balance(base_currency)
+        if result.spot_sold is not None and left > result.dust_base:
+            result.problems.append(
+                f"spot sell was accepted but {left} {base_currency} is still "
+                f"held against {result.dust_base} of expected dust - the "
+                f"order filled partially. Re-run to finish.")
+
+        result.closed = not result.problems
 
     def _unwind(self, result: ExecutionResult, plan: CarryPlan) -> None:
         """Close the perp leg, because half a carry is a directional bet.

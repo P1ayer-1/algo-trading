@@ -57,79 +57,13 @@ from plan_carry import (  # noqa: E402
     report as report_plan,
 )
 from server import log  # noqa: E402
-from trading.strategies.carry import CarryExecutor, plan_carry  # noqa: E402
+from trading.strategies.carry import (  # noqa: E402
+    BlofinBroker,
+    CarryExecutor,
+    plan_carry,
+)
 from trading.margin_tiers import maintenance_margin_rate  # noqa: E402
 from trading.risk import RiskLimits  # noqa: E402
-
-
-class BlofinBroker:
-    """The `Broker` protocol, against BloFin's REST API.
-
-    Thin on purpose: every method is one call and no logic, so the ordering,
-    unwinding and verification stay in `carry_executor` where the tests can
-    reach them without a network.
-    """
-
-    def __init__(self, client, trading_api):
-        self.client = client
-        self.trading = trading_api
-
-    def transfer(self, *, currency: str, amount: Decimal,
-                 from_account: str, to_account: str) -> Dict[str, Any]:
-        return self.trading.transfer(
-            currency=currency, amount=str(amount),
-            fromAccount=from_account, toAccount=to_account)
-
-    def margin_mode(self) -> str:
-        payload = self.client.get("/api/v1/account/margin-mode", params={},
-                                  sign=True)
-        return str((payload.get("data") or {}).get("marginMode", "unknown"))
-
-    def set_leverage(self, inst_id: str, leverage: Decimal) -> Dict[str, Any]:
-        return self.trading.setLeverage(
-            instId=inst_id, leverage=str(int(leverage)), marginMode="isolated")
-
-    def place_perp(self, *, inst_id: str, side: str, size: Decimal,
-                   client_order_id: str,
-                   reduce_only: bool = False) -> Dict[str, Any]:
-        return self.trading.placeOrder(
-            instId=inst_id, marginMode="isolated", positionSide="net",
-            side=side, orderType="market", size=str(size),
-            reduceOnly="true" if reduce_only else "false",
-            clientOrderId=client_order_id)
-
-    def place_spot(self, *, inst_id: str, side: str, size: Decimal,
-                   client_order_id: str) -> Dict[str, Any]:
-        # `targetCurrency` is OPTIONAL in BloFin's schema and decides whether
-        # `size` on a market order means base units or quote. Leaving it to a
-        # default would make a hedge of 254 SUI or of 254 USDT-worth of SUI
-        # depending on a value not written down here - a 3x mis-hedge that
-        # fills cleanly and looks correct. Always explicit.
-        return self.client.post("/api/v1/spot/trade/order", {
-            "instType": "SPOT",
-            "instId": inst_id,
-            "side": side,
-            "orderType": "market",
-            "targetCurrency": "base_currency",
-            "size": str(size),
-            "clientOrderId": client_order_id,
-        })
-
-    def perp_position(self, inst_id: str) -> Optional[Dict[str, Any]]:
-        payload = self.client.get("/api/v1/account/positions",
-                                  params={"instId": inst_id}, sign=True)
-        for row in payload.get("data") or []:
-            if row.get("instId") == inst_id:
-                return row
-        return None
-
-    def spot_balance(self, currency: str) -> Decimal:
-        payload = self.client.get("/api/v1/asset/balances",
-                                  params={"accountType": "spot"}, sign=True)
-        for row in payload.get("data") or []:
-            if row.get("currency") == currency:
-                return decimal_of(row.get("available"))
-        return Decimal(0)
 
 
 def report_execution(result, *, hold_days: Decimal) -> None:

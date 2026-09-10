@@ -1,8 +1,9 @@
 """Delta-neutral funding carry: LONG spot + SHORT perp, collect funding.
 
     plan.py     sizes both legs, prices the risk, says whether to do it
-    execute.py  puts it on, perp first, unwinds if the spot leg fails
+    execute.py  puts it on, perp first; takes it off, spot first
     monitor.py  reads both legs back and scores realised against predicted
+    broker.py   the REST calls all three are written against
 
 The return source is the funding payment a perpetual pays its shorts, not a
 price forecast. The two legs cancel price exposure so that what is left is the
@@ -14,6 +15,7 @@ leaves the PAIR flat can still liquidate the short - and what survives that is
 an unhedged long spot position, the opposite of the trade.
 """
 
+from .broker import BlofinBroker
 from .execute import CarryExecutor, ExecutionResult, Step
 from .monitor import (
     Baseline,
@@ -30,6 +32,7 @@ from .plan import CarryPlan, Market, Wallets, plan_carry, round_down
 
 __all__ = [
     "Baseline",
+    "BlofinBroker",
     "CarryExecutor",
     "CarryPlan",
     "ExecutionResult",

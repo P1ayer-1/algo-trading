@@ -56,7 +56,7 @@ first. Recording is therefore step one, not step four.
 │   ├── plan_carry.py         # entrypoint: what a carry WOULD do. Sends nothing.
 │   ├── run_carry.py          # entrypoint: opens it. Dry unless --confirm.
 │   ├── monitor_carry.py      # entrypoint: scores an open carry. Sends nothing.
-│   ├── record_oi.py          # entrypoint: open interest, addable to a live run
+│   ├── close_carry.py        # entrypoint: takes it off. Dry unless --confirm.
 │   ├── config.py             # all settings: env vars, paths, ports
 │   ├── market_data.py        # fetch/parse BloFin candles & prices
 │   ├── support_resistance.py # swing-detection + clustering (the only "analysis" so far)
@@ -70,15 +70,15 @@ first. Recording is therefore step one, not step four.
 │   │   ├── ingest.py          # live book/trade websocket loop
 │   │   ├── openinterest.py    # OI poller — the input for others' liquidation levels
 │   │   ├── rawlog.py          # raw event archive (gzipped JSONL)
-│   │   ├── openinterest.py    # OI snapshots -> archive; capture-or-lose
 │   │   ├── margin_tiers.py    # MMR for a size, from the account's own host
 │   │   ├── risk.py            # liquidation math, sizing, hard limits
 │   │   └── strategies/        # one directory per strategy, same three verbs
 │   │       ├── __init__.py    # the plan/execute/monitor contract, as Protocols
 │   │       └── carry/
 │   │           ├── plan.py     # sizes both legs; SENDS NOTHING
-│   │           ├── execute.py  # puts it on, or leaves nothing behind trying
-│   │           └── monitor.py  # scores it against the plan; READ ONLY
+│   │           ├── execute.py  # puts it on (perp first), takes it off (spot first)
+│   │           ├── monitor.py  # scores it against the plan; READ ONLY
+│   │           └── broker.py   # the REST calls the other three are written against
 │   ├── analysis/              # offline tooling (see analysis/README.md)
 │   │   ├── bars_import.py     # free Binance bar/OI/funding history -> dataset
 │   │   ├── cross_sectional_import.py  # the same, as a multi-symbol panel
@@ -96,7 +96,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (413 tests)
+│   └── tests/                 # pytest suite (571 tests)
 ├── data/                      # recorded data (gitignored)
 │   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
 │       ├── features-*.csv     #     labelled features — regenerable
@@ -953,7 +953,7 @@ ecord.py` runs N instruments headless in one process.
    7.8% of the trade's whole 30-day expected profit — the argument for getting
    leg sequencing right is not theoretical.
 
-9i. ~~**Watch it**~~ — `backend\trading\carry_monitor.py` and
+9i. ~~**Watch it**~~ — `backend\trading\strategies\carry\monitor.py` and
    `backend\monitor_carry.py`. Everything above finishes in seconds and
    produces a position that takes a month. Nothing read it back, so
    "+170.4 bps over 30 days" was a forecast with no scoreboard.
@@ -1002,6 +1002,45 @@ ecord.py` runs N instruments headless in one process.
    0.1% of base, landing at 0.0997% of notional. A threshold set at 0.001
    sits a rounding error away from the one failure it most needs to catch,
    and misses it.
+
+9j. ~~**Close it**~~ — `backend\close_carry.py`, and `CarryExecutor.close()`.
+   The 32 bps round trip priced two exit legs no code could send.
+
+   ```
+   python backend\close_carry.py --instrument SUI-USDT
+   python backend\close_carry.py --instrument SUI-USDT --confirm
+   ```
+
+   - **Spot leg first — the opposite of the open, for a stronger reason.**
+     The open sends the perp first so a failed spot leg leaves a short that
+     closes instantly. The close orders the legs so that *a first-leg failure
+     is a no-op rather than a position*. The spot sell is the leg that can
+     actually be refused: no `reduce_only` protection, needs a real balance,
+     and the fee convention on a sell is still unmeasured (the BUY was charged
+     in base currency, which is why the hedge came up 0.254 SUI short). If it
+     bounces, the carry is still fully hedged and retrying costs nothing. What
+     follows is a `reduce_only` perp close — deepest book, always approved,
+     cannot overshoot into a long.
+   - **Never unwound.** `open()` refuses to leave half a carry on. The close
+     must NOT inherit that: undoing a close means re-opening the position
+     somebody just decided to exit. A failed perp leg retries and then
+     screams; re-buying spot to re-hedge is deliberately not done, because an
+     executor that opens risk during a close is a surprise, and if the venue
+     is rejecting orders the re-hedge is as likely to fail as the retry.
+   - **Sized from the exchange, never from the plan** — which is weeks old by
+     then, with fees out of the spot balance and funding through the margin.
+     The useful consequence is that it is *idempotent*: interrupted after one
+     leg, run it again and it finishes from whatever is left.
+   - **Funding is captured immediately before the orders go.** It is derived
+     from `realizedPnl`, which ceases to exist with the position, and there is
+     no bills endpoint to recover it from. A 30-day test that cannot say what
+     it earned has not concluded, it has only stopped. The exit fees are read
+     after, because they do not exist until then, and the two halves are
+     stitched into `data/<INST>/carry/closed.json`.
+
+   A separate entrypoint rather than `run_carry.py --close`, because with a
+   flag, the open command minus the flag **opens a second carry** — the most
+   expensive typo available here. One verb per entrypoint deletes that.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
