@@ -16,7 +16,14 @@ from contextlib import redirect_stdout
 import numpy as np
 import pytest
 
-from analysis.check_features import build_matrix, evaluate, load_rows, main
+from analysis.check_features import (
+    binomial_tail,
+    build_matrix,
+    economic_test,
+    evaluate,
+    load_rows,
+    main,
+)
 from analysis.stats import auc, fit_logistic, predict_proba, standardize
 
 FEATURE_COLUMNS = [
@@ -37,9 +44,17 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def synth_rows(n, *, signal_strength, seed=0, interval_ms=250):
+def synth_rows(n, *, signal_strength, seed=0, interval_ms=250, drift_bps=0.0,
+               flip_at=None):
     """Generate feature rows where obi_1 and tfi_5s predict the forward return
-    with a controllable strength. signal_strength=0 gives pure noise."""
+    with a controllable strength. signal_strength=0 gives pure noise.
+
+    `drift_bps` adds a constant to every forward return, simulating a window
+    that trended. `flip_at` inverts the planted relationship from that row
+    onward, simulating a relationship that held in the training half and
+    reversed in the test half - which is what fitting a window rather than an
+    effect looks like from the inside.
+    """
     rng = np.random.default_rng(seed)
     rows = []
     ts = 1_700_000_000_000
@@ -49,9 +64,13 @@ def synth_rows(n, *, signal_strength, seed=0, interval_ms=250):
         obi = rng.normal()
         tfi = rng.normal()
         noise = rng.normal(scale=3.0)
+        strength = signal_strength
+        if flip_at is not None and index >= flip_at:
+            strength = -signal_strength
         # The planted relationship, in bps.
-        forward_1s = signal_strength * (0.7 * obi + 0.3 * tfi) + noise
-        forward_5s = signal_strength * (0.7 * obi + 0.3 * tfi) * 1.5 + noise * 2
+        forward_1s = strength * (0.7 * obi + 0.3 * tfi) + noise + drift_bps
+        forward_5s = (strength * (0.7 * obi + 0.3 * tfi) * 1.5 + noise * 2
+                      + drift_bps)
 
         rows.append({
             "ts": ts + index * interval_ms,
@@ -446,3 +465,202 @@ def test_the_raw_archive_directory_is_not_mistaken_for_an_instrument(tmp_path):
 def test_an_empty_directory_says_how_to_get_data(tmp_path):
     with pytest.raises(SystemExit, match="Run the bot first"):
         resolve_files(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Drift adjustment: the sample's own trend is not an edge
+# ---------------------------------------------------------------------------
+
+
+def capture(fn, *args, **kwargs):
+    """Run something that prints, and keep both the value and the output."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        result = fn(*args, **kwargs)
+    return result, buffer.getvalue()
+
+
+def test_drift_alone_is_not_an_edge():
+    """The bug the adjustment exists for.
+
+    Pure-noise predictions on a window that fell 20 bps. Shorting anything
+    scores +20 raw, which clears any plausible cost - and there is nothing
+    there. Measured as excess it is zero, and the check must say so.
+    """
+    rng = np.random.default_rng(0)
+    scores = rng.uniform(size=20_000)
+    forward = rng.normal(scale=3.0, size=20_000) - 20.0
+
+    result, output = capture(economic_test, scores, forward, 12.0, 0.60,
+                             0.60, 0.51)
+
+    assert result["raw_tradeable"] == 1.0, "raw short edge should clear costs"
+    assert result["tradeable"] == 0.0, "excess must not"
+    assert "DRIFT WARNING" in output
+    assert "NOT TRADEABLE" in output
+
+
+def test_a_real_edge_survives_the_drift_adjustment():
+    """The adjustment must not throw away signal along with the trend."""
+    rng = np.random.default_rng(1)
+    scores = rng.uniform(size=20_000)
+    # A genuine +40 bps lift in the top decile, on top of a falling window.
+    forward = rng.normal(scale=3.0, size=20_000) - 20.0 + 40.0 * (scores > 0.9)
+
+    result, output = capture(economic_test, scores, forward, 12.0, 0.60,
+                             0.60, 0.51)
+
+    assert result["tradeable"] == 1.0
+    assert result["long_edge_bps"] > 30.0
+    assert "PROMISING" in output
+
+
+def test_excess_is_exactly_raw_minus_drift():
+    rng = np.random.default_rng(2)
+    scores = rng.uniform(size=8_000)
+    forward = rng.normal(scale=3.0, size=8_000) - 7.5
+
+    result, _ = capture(economic_test, scores, forward, 12.0, 0.55, 0.55, 0.51)
+
+    assert result["drift_bps"] == pytest.approx(float(forward.mean()))
+    assert result["long_edge_bps"] == pytest.approx(
+        result["long_edge_raw_bps"] - result["drift_bps"])
+    # The short side is HANDED the drift rather than giving it up.
+    assert result["short_edge_bps"] == pytest.approx(
+        result["short_edge_raw_bps"] + result["drift_bps"])
+
+
+def test_monotonicity_is_untouched_by_drift():
+    """Subtracting a constant from every decile cannot change its correlation
+    with rank - which is why monotonicity was trustworthy while the edge
+    numbers were not."""
+    rng = np.random.default_rng(3)
+    scores = rng.uniform(size=8_000)
+    base = rng.normal(scale=3.0, size=8_000) + 10.0 * scores
+
+    flat, _ = capture(economic_test, scores, base, 12.0, 0.55, 0.55, 0.51)
+    trending, _ = capture(economic_test, scores, base - 25.0, 12.0, 0.55,
+                          0.55, 0.51)
+
+    assert flat["monotonicity"] == pytest.approx(trending["monotonicity"])
+
+
+def test_a_driftless_window_is_unchanged_by_the_adjustment():
+    rng = np.random.default_rng(4)
+    scores = rng.uniform(size=8_000)
+    forward = rng.normal(scale=3.0, size=8_000)
+
+    result, output = capture(economic_test, scores, forward, 12.0, 0.55,
+                             0.55, 0.51)
+
+    assert abs(result["drift_bps"]) < 0.2
+    assert result["long_edge_bps"] == pytest.approx(
+        result["long_edge_raw_bps"], abs=0.2)
+    assert "DRIFT WARNING" not in output
+
+
+# ---------------------------------------------------------------------------
+# Sign consistency across instruments
+# ---------------------------------------------------------------------------
+
+
+def test_binomial_tail_matches_the_hand_computable_cases():
+    assert binomial_tail(0, 10) == pytest.approx(1.0)
+    assert binomial_tail(10, 10) == pytest.approx(0.5 ** 10)
+    assert binomial_tail(1, 1) == pytest.approx(0.5)
+    # The live result: 8 of 15 is what a coin flip does half the time.
+    assert binomial_tail(8, 15) == pytest.approx(0.5, abs=0.01)
+    # Four instruments can never reach significance, however they agree.
+    assert binomial_tail(4, 4) > 0.05
+    assert binomial_tail(5, 5) < 0.05
+
+
+def test_binomial_tail_on_no_trials_is_not_a_division_by_zero():
+    assert binomial_tail(0, 0) == 1.0
+
+
+def write_instruments(root, spec):
+    """spec: {instrument: rows}. Builds data/<INST>/features-*.csv."""
+    for name, rows in spec.items():
+        directory = root / name
+        directory.mkdir(parents=True, exist_ok=True)
+        write_csv(directory / "features-2026-01-01.csv", rows)
+
+
+def run_across(root, cost_bps=0.0, horizon=5.0):
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        main(["--data-dir", str(root), "--horizon", str(horizon),
+              "--cost-bps", str(cost_bps), "--across-instruments"])
+    return buffer.getvalue()
+
+
+def test_an_edge_present_on_every_instrument_is_reported_consistent(tmp_path):
+    """Five is the smallest panel that can reach p < 0.05, so it is the
+    smallest honest test of consistency."""
+    write_instruments(tmp_path, {
+        f"SYM{i}-USDT": synth_rows(6000, signal_strength=2.0, seed=100 + i)
+        for i in range(5)
+    })
+    output = run_across(tmp_path)
+
+    assert "sign agreement           5/5" in output, output[-2500:]
+    assert "SIGN IS NOT CONSISTENT" not in output
+
+
+def test_a_relationship_that_reverses_out_of_sample_is_caught(tmp_path):
+    """Each instrument's model is fit on its own training half, so a planted
+    signal always looks good in-sample. What separates an effect from a fitted
+    window is whether it survives into the test half - here it does not, on
+    the instruments that flip."""
+    spec = {}
+    for i in range(5):
+        flip = 4200 if i % 2 == 0 else None      # 3 of 5 reverse
+        spec[f"SYM{i}-USDT"] = synth_rows(6000, signal_strength=2.5,
+                                          seed=200 + i, flip_at=flip)
+    write_instruments(tmp_path, spec)
+    output = run_across(tmp_path)
+
+    assert "SIGN IS NOT CONSISTENT" in output, output[-2500:]
+    assert "Do not build on it" in output
+
+
+def test_every_instrument_appears_in_the_table(tmp_path):
+    write_instruments(tmp_path, {
+        "AAA-USDT": synth_rows(6000, signal_strength=1.0, seed=11),
+        "BBB-USDT": synth_rows(6000, signal_strength=1.0, seed=12),
+    })
+    output = run_across(tmp_path)
+
+    assert "AAA-USDT" in output
+    assert "BBB-USDT" in output
+    assert "drift" in output and "long-ex" in output and "short-ex" in output
+
+
+def test_one_unusable_instrument_does_not_stop_the_sweep(tmp_path):
+    """A symbol with too little data is skipped and named, not fatal. A sweep
+    that dies on its worst member reports nothing about its best."""
+    write_instruments(tmp_path, {
+        "GOOD-USDT": synth_rows(6000, signal_strength=2.0, seed=31),
+        "THIN-USDT": synth_rows(40, signal_strength=2.0, seed=32),
+    })
+    output = run_across(tmp_path)
+
+    assert "GOOD-USDT" in output
+    assert "THIN-USDT" in output
+    assert "ACROSS INSTRUMENTS" in output
+
+
+def test_no_instrument_directories_says_what_to_run(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        run_across(tmp_path)
+    assert "recorder" in str(excinfo.value).lower()
+
+
+def test_nothing_evaluable_refuses_to_conclude(tmp_path):
+    write_instruments(tmp_path, {
+        "THIN-USDT": synth_rows(40, signal_strength=2.0, seed=41),
+    })
+    with pytest.raises(SystemExit) as excinfo:
+        run_across(tmp_path)
+    assert "Nothing could be evaluated" in str(excinfo.value)

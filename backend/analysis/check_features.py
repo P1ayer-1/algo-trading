@@ -32,9 +32,11 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import io
 import math
 import os
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -513,13 +515,47 @@ def economic_test(
 
     Accuracy is not profitability. What matters is the mean forward move
     conditional on the model firing, measured against what a round trip costs.
+
+    Measured as EXCESS over the sample's own drift
+    ----------------------------------------------
+    Every number below is the decile's mean forward return minus the
+    unconditional mean forward return of the same test window. Without that
+    subtraction a sample that trended pays every strategy pointing the same
+    way, and the check reports it as an edge.
+
+    This is not hypothetical. Measured 2026-09-10 on 1.55 days of recorded
+    features, the raw version returned:
+
+        SUI-USDT    fell  7.7%   ->  "PROMISING", net SHORT edge +5.67 bps
+        IOST-USDT   rose 26.0%   ->  "PROMISING", net LONG  edge +8.02 bps
+
+    Same features, same code, opposite trade. Nine of SUI's ten deciles had
+    negative mean returns because the window's drift was -8.30 bps; shorting
+    anything scored. On excess, SUI's short edge is -2.63 and does not clear
+    costs. The drift WAS the edge.
+
+    You also cannot trade the drift even when it is real, because you would
+    have to know its sign in advance - and if you knew that, the model would
+    be unnecessary. Drift is the thing being controlled for, not harvested.
+
+    Note that `decile monotonicity` is unaffected: subtracting a constant from
+    every decile cannot change its correlation with rank. That is precisely
+    why monotonicity was already trustworthy while the edge numbers were not,
+    and why it is the statistic to lean on when the two disagree.
     """
     print("\n" + "=" * 72)
     print("ECONOMIC TEST  (does the edge survive costs?)")
     print("=" * 72)
 
-    deciles = decile_returns(scores, forward_returns)
-    print("  Mean forward return (bps) by predicted-probability decile:")
+    drift = float(forward_returns.mean())
+    print(f"  sample drift          {drift:+.3f} bps   <- unconditional mean "
+          f"forward return")
+    print("  Everything below is EXCESS over that. A window that trended pays "
+          "every\n  strategy pointing the same way, and its sign cannot be "
+          "known in advance -\n  if it could, the model would be unnecessary.")
+
+    deciles = decile_returns(scores, forward_returns) - drift
+    print("\n  Excess forward return (bps) by predicted-probability decile:")
     for index, value in enumerate(deciles):
         bar = "#" * int(min(abs(value) * 12, 40))
         print(f"    d{index + 1:<2} {value:>+8.3f}  {bar}")
@@ -531,16 +567,29 @@ def economic_test(
 
     top = forward_returns[scores >= np.quantile(scores, 0.9)]
     bottom = forward_returns[scores <= np.quantile(scores, 0.1)]
-    long_edge = float(top.mean())
-    short_edge = float(-bottom.mean())
+    long_raw = float(top.mean())
+    short_raw = float(-bottom.mean())
+    # Excess: the long side gives up the drift, the short side is handed it.
+    long_edge = long_raw - drift
+    short_edge = short_raw + drift
 
-    print(f"\n  top decile mean move      {long_edge:+.3f} bps  (would go long)")
-    print(f"  bottom decile mean move   {short_edge:+.3f} bps  (would go short)")
+    print(f"\n  top decile     raw {long_raw:+8.3f}   excess {long_edge:+8.3f} bps"
+          f"  (would go long)")
+    print(f"  bottom decile  raw {-short_raw:+8.3f}   excess "
+          f"{-short_edge:+8.3f} bps  (would go short)")
     print(f"  round-trip cost           {cost_bps:.3f} bps")
-    print(f"  net long edge             {long_edge - cost_bps:+.3f} bps")
-    print(f"  net short edge            {short_edge - cost_bps:+.3f} bps")
+    print(f"  net long edge  (excess)   {long_edge - cost_bps:+.3f} bps")
+    print(f"  net short edge (excess)   {short_edge - cost_bps:+.3f} bps")
 
     tradeable = max(long_edge, short_edge) > cost_bps
+    raw_tradeable = max(long_raw, short_raw) > cost_bps
+    if raw_tradeable and not tradeable:
+        side = "long" if long_raw >= short_raw else "short"
+        print(f"\n  DRIFT WARNING: on raw returns the {side} side clears costs "
+              f"({max(long_raw, short_raw):+.3f} bps) and on excess it does not "
+              f"\n  ({max(long_edge, short_edge):+.3f} bps). The sample's "
+              f"{drift:+.3f} bps drift is carrying it.\n  The verdict below "
+              f"uses excess, which is the one you can actually trade.")
 
     print("\n" + "=" * 72)
     print("VERDICT")
@@ -553,15 +602,18 @@ def economic_test(
     elif not tradeable:
         print("  STATISTICAL SIGNAL, BUT NOT TRADEABLE.")
         print(f"  The model predicts direction (AUC {model_auc:.3f}) but the moves it")
-        print(f"  finds ({max(long_edge, short_edge):.3f} bps) are smaller than costs")
-        print(f"  ({cost_bps:.3f} bps). This is the most common outcome, and it is a")
-        print("  real result - the edge exists but the fee schedule eats it.")
+        print(f"  finds ({max(long_edge, short_edge):.3f} bps excess) are smaller than")
+        print(f"  costs ({cost_bps:.3f} bps). This is the most common outcome, and it")
+        print("  is a real result - the edge exists but the fee schedule eats it.")
         print("  Next: maker-only execution to cut costs, or a longer horizon where")
         print("  moves are larger. Do NOT proceed to live trading.")
     else:
         print(f"  PROMISING. AUC {model_auc:.3f}, net edge "
-              f"{max(long_edge, short_edge) - cost_bps:+.3f} bps after costs.")
+              f"{max(long_edge, short_edge) - cost_bps:+.3f} bps after costs, "
+              f"excess of drift.")
         print("  Worth building a proper model. Before believing it:")
+        print("    - confirm the sign holds ACROSS INSTRUMENTS, not just this one:")
+        print("      python backend/analysis/check_features.py --across-instruments")
         print("    - confirm it holds on a DIFFERENT day, not just this test split")
         print("    - re-run with realistic fills, not mid-price (you will not get mid)")
         print("    - check the edge is not concentrated in a few minutes of one event")
@@ -575,11 +627,138 @@ def economic_test(
         "auc": model_auc,
         "accuracy": accuracy,
         "majority": majority,
+        # Excess of drift - the tradeable ones. Raw kept alongside so a caller
+        # can see how much of a result was the window trending.
         "long_edge_bps": long_edge,
         "short_edge_bps": short_edge,
+        "long_edge_raw_bps": long_raw,
+        "short_edge_raw_bps": short_raw,
+        "drift_bps": drift,
         "monotonicity": monotonic,
         "tradeable": float(tradeable),
+        "raw_tradeable": float(raw_tradeable),
     }
+
+
+def run_one(data_dir: Path, *, horizon: float, cost_bps: float,
+            threshold_bps: float) -> Dict[str, float]:
+    """The whole check, on one instrument's directory."""
+    tag = f"{horizon:g}s".replace(".", "p")
+    rows = load_rows(data_dir, target_column=f"fwd_ret_bps_{tag}")
+    X, y, names, timestamps = build_matrix(rows, horizon)
+    X, names = drop_constant_features(X, names)
+
+    interval, eff_n = describe(y, timestamps, horizon, threshold_bps)
+    _, rows_per_ts, _ = panel_geometry(timestamps)
+    ics = information_coefficients(X, y, names, eff_n)
+    clean = leakage_checks(ics, y, eff_n)
+
+    if not clean:
+        print("\nLeakage checks failed. Fix those before trusting anything below.\n")
+
+    return evaluate(X, y, names, horizon=horizon, interval=interval,
+                    cost_bps=cost_bps, rows_per_timestamp=rows_per_ts)
+
+
+def binomial_tail(successes: int, trials: int, p: float = 0.5) -> float:
+    """P(X >= successes) for X ~ Binomial(trials, p). No scipy needed."""
+    if trials <= 0:
+        return 1.0
+    return sum(math.comb(trials, k) * p ** k * (1 - p) ** (trials - k)
+               for k in range(successes, trials + 1))
+
+
+def across_instruments(data_dir: Path, *, horizon: float, cost_bps: float,
+                       threshold_bps: float) -> int:
+    """Does the same edge appear, with the same SIGN, on every instrument?
+
+    A single instrument cannot distinguish a microstructure edge from a
+    property of that instrument's week. Fifteen can, because the features are
+    normalised quantities - book imbalance, trade-flow imbalance - whose
+    relationship to the forward return should not care which symbol produced
+    them. If the sign flips instrument to instrument, what was measured is the
+    instrument, not the feature.
+
+    This is the test that made step 8's cross-sectional result credible: ten
+    independent momentum lookbacks all came back negative, and noise does not
+    do that. The single-instrument check never had the equivalent.
+    """
+    instruments = instrument_dirs(data_dir)
+    if not instruments:
+        raise SystemExit(
+            f"No instrument directories under {data_dir}.\n"
+            "Expected data/<INST-ID>/features-*.csv - run the recorder first.")
+
+    results: Dict[str, Dict[str, float]] = {}
+    skipped: Dict[str, str] = {}
+    for name, path in instruments.items():
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                results[name] = run_one(path, horizon=horizon,
+                                        cost_bps=cost_bps,
+                                        threshold_bps=threshold_bps)
+        except SystemExit as exc:
+            skipped[name] = str(exc).splitlines()[0]
+        except Exception as exc:  # noqa: BLE001 - one bad symbol must not stop the sweep
+            skipped[name] = f"{type(exc).__name__}: {exc}"
+        print(f"  {name:<18} {'ok' if name in results else skipped[name][:48]}")
+
+    print("\n" + "=" * 72)
+    print(f"ACROSS INSTRUMENTS  ({horizon:g}s horizon, {cost_bps:g} bps cost)")
+    print("=" * 72)
+    if not results:
+        raise SystemExit("Nothing could be evaluated. See the reasons above.")
+
+    print(f"  {'instrument':<18} {'AUC':>7} {'drift':>9} {'long-ex':>9} "
+          f"{'short-ex':>9} {'mono':>7}")
+    print("  " + "-" * 62)
+    for name, row in sorted(results.items()):
+        print(f"  {name:<18} {row['auc']:>7.4f} {row['drift_bps']:>+9.2f} "
+              f"{row['long_edge_bps']:>+9.2f} {row['short_edge_bps']:>+9.2f} "
+              f"{row['monotonicity']:>+7.3f}")
+
+    total = len(results)
+    long_positive = sum(1 for r in results.values() if r["long_edge_bps"] > 0)
+    mono_positive = sum(1 for r in results.values() if r["monotonicity"] > 0)
+    tradeable = sum(1 for r in results.values() if r["tradeable"] > 0)
+    drift_carried = sum(1 for r in results.values()
+                        if r["raw_tradeable"] > 0 and r["tradeable"] <= 0)
+    agree = max(long_positive, total - long_positive)
+    p_value = binomial_tail(agree, total)
+
+    print(f"\n  top decile beats drift   {long_positive}/{total}")
+    print(f"  decile ladder positive   {mono_positive}/{total}")
+    print(f"  clears costs on excess   {tradeable}/{total}")
+    if drift_carried:
+        print(f"  would have passed on RAW returns but not on excess: "
+              f"{drift_carried}/{total}")
+    print(f"\n  sign agreement           {agree}/{total}  "
+          f"(p = {p_value:.3f} if the sign were a coin flip)")
+
+    print("\n" + "=" * 72)
+    print("VERDICT")
+    print("=" * 72)
+    if p_value > 0.05:
+        print(f"  SIGN IS NOT CONSISTENT. {agree} of {total} instruments agree, "
+              f"which a\n  coin flip produces {p_value:.0%} of the time. Whatever "
+              f"this is, it is a\n  property of individual instruments' windows "
+              f"and not of the features.")
+        print("  Do not build on it. Collect more days, across more regimes.")
+    elif tradeable == 0:
+        print(f"  CONSISTENT SIGN, NO TRADEABLE EDGE. {agree}/{total} agree "
+              f"(p = {p_value:.3f}),\n  so the features carry something real, but "
+              f"no instrument clears "
+              f"{cost_bps:g} bps\n  on excess. This is a cost problem, not a "
+              f"signal problem - the next move\n  is passive execution, not a "
+              f"bigger model.")
+    else:
+        print(f"  CONSISTENT AND TRADEABLE ON {tradeable}/{total}. "
+              f"{agree}/{total} agree on sign (p = {p_value:.3f}).")
+        print("  This is the first result worth building a model on. Still owed:")
+        print("    - a DIFFERENT set of days, not just this window")
+        print("    - realistic fills rather than mid-price")
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -596,23 +775,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                              f"exists and its fill rate has been measured.")
     parser.add_argument("--threshold-bps", type=float, default=DEFAULT_COST_BPS,
                         help="Move size counted as up/down for the balance report.")
+    parser.add_argument("--across-instruments", action="store_true",
+                        help="Run every instrument under --data-dir and report "
+                             "whether the edge keeps its SIGN across them. One "
+                             "instrument cannot tell an edge from a week.")
     args = parser.parse_args(argv)
 
-    tag = f"{args.horizon:g}s".replace(".", "p")
-    rows = load_rows(args.data_dir, target_column=f"fwd_ret_bps_{tag}")
-    X, y, names, timestamps = build_matrix(rows, args.horizon)
-    X, names = drop_constant_features(X, names)
+    if args.across_instruments:
+        return across_instruments(args.data_dir, horizon=args.horizon,
+                                  cost_bps=args.cost_bps,
+                                  threshold_bps=args.threshold_bps)
 
-    interval, eff_n = describe(y, timestamps, args.horizon, args.threshold_bps)
-    _, rows_per_ts, _ = panel_geometry(timestamps)
-    ics = information_coefficients(X, y, names, eff_n)
-    clean = leakage_checks(ics, y, eff_n)
-
-    if not clean:
-        print("\nLeakage checks failed. Fix those before trusting anything below.\n")
-
-    evaluate(X, y, names, horizon=args.horizon, interval=interval,
-             cost_bps=args.cost_bps, rows_per_timestamp=rows_per_ts)
+    run_one(args.data_dir, horizon=args.horizon, cost_bps=args.cost_bps,
+            threshold_bps=args.threshold_bps)
     return 0
 
 

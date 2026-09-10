@@ -364,6 +364,54 @@ Next, in order:
    fix that — more model complexity cannot create information that isn't
    there. If it says `NOT TRADEABLE`, the problem is execution cost, not the
    model.
+
+   **First real run, 2026-09-10, and it found a bug in the check before it
+   found anything about the market.** On 1.55 days of recorded microstructure
+   features the economic test compared each decile's mean forward return to
+   *zero* rather than to the window's own drift. Every strategy pointing the
+   same way as a trending sample therefore scored:
+
+   | | move over window | raw verdict |
+   |---|---|---|
+   | SUI-USDT | −7.7% | PROMISING, net **short** edge +5.67 bps |
+   | IOST-USDT | +26.0% | PROMISING, net **long** edge +8.02 bps |
+
+   Same features, same code, opposite trade. Nine of SUI's ten deciles had
+   negative mean returns because the window's drift was −8.30 bps; shorting
+   anything scored. The drift *was* the edge.
+
+   Two fixes, both in `check_features.py`:
+
+   - **Everything is now measured as EXCESS over the sample's drift.** You
+     cannot trade a drift you must know the sign of in advance — if you knew
+     it, the model would be unnecessary. Note `decile monotonicity` was never
+     affected: shifting every decile by a constant cannot change its
+     correlation with rank, which is exactly why it stayed trustworthy while
+     the edge numbers did not.
+   - **`--across-instruments`** runs the whole panel and asks whether the edge
+     keeps its SIGN. One instrument cannot tell an edge from a week; the
+     features are normalised quantities whose relationship to forward returns
+     should not care which symbol produced them. This is the test that made
+     step 8's result credible, and the single-instrument check never had it.
+
+   ```
+   python backend\analysis\check_features.py --across-instruments --cost-bps 12
+   ```
+
+   **Then the actual answer, across 15 instruments: no.**
+
+   ```
+   top decile beats drift   7/15
+   clears costs on excess   3/15
+   would have passed on RAW returns but not on excess: 4/15
+   sign agreement           8/15  (p = 0.500 if the sign were a coin flip)
+   ```
+
+   Mean AUC across the panel is **0.5036**. SUI's 0.586 is the top draw of a
+   noise distribution centred on a coin flip, not a signal — and four of
+   fifteen instruments were being handed false positives by the drift bug.
+   1.55 days of one regime (everything down but IOST) cannot overturn step 7's
+   365-day null result, and now it does not pretend to.
 7. ~~**Prediction model**~~ — `backend\analysis\train_model.py`. LightGBM on
    a three-way purged time split, a shuffled-label control, and a paired
    bootstrap against both the control and the linear baseline.
