@@ -78,11 +78,13 @@ first. Recording is therefore step one, not step four.
 │   │   ├── risk.py            # liquidation math, sizing, hard limits
 │   │   └── strategies/        # one directory per strategy, same three verbs
 │   │       ├── __init__.py    # the plan/execute/monitor contract, as Protocols
-│   │       └── carry/
-│   │           ├── plan.py     # sizes both legs; SENDS NOTHING
-│   │           ├── execute.py  # puts it on (perp first), takes it off (spot first)
-│   │           ├── monitor.py  # scores it against the plan; READ ONLY
-│   │           └── broker.py   # the REST calls the other three are written against
+│   │       ├── carry/
+│   │       │   ├── plan.py     # sizes both legs; SENDS NOTHING
+│   │       │   ├── execute.py  # puts it on (perp first), takes it off (spot first)
+│   │       │   ├── monitor.py  # scores it against the plan; READ ONLY
+│   │       │   └── broker.py   # the REST calls the other three are written against
+│   │       └── range_trade/
+│   │           └── levels.py   # the range + brackets; no other verbs (step 9k: no edge)
 │   ├── analysis/              # offline tooling (see analysis/README.md)
 │   │   ├── bars_import.py     # free Binance bar/OI/funding history -> dataset
 │   │   ├── cross_sectional_import.py  # the same, as a multi-symbol panel
@@ -94,13 +96,14 @@ first. Recording is therefore step one, not step four.
 │   │   ├── blofin_spot.py     # the spot endpoints the SDK omits
 │   │   ├── funding_carry.py   # long spot + short perp: does funding pay?
 │   │   ├── carry_backtest.py  # the same position, run from every entry
+│   │   ├── range_backtest.py  # fade the range: bracketed 1m fills vs a shuffled-day control
 │   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (646 tests)
+│   └── tests/                 # pytest suite (702 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -1167,6 +1170,77 @@ ecord.py` runs N instruments headless in one process.
    A separate entrypoint rather than `run_carry.py --close`, because with a
    flag, the open command minus the flag **opens a second carry** — the most
    expensive typo available here. One verb per entrypoint deletes that.
+
+9k. ~~**Fade the range**~~ — `backend\trading\strategies\range_trade\levels.py`
+   and `backend\analysis\range_backtest.py`. Buy near the bottom of the last N
+   hours' range, sell near the top, stop beyond both edges, take profit at the
+   middle, with leverage. Proposed 2026-09-11 for a market that had been
+   "trading sideways for three weeks".
+
+   ```
+   python backend\analysis\range_backtest.py
+   ```
+
+   The naive backtest of this lies in two ways, and the tool is built around
+   both:
+
+   - **Win rate is geometry.** A bracket with its stop S away and target T
+     away wins S/(S+T) of the time on a driftless random walk, and still loses
+     its fees. Out of sample the chosen configuration won **64%** of its
+     trades, averaging +90.9 bps against losses of −185.4, and lost money.
+   - **OHLC does not say whether the stop or the target printed first**, so
+     fills are bracketed (1 bp trade-through and stop-first, against touch and
+     target-first). A **shuffled-day control** — each UTC day's 1m bars
+     permuted, which keeps the day's net move and volatility and destroys only
+     the order of moves inside it — says what a random walk with the same days
+     would have made. `real − control` is the mean-reversion edge, which is
+     the only thing a fade can be harvesting.
+
+   **Run on 365 days of Binance 1m klines for ten majors at BloFin VIP 1
+   fees, and the answer is no.** 24 configurations (lookback 4/24/72h × entry
+   0.1/0.25 × stop 0.25/0.5 × trend filter off/≤0.5), and **not one had a
+   positive in-sample median across symbols.** The least bad (24h, entry
+   0.25, stop 0.25), scored on the last 110 days without re-fitting:
+
+   | | bps per trade | 95%, whole-day blocks |
+   |---|---|---|
+   | real, pessimistic | **−9.0** | [−21.4, +2.9] |
+   | real, optimistic | −6.0 | [−18.9, +6.2] |
+   | control, pessimistic | −0.8 | [−10.8, +9.0] |
+   | real − control | −8.2 | [−19.1, +2.7] |
+
+   2,966 trades, 9 of 10 symbols negative. The comparison with the control
+   leans the wrong way: inside a day, moves at these scales tended to
+   *continue* rather than reverse. That is not significant, but there is no
+   hint of the reversion the strategy is a bet on. Ranking the grid in sample
+   did not predict its ranking out of sample (Spearman **+0.07**).
+
+   **Was it sideways?** The last 21 days against every 21-day window in the
+   year, by trend ratio (net move / range width): BTC at the 45th percentile,
+   ETH the 52nd — an ordinary three weeks for both. DOGE, ADA and AVAX were
+   genuinely range-bound (10th–14th). Over exactly those 21 days the fade made
+   −0.8 (pessimistic) / +5.2 (optimistic) bps per trade with an interval of
+   about ±40, and the control made +3.5 on the same days. 21 days of one
+   regime cannot tell this strategy from noise.
+
+   **Leverage.** At 5x full allocation every symbol lost capital out of
+   sample: ending equity 0.03–0.47x, max drawdown 83–99%. DOGE, the one symbol
+   ahead at 1x (1.018x), finished at 0.47x — a +1.8 bps mean does not survive
+   five times the variance. Liquidation never fired, since the stops sit well
+   inside a 5x liquidation price. It did not need to.
+
+   One thread worth pulling, and no more than that: the only positive
+   out-of-sample medians in the grid all belong to the four **72h
+   trend-filtered** configurations (+2.7 to +15.1), and all four were negative
+   in sample (−7.0 to −12.6). That is either noise getting a second draw or a
+   sign the regime filter needs a window of weeks rather than the lookback's.
+   This data cannot say which, and a filter measured over weeks is the next
+   test. Also not covered: stops triggered on BloFin's mark price rather than
+   last trade (which would skip some wicks), and funding.
+
+   No planner or executor was built. The plan/execute/monitor split exists so
+   that order code is asked for after the evidence, and the evidence is
+   negative.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
