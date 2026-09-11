@@ -1265,13 +1265,22 @@ ecord.py` runs N instruments headless in one process.
    |---|---|---|
    | 0% | 0% | −7.1 |
    | 0% | **100%** | **−15.9** |
+   | 5% | 0% | −9.2 |
+   | 10% | 0% | −7.0 |
+   | 15% | 0% | −2.9 |
+   | 20% | 0% | +2.5 |
    | 25% | 0% | +11.2 |
    | 50% | 0% | +68.7 |
    | 100% | 0% | +102.1 |
 
    **Perfect knowledge of the next day's range WIDTH is worth less than
    nothing — it makes the strategy worse.** All of the value is in the CENTRE,
-   and break-even sits at a centre IC of about **0.10**. A range forecast that
+   and break-even sits at a centre IC of **0.177**. The curve is not linear
+   near zero — it *dips* before it climbs, so a little centre skill is worse
+   than none, and interpolating the threshold from the coarse 0/25% pair gave
+   0.097 against a measured crossing of 0.177. Nearly double, in the direction
+   that flatters a model, which is why the sweep now steps through 0.05–0.20.
+   A range forecast that
    is symmetric around the current price — which is what a volatility model, a
    quantile regression on the high/low, or a Monte Carlo path simulation
    produces — has a centre IC of zero by construction. It forecasts the
@@ -1293,7 +1302,7 @@ ecord.py` runs N instruments headless in one process.
 
    | target | pooled IC | control ceiling | reading |
    |---|---|---|---|
-   | centre | +0.064 (t 2.12) | **+0.062** | does not separate from its own control, and is under the 0.097 break-even |
+   | centre | +0.064 (t 2.12) | **+0.062** | does not separate from its own control; worth −8.6 bps against a 0.177 break-even, so it needs 2.7x this skill |
    | width | +0.600 (t 24.7) | +0.289 | real, and measured above as worth nothing |
    | contained | +0.242 (t 8.19) | +0.134 | the untested idea: it gates WHEN to fade, not where |
 

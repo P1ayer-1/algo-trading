@@ -88,17 +88,25 @@ def test_moving_the_centre_leaves_the_width_alone_and_the_reverse():
 def test_the_skill_table_interpolates_between_measured_points():
     assert value_of_centre_skill(0.0) == pytest.approx(-7.1)
     assert value_of_centre_skill(1.0) == pytest.approx(102.1)
-    # halfway between (0, -7.1) and (0.25, +11.2)
-    assert value_of_centre_skill(0.125) == pytest.approx(-7.1 + 0.5 * 18.3)
+    # halfway between (0.10, -7.0) and (0.15, -2.9)
+    assert value_of_centre_skill(0.125) == pytest.approx((-7.0 + -2.9) / 2)
     # outside the measured range it clamps rather than extrapolating a fantasy
     assert value_of_centre_skill(2.0) == pytest.approx(102.1)
 
 
 def test_break_even_is_where_the_measured_curve_crosses_zero():
-    """Hand-computed: between (0, -7.1) and (0.25, +11.2), zero sits at
-    0.25 * 7.1 / 18.3 = 0.097."""
-    assert breakeven_centre_skill() == pytest.approx(0.25 * 7.1 / 18.3, abs=1e-6)
+    """Hand-computed: between (0.15, -2.9) and (0.20, +2.5), zero sits at
+    0.15 + 0.05 * 2.9 / 5.4 = 0.1769."""
+    assert breakeven_centre_skill() == pytest.approx(0.15 + 0.05 * 2.9 / 5.4, abs=1e-6)
     assert breakeven_centre_skill(((0.0, -10.0), (1.0, 10.0))) == pytest.approx(0.5)
+
+
+def test_break_even_is_the_FIRST_crossing_not_the_last():
+    """The measured curve dips below zero before climbing, so a table can cross
+    zero more than once. The first crossing is the threshold - reporting a
+    later one would claim a model needs more skill than it does."""
+    table = ((0.0, 1.0), (0.1, -1.0), (0.2, 1.0))
+    assert breakeven_centre_skill(table) == pytest.approx(0.15)
 
 
 def test_a_curve_that_never_pays_has_no_break_even():
@@ -107,6 +115,12 @@ def test_a_curve_that_never_pays_has_no_break_even():
     assert breakeven_centre_skill(((0.0, -5.0), (0.5, -3.0), (1.0, -1.0))) is None
 
 
-def test_the_shipped_table_is_monotone_in_skill():
-    values = [value for _, value in CENTRE_VALUE_BPS]
-    assert values == sorted(values), "more centre skill must never be worth less"
+def test_the_shipped_table_climbs_once_it_is_past_the_dip():
+    """Measured, not assumed: the curve DIPS between alpha 0 and 0.10 - a
+    little centre skill is worse than none, because it moves the levels
+    without moving them to the right place. Past 0.10 more skill is always
+    worth more, and that is the part the threshold is read off."""
+    past_dip = [value for alpha, value in CENTRE_VALUE_BPS if alpha >= 0.10]
+    assert past_dip == sorted(past_dip)
+    dip = dict(CENTRE_VALUE_BPS)
+    assert dip[0.05] < dip[0.00]

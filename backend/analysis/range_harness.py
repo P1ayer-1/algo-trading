@@ -10,7 +10,7 @@ Why this exists
 `range_information.py` measured what a forecast range is worth (2026-09-11):
 perfect knowledge of the next 24h WIDTH is worth -15.9 bps per trade, perfect
 knowledge of where the range SITS is worth +102.1, and break-even sits at a
-centre IC around 0.1. So one number decides whether any model - ridge,
+centre IC of 0.177. So one number decides whether any model - ridge,
 LightGBM, an attention network, an LLM reading news, an RL policy - can rescue
 the range fade, and this scores that number the same way for all of them.
 

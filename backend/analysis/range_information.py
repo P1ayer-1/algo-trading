@@ -15,9 +15,18 @@ stop 0.25 / target 0.5 of width, pessimistic fills, VIP 1 fees, 5x:
     centre  width   mean bps per trade
     0.00    0.00    -7.1     <- the strategy as it stands
     0.00    1.00    -15.9    <- PERFECT width knowledge, and it is WORSE
+    0.05    0.00    -9.2
+    0.10    0.00    -7.0
+    0.15    0.00    -2.9
+    0.20    0.00    +2.5     <- break-even is IC 0.177
     0.25    0.00    +11.2
     0.50    0.00    +68.7
     1.00    0.00    +102.1
+
+The curve is not linear near zero - it DIPS before it climbs, so a little
+centre skill is worse than none. Interpolating break-even from the coarse
+0.00/0.25 pair gave 0.097 and the measured crossing is 0.177, nearly twice
+that, which is why the sweep now runs 0.05 to 0.20 in steps.
 
 The half that is predictable - next-day width, IC ~0.4 off the trailing width -
 is worth nothing here, and the half that pays is WHERE the range sits, which is
@@ -70,7 +79,8 @@ DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,ADAUSDT"
 # the exchange rate between model skill and money, and everything downstream
 # quotes them.
 CENTRE_VALUE_BPS: Tuple[Tuple[float, float], ...] = (
-    (0.00, -7.1), (0.25, 11.2), (0.50, 68.7), (0.75, 94.7), (1.00, 102.1),
+    (0.00, -7.1), (0.05, -9.2), (0.10, -7.0), (0.15, -2.9), (0.20, 2.5),
+    (0.25, 11.2), (0.50, 68.7), (0.75, 94.7), (1.00, 102.1),
 )
 WIDTH_VALUE_BPS: Tuple[Tuple[float, float], ...] = (
     (0.00, -7.1), (0.25, -11.6), (0.50, -11.8), (0.75, -14.6), (1.00, -15.9),
