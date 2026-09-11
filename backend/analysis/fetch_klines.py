@@ -24,6 +24,11 @@ still one venue. It buys history and breadth; it does not buy the effective N
 that a t-statistic wants, and `range_harness` keeps correcting for that
 regardless of how much is downloaded here.
 
+Tokenised equities and commodities are excluded by default. Binance lists them
+as TRADIFI_PERPETUAL, and on 2026-09-11 seven of the hundred most-traded
+contracts were gold, crude, silver and single stocks - instruments with
+trading hours, whose session gaps a crypto model would read as structure.
+
 Coverage is reported per symbol because a listing date is invisible otherwise:
 a symbol that started trading in 2024 silently returns three years of 404s,
 and a model trained on "five years" of it is trained on whatever arrived.
@@ -45,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from analysis.bars_import import Fetcher, daterange, kline_urls  # noqa: E402
 
 TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 # Measured from the cache on 2026-09-11 over 380 daily and 110 monthly 1m
 # archives: daily median 0.057 MB, monthly median 1.67 MB (0.055 MB/day), so a
 # symbol-year is about 20 MB. Used only for the --dry-run estimate.
@@ -78,17 +84,52 @@ def fetch_ticker_payload(opener: Optional[Callable[[str], bytes]] = None) -> Lis
     return payload
 
 
+def fetch_exchange_info(opener: Optional[Callable[[str], bytes]] = None) -> List[dict]:
+    """Every listed contract with its asset class. `opener` is injectable."""
+    if opener is None:
+        def opener(url: str) -> bytes:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                return response.read()
+    payload = json.loads(opener(EXCHANGE_INFO_URL))
+    symbols = payload.get("symbols") if isinstance(payload, dict) else None
+    if not symbols:
+        raise SystemExit(f"{EXCHANGE_INFO_URL} returned no symbols.")
+    return symbols
+
+
+def crypto_perpetuals(symbols: Sequence[dict]) -> set:
+    """Crypto perps only - not gold, not crude, not Samsung.
+
+    Binance lists tokenised equities and commodities as TRADIFI_PERPETUAL
+    (XAUUSDT, CLUSDT, SOXLUSDT, SKHYNIXUSDT), and on 2026-09-11 seven of the
+    hundred most-traded contracts were those. They do not belong in a pooled
+    crypto dataset: an equity trades in sessions, so its bars carry overnight
+    and weekend gaps that a crypto model reads as market structure, and the
+    dynamics of a commodity are not what a range model for BTC is being asked
+    about. The exchange labels the difference, so this filters on the label
+    rather than on a list of names that goes stale at the next listing.
+    """
+    return {str(row.get("symbol")) for row in symbols
+            if row.get("contractType") == "PERPETUAL"
+            and row.get("underlyingType") == "COIN"
+            and row.get("status") == "TRADING"}
+
+
 def rank_symbols(payload: Sequence[dict], *, top: int, quote: str = "USDT",
-                 min_volume_usd: float = 0.0) -> List[str]:
+                 min_volume_usd: float = 0.0,
+                 allowed: Optional[set] = None) -> List[str]:
     """The `top` most-traded perpetuals in `quote`, busiest first.
 
     Dated futures (BTCUSDT_240329) are excluded: they expire, so their history
-    stops for reasons that have nothing to do with the market.
+    stops for reasons that have nothing to do with the market. `allowed`, when
+    given, restricts the universe further - see `crypto_perpetuals`.
     """
     rows: List[Tuple[float, str]] = []
     for row in payload:
         symbol = str(row.get("symbol", ""))
         if not symbol.endswith(quote) or "_" in symbol:
+            continue
+        if allowed is not None and symbol not in allowed:
             continue
         try:
             volume = float(row.get("quoteVolume") or 0.0)
@@ -189,6 +230,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cache", type=Path, default=repo_root / "data" / "cache")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--min-volume-usd", type=float, default=1e6)
+    parser.add_argument("--include-tradfi", action="store_true",
+                        help="Keep tokenised equities and commodities "
+                             "(XAUUSDT, SOXLUSDT...). They have trading hours.")
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the plan and the disk it needs. Fetch nothing.")
@@ -206,9 +250,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.symbols:
         symbols = [part.strip().upper() for part in args.symbols.split(",") if part.strip()]
     else:
-        print(f"Ranking symbols by 24h volume...")
+        print("Ranking symbols by 24h volume...")
+        allowed = None
+        if not args.include_tradfi:
+            allowed = crypto_perpetuals(fetch_exchange_info())
+            print(f"  {len(allowed)} crypto perpetuals listed; tokenised equities "
+                  "and commodities excluded")
         symbols = rank_symbols(fetch_ticker_payload(), top=args.top,
-                               min_volume_usd=args.min_volume_usd)
+                               min_volume_usd=args.min_volume_usd, allowed=allowed)
         if not symbols:
             raise SystemExit("No symbol cleared the volume floor.")
     print(f"{len(symbols)} symbols, {start} .. {end} ({len(days)} days), "

@@ -15,6 +15,8 @@ from analysis.fetch_klines import (
     Coverage,
     coverage_of,
     covered_days,
+    crypto_perpetuals,
+    fetch_exchange_info,
     fetch_ticker_payload,
     rank_symbols,
     write_manifest,
@@ -109,3 +111,44 @@ def test_the_manifest_records_what_arrived(tmp_path):
     assert written["interval"] == "1m"
     assert written["symbols"][0]["days_covered"] == 9
     assert written["symbols"][0]["megabytes"] == pytest.approx(2.5)
+
+
+# ---------------------------------------------------------------------------
+# Asset class
+# ---------------------------------------------------------------------------
+
+LISTINGS = [
+    {"symbol": "BTCUSDT", "contractType": "PERPETUAL", "underlyingType": "COIN",
+     "status": "TRADING"},
+    {"symbol": "XAUUSDT", "contractType": "TRADIFI_PERPETUAL",
+     "underlyingType": "COMMODITY", "status": "TRADING"},
+    {"symbol": "SOXLUSDT", "contractType": "TRADIFI_PERPETUAL",
+     "underlyingType": "EQUITY", "status": "TRADING"},
+    {"symbol": "SKHYNIXUSDT", "contractType": "TRADIFI_PERPETUAL",
+     "underlyingType": "KR_EQUITY", "status": "TRADING"},
+    {"symbol": "DEADUSDT", "contractType": "PERPETUAL", "underlyingType": "COIN",
+     "status": "SETTLING"},
+]
+
+
+def test_only_trading_crypto_perpetuals_survive_the_asset_class_filter():
+    """Gold, crude and single stocks trade in sessions, so their bars carry
+    overnight and weekend gaps a crypto model would read as structure."""
+    assert crypto_perpetuals(LISTINGS) == {"BTCUSDT"}
+
+
+def test_ranking_can_be_restricted_to_an_allowed_universe():
+    payload = PAYLOAD + [{"symbol": "XAUUSDT", "quoteVolume": "99000000000"}]
+    assert rank_symbols(payload, top=3)[0] == "XAUUSDT"
+    assert "XAUUSDT" not in rank_symbols(payload, top=3, allowed={"BTCUSDT", "ETHUSDT"})
+
+
+def test_exchange_info_is_read_through_an_injected_opener():
+    payload = json.dumps({"symbols": LISTINGS}).encode()
+    assert fetch_exchange_info(opener=lambda url: payload)[0]["symbol"] == "BTCUSDT"
+
+
+def test_exchange_info_without_symbols_is_refused():
+    empty = json.dumps({"symbols": []}).encode()
+    with pytest.raises(SystemExit):
+        fetch_exchange_info(opener=lambda url: empty)
