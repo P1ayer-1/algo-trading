@@ -7,8 +7,8 @@ rather than against any price that printed.
 
 The tests that earn their place are the ones about coexistence: this poller
 writes into the same per-instrument archive an open-interest poller is already
-writing to, and the rule that two pollers on one channel destroy the hour's
-file has already been paid for once.
+writing to, and two pollers on one channel have already cost an hour once
+(0 of 40 records, before archive files were created exclusively).
 
 No network: the opener is injected.
 """
@@ -173,8 +173,8 @@ def test_it_runs_alongside_an_open_interest_poller_on_the_same_instrument(tmp_pa
 
 
 def test_a_second_mark_price_poller_is_still_refused(tmp_path):
-    """Two on ONE channel interleave gzip members and the hour stops decoding
-    - measured at 0 of 40 records recoverable, not theorised."""
+    """Two on ONE channel archive every row twice - and before files were
+    created exclusively, destroyed the hour outright (0 of 40, measured)."""
     first = poller_at(tmp_path, opener_for(payload()))
     with pytest.raises(SystemExit) as excinfo:
         poller_at(tmp_path, opener_for(payload()))

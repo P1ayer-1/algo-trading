@@ -334,10 +334,12 @@ class WeightBudget:
 class ExclusiveLock:
     """One owner per path, the same pid-file rule the snapshot pollers use.
 
-    Two writers on one hourly gzip file destroy it (measured: 0 of 40 records
-    recoverable - see `openinterest.py`), and this process writes a file per
-    coin per channel plus the accounts archive, so the whole venue directory
-    has exactly one owner.
+    A second recorder would archive every event twice. (Two writers on one
+    hourly gzip file used to destroy it outright - 0 of 40 records, see
+    `openinterest.py` - until `RawEventLog` began creating its files
+    exclusively on 2026-09-11.) This process writes a file per coin per
+    channel plus the accounts archive, so the whole venue directory has
+    exactly one owner.
     """
 
     def __init__(self, path: Path, *, holder: str):
@@ -351,8 +353,8 @@ class ExclusiveLock:
         if owner is not None and _pid_alive(owner):
             raise SystemExit(
                 f"{self.holder} is already running as pid {owner} "
-                f"({self.path}).\nTwo writers on one archive file destroy it "
-                f"rather than duplicating it. Stop that process first.")
+                f"({self.path}).\nA second one would archive every event "
+                f"twice. Stop that process first.")
         if owner is not None:
             self.path.unlink(missing_ok=True)   # stale: the owner is gone
         try:

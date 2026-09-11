@@ -47,14 +47,16 @@ shared file handle. The archive is the half that cannot be re-collected, so
 "start it without stopping anything" is a requirement, not a convenience.
 
 That safety holds against the BOOK and TRADE files. It does NOT hold against
-another open-interest poller, and the difference is expensive: two of them on
-one instrument append interleaved gzip members to the same hourly file, and
-the result does not decode at all. Measured - 20 rows each from two writers
-produced a file yielding **0 of 40** records. The `ts` dedupe cannot help,
-being per-process state.
+another open-interest poller. Until 2026-09-11 two of them on one instrument
+appended interleaved gzip members to the same hourly file, and the result did
+not decode - measured, 20 rows each from two writers produced a file yielding
+**0 of 40** records. `RawEventLog` now creates every file exclusively, so a
+second writer gets its own (`open-interest-14.r001.jsonl.gz`) and nothing is
+destroyed. What remains is every minute archived twice, which the `ts` dedupe
+cannot prevent, being per-process state.
 
-So each poller takes an exclusive per-instrument lock and a second one is
-refused. `record.py` starts a poller of its own, which makes `record_oi.py`
+So each poller still takes an exclusive per-instrument lock and a second one
+is refused. `record.py` starts a poller of its own, which makes `record_oi.py`
 useful only against a run that predates that change.
 
 Two consequences of that separation, both of which matter when reading the
@@ -254,19 +256,20 @@ class SnapshotPoller:
         # reason polling faster than the publish rate costs nothing.
         self._last_ts: Dict[str, str] = {}
 
-        # Two pollers on one instrument DESTROY that hour's file. Measured, not
-        # theorised: two RawEventLogs appending 20 rows each to the same
-        # `open-interest-HH.jsonl.gz` produced a file from which 0 of 40
-        # records could be read back. Each holds its own gzip writer, so their
-        # members interleave and the stream stops decoding at the first splice.
+        # Two pollers on one instrument used to DESTROY that hour's file.
+        # Measured, not theorised: two RawEventLogs appending 20 rows each to
+        # the same `open-interest-HH.jsonl.gz` produced a file from which 0 of
+        # 40 records could be read back. Since 2026-09-11 each RawEventLog
+        # creates its file exclusively, so the second gets a file of its own
+        # and both survive - with every row archived twice, once per file.
         #
-        # The per-instrument `ts` dedupe does NOT prevent this - it is
+        # The per-instrument `ts` dedupe does NOT prevent that - it is
         # per-process state, and the two processes never see each other's.
         #
         # This is reachable: `record.py` starts a poller of its own, and
         # `record_oi.py` exists to be run against a recorder that is already
         # going. So ownership is claimed explicitly, and a second poller is
-        # refused rather than allowed to quietly shred the archive.
+        # refused rather than allowed to quietly double the archive.
         self._locks: List[Path] = []
         if enabled:
             self._claim(inst_ids=self.instruments)

@@ -136,6 +136,17 @@ counter: `{"t":…,"n":…,"m":{…}}`. Channels: `books`, `trades`, `funding-ra
 over websocket, plus `open-interest` and `mark-price` polled over REST. About
 **1.35 GB/day across 15 instruments**.
 
+A process never appends to a file it did not create. A restart inside an hour
+writes `<channel>-<HH>.r001.jsonl.gz` beside the first run's file; it sorts
+after it and matches the same `<channel>-*.jsonl.gz` glob. Appending is how it
+used to work, and after a hard kill it cost the whole hour: the killed run's
+gzip member has no trailer, the reader decoded through it into the restart's
+member and gave up, and in the 2026-09-11 reproduction it returned **0 of 10**
+records - the ones written before the crash included. The reader now recovers
+every member of files written that way (`backend/trading/rawlog.py`), and
+`python backend\analysis\audit_raw.py` reports which archived hours it
+changes.
+
 **The feature CSV** is a derived, deliberately lossy 1-second sample — 31
 features plus `fwd_ret_bps_{300,900,1800}s` and their labels. `replay.py`
 rebuilds it from raw with different parameters, so nothing in it is a

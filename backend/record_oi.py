@@ -16,9 +16,10 @@ the hours you do not have are gone, which a restart makes worse before it
 makes better.
 
 **`record.py` now starts a poller of its own, so do not run both.** They would
-write the same `open-interest-<HH>.jsonl.gz` from two processes, and two gzip
-writers appending to one file produce a stream that does not decode - measured
-at 0 of 40 records recovered, not merely duplicated. Each poller therefore
+archive every minute twice. Before 2026-09-11 it was worse: both appended to
+the same `open-interest-<HH>.jsonl.gz`, and two gzip writers on one file
+produce a stream that does not decode - measured at 0 of 40 records recovered.
+Files are now created exclusively so that cannot recur, but each poller still
 takes an exclusive per-instrument lock and the second is refused with the
 owning pid. This entrypoint is for a recorder started BEFORE that change, or
 for instruments the running recorder is not covering.
@@ -119,7 +120,7 @@ async def run(poller: SnapshotPoller) -> None:
     log("Different channel from books/trades, so a live record.py's feed "
         "files are untouched.")
     log(f"  A second {channel} poller on the same instrument is refused: two "
-        f"of them destroy\n  the hour's file rather than duplicating it. A "
+        f"of them archive\n  every row twice. A "
         f"poller on a DIFFERENT channel is fine.")
 
     try:

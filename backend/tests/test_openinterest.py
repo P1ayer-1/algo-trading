@@ -259,11 +259,13 @@ def test_rows_are_readable_as_gzipped_jsonl(tmp_path):
 # Exclusive ownership
 # ---------------------------------------------------------------------------
 #
-# Two pollers on one instrument append interleaved gzip members to the same
-# hourly file. Measured: 20 rows each from two writers produced a file from
-# which 0 of 40 records could be read back. Not duplication - destruction. The
-# per-process `ts` dedupe cannot see the other process, so the lock is the
-# only thing standing between `record.py`'s poller and `record_oi.py`.
+# Two pollers on one instrument used to append interleaved gzip members to the
+# same hourly file. Measured: 20 rows each from two writers produced a file
+# from which 0 of 40 records could be read back. Since 2026-09-11 each writer
+# creates its file exclusively, so that destruction is gone and what remains
+# is duplication: the per-process `ts` dedupe cannot see the other process, so
+# the lock is the only thing stopping `record.py`'s poller and `record_oi.py`
+# from archiving every row twice.
 
 import os
 
@@ -271,8 +273,9 @@ from trading.openinterest import OpenInterestPoller
 from trading.rawlog import iter_events
 
 
-def test_two_writers_on_one_file_destroy_it(tmp_path):
-    """The measurement the lock exists because of."""
+def test_two_writers_in_one_hour_no_longer_destroy_it(tmp_path):
+    """The measurement the lock was written because of, now a regression test:
+    the second writer must never open the first one's file."""
     from trading.openinterest import CHANNEL, as_message
     from trading.rawlog import RawEventLog
 
@@ -285,10 +288,10 @@ def test_two_writers_on_one_file_destroy_it(tmp_path):
     first.close()
     second.close()
 
-    archives = list((tmp_path / "X-USDT" / "raw").rglob("*.jsonl.gz"))
-    assert len(archives) == 1, "both wrote the same file"
-    recovered = list(iter_events(archives[0], warn=False))
-    assert len(recovered) < 40, "interleaved gzip members do not all survive"
+    archives = sorted((tmp_path / "X-USDT" / "raw").rglob("*.jsonl.gz"))
+    assert len(archives) == 2, "each writer has a file of its own"
+    recovered = [event for path in archives for event in iter_events(path, warn=False)]
+    assert len(recovered) == 40, "both survive - as duplicates, hence the lock"
 
 
 def test_a_second_poller_on_the_same_instrument_is_refused(tmp_path):

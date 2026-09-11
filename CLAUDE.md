@@ -54,7 +54,11 @@ through the same `OrderBook`/`TradeTape`/`FeatureEngine` as live. Merge a
 websocket channel's events on `(t, n)`. REST-polled channels (open-interest,
 mark-price) run in other processes whose `n` is unrelated, so as-of join them
 on `t` only. Never subscribe to less than you might later need: unrecorded
-data is gone.
+data is gone. A writer never appends to an existing file: a restart inside an
+hour writes `<channel>-<HH>.r001.jsonl.gz` beside it, because appending after
+a hard kill made the whole hour unreadable (2026-09-11). Read through
+`iter_events`, which resumes at the next gzip member past a torn one;
+`analysis/audit_raw.py` reports which hours were affected.
 
 **One directory per instrument, enforced.** Rows for two symbols are
 structurally identical, so layout is the only thing separating them.
@@ -63,9 +67,11 @@ structurally identical, so layout is the only thing separating them.
 instruments. Hyperliquid lives under `data/hyperliquid/<COIN>/` and
 `data/hyperliquid/_accounts/` precisely so BloFin tools cannot see it.
 
-**Two writers on one hourly gzip file destroy it** (measured: 0 of 40 records
-recoverable). Snapshot pollers (`trading/openinterest.py` `SnapshotPoller`,
-`markprice.py`) take an exclusive pid lock per instrument *per channel*;
+**One writer per channel per instrument.** Two writers used to share and
+destroy an hourly gzip file (measured: 0 of 40 records); files are now created
+exclusively, so a second writer would duplicate rather than destroy. Snapshot
+pollers (`trading/openinterest.py` `SnapshotPoller`, `markprice.py`) still
+take an exclusive pid lock per instrument *per channel*;
 `record_hyperliquid.py` locks the whole venue directory. Stale locks from dead
 pids are taken over.
 

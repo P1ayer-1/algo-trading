@@ -7,6 +7,11 @@ something the live bot never sees — a silent, very expensive discrepancy.
 
 import gzip
 import json
+import random
+import subprocess
+import sys
+import textwrap
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -15,6 +20,12 @@ from trading.features import FeatureEngine
 from trading.orderbook import OrderBook
 from trading.rawlog import RawEventLog, iter_directory, iter_events
 from trading.tape import TradeTape
+
+BACKEND = Path(__file__).resolve().parents[1]
+
+# Pinned so every child process writes into the same hour. Two runs straddling
+# an hour boundary would land in separate files and pass for the wrong reason.
+CLOCK = datetime(2026, 9, 11, 14, 13, tzinfo=timezone.utc).timestamp()
 
 
 def message(seq, price=100.0):
@@ -76,7 +87,7 @@ def test_files_are_split_per_channel(tmp_path):
     assert names == ["books", "trades"]
 
 
-def test_reopening_appends_rather_than_truncating(tmp_path):
+def test_reopening_in_the_same_hour_keeps_the_first_run(tmp_path):
     """A restart within the same hour must not destroy that hour's history."""
     first = RawEventLog(tmp_path)
     first.write("books", message(1))
@@ -104,6 +115,157 @@ def test_truncated_final_line_is_tolerated(tmp_path):
 
     recovered = list(iter_events(path))
     assert len(recovered) == 5  # the five good ones, no exception
+
+
+# ---------------------------------------------------------------------------
+# Hard kills: a real process, killed with no close() and no gzip trailer
+# ---------------------------------------------------------------------------
+
+
+def trade(index):
+    """A trade whose fields vary enough that gzip cannot flatten the stream.
+
+    Uniform messages would never fill a deflate block between flushes, and a
+    kill in the middle of a block is one of the tears being tested.
+    """
+    rng = random.Random(index)
+    return {
+        "arg": {"channel": "trades", "instId": "BTC-USDT"},
+        "data": [{"tradeId": str(rng.randrange(10 ** 12)),
+                  "price": f"{rng.uniform(100_000, 110_000):.1f}",
+                  "size": str(rng.randrange(1, 500)),
+                  "side": rng.choice(["buy", "sell"]),
+                  "ts": str(1_789_135_980_000 + index)}],
+    }
+
+
+WRITER = textwrap.dedent("""
+    import os, sys, time
+    backend, root, clock, first, count, unflushed, ending = sys.argv[1:8]
+    sys.path[:0] = [backend, os.path.join(backend, "tests")]
+    time.time = lambda: float(clock)
+    from trading.rawlog import RawEventLog
+    from test_rawlog import trade
+
+    first, count, unflushed = int(first), int(count), int(unflushed)
+    log = RawEventLog(root, flush_lines=1)
+    for index in range(first, first + count):
+        log.write("trades", trade(index))
+    log.flush()
+    # Then write without flushing, so what reaches disk ends mid-block.
+    log.flush_lines = 10 ** 9
+    for index in range(first + count, first + count + unflushed):
+        log.write("trades", trade(index))
+    if ending == "kill":
+        os._exit(0)   # no close(), no atexit, no trailer: a power cut
+    log.close()
+""")
+
+
+def run_writer(root, *, first, count, unflushed=0, ending="close"):
+    subprocess.run(
+        [sys.executable, "-c", WRITER, str(BACKEND), str(root), repr(CLOCK),
+         str(first), str(count), str(unflushed), ending],
+        check=True, timeout=120,
+    )
+
+
+def append_like_the_old_writer(path, messages):
+    """What `RawEventLog` did before 2026-09-11: `gzip.open(path, "at")`, a
+    new member on the end of whatever was there. Every archive hour written
+    before then that saw a restart after a crash looks like this."""
+    with gzip.open(path, "at", encoding="utf-8") as handle:
+        for n, message in enumerate(messages, start=1):
+            handle.write(json.dumps({"t": int(CLOCK * 1000), "n": n, "m": message},
+                                    separators=(",", ":")) + "\n")
+
+
+def test_a_hard_kill_then_a_restart_in_the_same_hour_loses_nothing(tmp_path):
+    """Reproduced 2026-09-11: this returned ZERO of ten records.
+
+    The first recorder flushes five trades and dies without closing, so its
+    gzip member has no trailer. The restart appended a second member to the
+    same file; reading ran through the torn member into the second's header,
+    raised, and gave up before yielding anything - including the five records
+    written before the crash. A power cut cost the whole hour, not its last
+    few seconds.
+    """
+    run_writer(tmp_path, first=0, count=5, ending="kill")
+    run_writer(tmp_path, first=5, count=5)
+
+    recovered = [m for _, _, m in iter_directory(tmp_path / "raw", "trades")]
+    assert recovered == [trade(i) for i in range(10)]
+
+
+def test_a_restart_never_appends_to_the_file_it_found(tmp_path):
+    """The crashed file stays byte-for-byte as the crash left it, and the
+    restart writes beside it under a name that sorts after it."""
+    run_writer(tmp_path, first=0, count=5, ending="kill")
+    (torn,) = (tmp_path / "raw").rglob("trades-*.jsonl.gz")
+    before = torn.read_bytes()
+
+    run_writer(tmp_path, first=5, count=5)
+
+    assert torn.read_bytes() == before
+    names = [p.name for p in sorted((tmp_path / "raw").rglob("trades-*.jsonl.gz"))]
+    assert names == ["trades-14.jsonl.gz", "trades-14.r001.jsonl.gz"]
+
+
+def test_archives_torn_by_the_old_appending_writer_are_recovered(tmp_path, capsys):
+    """History already on disk was written by the appending writer, so the
+    reader has to recover it - fixing the writer alone saves nothing past."""
+    run_writer(tmp_path, first=0, count=5, ending="kill")
+    (path,) = (tmp_path / "raw").rglob("trades-*.jsonl.gz")
+    append_like_the_old_writer(path, [trade(i) for i in range(5, 10)])
+
+    assert [m for _, _, m in iter_events(path)] == [trade(i) for i in range(10)]
+    assert path.name in capsys.readouterr().err   # said, not papered over
+
+
+# Unflushed trades before the kill. With this file's `trade()`, a decoder that
+# only resynchronises on a zlib error: 3000 swallows the appended member
+# whole, 4000 decodes 37 bytes past its header, and 8000 does both and also
+# completes the torn last line into a well-formed record with the wrong
+# contents. A different zlib may tear elsewhere; the assertions hold anyway.
+MID_BLOCK_KILLS = (3000, 4000, 8000)
+
+
+@pytest.mark.parametrize("unflushed", MID_BLOCK_KILLS)
+def test_a_kill_mid_block_invents_nothing_and_loses_no_later_member(tmp_path, unflushed):
+    """Killed between flushes, the torn member ends inside a deflate block.
+
+    Measured 2026-09-11 over 30 such kills (1,000 to 30,000 unflushed trades):
+    decoding carried on through the next member's bytes as if they continued
+    the block. In 13 it never raised at all, silently swallowing the member a
+    restart appended. In 2 it completed the torn last line into a well-formed
+    record carrying the next sequence number and the wrong contents, which no
+    ordering check could catch. So a record may only come from bytes before
+    the next real gzip header.
+    """
+    run_writer(tmp_path, first=0, count=1000, unflushed=unflushed, ending="kill")
+    (path,) = (tmp_path / "raw").rglob("trades-*.jsonl.gz")
+    later = [{"after": n} for n in range(100)]
+    append_like_the_old_writer(path, later)
+
+    recovered = [m for _, _, m in iter_events(path, warn=False)]
+    torn = [m for m in recovered if "after" not in m]
+    assert recovered == torn + later          # nothing lost after the tear
+    assert len(torn) >= 1000                  # everything flushed survives
+    assert torn == [trade(i) for i in range(len(torn))]   # nothing invented
+
+
+def test_a_file_still_being_written_yields_what_has_been_flushed(tmp_path, capsys):
+    """The current hour is an unterminated gzip stream for as long as it is
+    recorded, and analysis runs while recording continues."""
+    log = RawEventLog(tmp_path, flush_lines=1)
+    try:
+        for index in range(5):
+            log.write("trades", trade(index))
+        path = next((tmp_path / "raw").rglob("trades-*.jsonl.gz"))
+        assert [m for _, _, m in iter_events(path)] == [trade(i) for i in range(5)]
+        assert path.name in capsys.readouterr().err
+    finally:
+        log.close()
 
 
 def test_compression_actually_helps(tmp_path):

@@ -74,6 +74,30 @@ Two things to know before training on it:
   trained to predict 3bps moves against a 10bps round trip is being trained to
   lose money.
 
+### The raw archive survives a hard kill
+
+`rawlog.py` writes `data/<INST-ID>/raw/<day>/<channel>-<HH>.jsonl.gz`, and a
+second process in the same hour writes `<channel>-<HH>.r001.jsonl.gz` beside
+it instead of appending. Files are created exclusively (`gzip.open(path,
+"xt")`), so no file ever holds more than one process's output and a tear can
+only be at the end of one.
+
+A power cut is why. Appending after a hard kill put a trailerless gzip member
+in front of the restart's, and the reader - which decoded straight through
+the tear - returned 0 of 10 records for that hour in the 2026-09-11
+reproduction, including the ones from before the crash. `iter_events` now
+decodes member by member and stops feeding each one at the next real gzip
+header, so hours written the old way read back in full. Stopping *at* the
+header is the part that matters: a decoder that only resynchronises when zlib
+raises never raised at all in 13 of 30 measured mid-block kills, swallowing
+the next member whole, and twice completed the torn line into a well-formed
+record with the wrong contents.
+
+Appending only when the existing file had ended cleanly was the alternative,
+and was rejected on cost: the check is a full decode, 0.78s for a 39.3 MB
+books hour, on the event loop, per channel per instrument per restart.
+`analysis/audit_raw.py` reports which archived hours the old reader cut short.
+
 ## Liquidation math — verify before trusting
 
 `liquidation_price()` implements the standard flat-MMR linear-perp formula
@@ -220,6 +244,10 @@ python -m pytest
   nothing else, which is what makes it safe to start against a recorder that
   is already holding `books-*.jsonl.gz` open. Also: a failed poll is counted,
   never raised.
+- `test_rawlog.py` — hard kills with real processes and `os._exit`: a crash
+  then a restart in the same hour must read back every record, a restart must
+  never append to the file it found, and a kill mid-block must neither invent
+  a record nor lose the member written after it.
 
 ## A silent feed is worse than a crashed one
 
