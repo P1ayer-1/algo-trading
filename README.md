@@ -106,7 +106,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (747 tests)
+│   └── tests/                 # pytest suite (758 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
