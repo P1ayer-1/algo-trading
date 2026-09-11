@@ -1325,9 +1325,34 @@ ecord.py` runs N instruments headless in one process.
    the top hundred, unfetchable because the archive path is the symbol
    verbatim, one of which sat sixth by volume and ended the first run.
 
+   **Then the sample was expanded 30x, and the centre signal disappeared.**
+   35 symbols with a full five years, 454,305 rows, **18,922 independent
+   windows** against 1,080:
+
+   | | ten majors, one year | 35 symbols, five years |
+   |---|---|---|
+   | centre IC | +0.064 (t 2.12) | **+0.011** (t 1.55) |
+   | control ceiling | +0.062 | +0.039 |
+   | symbols positive | 8/10 | 21/35 |
+
+   More data made the apparent skill *shrink toward zero*, which is what a
+   small-sample draw does and is the opposite of what a real effect does. The
+   ten-major +0.064 was noise that happened to point one way, and it never
+   separated from its control even then.
+
+   That settles the question the expansion was built to answer: **the sample
+   was not the binding constraint.** The data now resolves an IC of ~0.015 at
+   two standard errors, break-even is 0.177, and the measurement is 0.011 —
+   an order of magnitude short, with the error bars to say so. A bigger model
+   over these features is not searching for a signal too faint to fit; it is
+   searching where this says there is nothing, and the harness makes that
+   claim cheap to overturn rather than merely asserted.
+
    What this does not settle: `contained` has never been converted into money,
-   which needs the gated backtest rather than an IC, and no larger model has
-   been run against the bar yet. Making that cheap is what the harness is for.
+   which needs the gated backtest rather than an IC; the features are bar-level
+   only, so nothing here speaks to order flow, the liquidation map or news; and
+   no larger model has been run against the bar yet. Making that cheap is what
+   the harness is for.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
