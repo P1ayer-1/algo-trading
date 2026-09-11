@@ -1331,14 +1331,20 @@ ecord.py` runs N instruments headless in one process.
 
    | | ten majors, one year | 35 symbols, five years |
    |---|---|---|
-   | centre IC | +0.064 (t 2.12) | **+0.011** (t 1.55) |
-   | control ceiling | +0.062 | +0.039 |
+   | **centre** IC | +0.064 (t 2.12) | **+0.011** (t 1.55) |
+   | its control ceiling | +0.062 | +0.039 |
    | symbols positive | 8/10 | 21/35 |
+   | **contained** IC | +0.242 (t 8.19) | **+0.267** (t 38.0) |
+   | its control ceiling | +0.134 | +0.098 |
+   | symbols positive | 10/10 | **35/35** |
 
-   More data made the apparent skill *shrink toward zero*, which is what a
-   small-sample draw does and is the opposite of what a real effect does. The
+   **The two targets moved in opposite directions, and that contrast is the
+   result.** More data made the centre skill *shrink toward zero* — what a
+   small-sample draw does, and the opposite of what a real effect does. The
    ten-major +0.064 was noise that happened to point one way, and it never
-   separated from its control even then.
+   separated from its control even then. `contained` did the reverse: it held,
+   strengthened slightly, and came back positive on **every one of 35
+   symbols**, far clear of its control.
 
    That settles the question the expansion was built to answer: **the sample
    was not the binding constraint.** The data now resolves an IC of ~0.015 at
