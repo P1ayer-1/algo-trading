@@ -129,6 +129,12 @@ def rank_symbols(payload: Sequence[dict], *, top: int, quote: str = "USDT",
         symbol = str(row.get("symbol", ""))
         if not symbol.endswith(quote) or "_" in symbol:
             continue
+        if not (symbol.isascii() and symbol.isalnum()):
+            # Binance lists meme perps under CJK tickers - four of the top
+            # hundred on 2026-09-11. The archive path is the symbol verbatim,
+            # and a non-ASCII path cannot be encoded into an HTTP request line,
+            # so these are unfetchable rather than merely unusual.
+            continue
         if allowed is not None and symbol not in allowed:
             continue
         try:
@@ -275,10 +281,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     reports: List[Coverage] = []
+    failures: List[str] = []
     downloaded = cached = 0
     for index, symbol in enumerate(symbols, start=1):
         fetcher = Fetcher(args.cache / symbol, workers=args.workers)
-        fetcher.fetch_all(kline_urls(symbol, days, "klines", args.interval))
+        try:
+            fetcher.fetch_all(kline_urls(symbol, days, "klines", args.interval))
+        except Exception as exc:  # noqa: BLE001
+            # One symbol must not end a run of a hundred: the archive is the
+            # slow half, and whatever arrived before the failure is still on
+            # disk and still counted by coverage_of below.
+            failures.append(f"{symbol}: {type(exc).__name__}: {exc}")
+            print(f"  [{index:>3}/{len(symbols)}] {symbol:<14}FAILED "
+                  f"({type(exc).__name__}) - continuing", flush=True)
         downloaded += fetcher.downloaded
         cached += fetcher.cached
         report = coverage_of(args.cache, symbol, days, args.interval)
@@ -298,6 +313,10 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"{total_mb / 1000:.1f} GB on disk")
     print(f"  {len(full)} symbol(s) cover the whole period; {len(partial)} cover "
           f"under half of it")
+    if failures:
+        print(f"  {len(failures)} symbol(s) failed:")
+        for failure in failures[:10]:
+            print(f"    {failure}")
     if partial:
         names = ", ".join(f"{report.symbol} ({report.share:.0%})" for report in partial[:10])
         print(f"    thin: {names}")

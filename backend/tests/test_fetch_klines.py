@@ -152,3 +152,13 @@ def test_exchange_info_without_symbols_is_refused():
     empty = json.dumps({"symbols": []}).encode()
     with pytest.raises(SystemExit):
         fetch_exchange_info(opener=lambda url: empty)
+
+
+def test_symbols_that_cannot_form_an_archive_url_are_excluded():
+    """Binance lists meme perps under CJK tickers. The archive path is the
+    symbol verbatim, so a non-ASCII name cannot be encoded into a request line
+    - and on 2026-09-11 one of them sat sixth by volume and ended the run."""
+    payload = PAYLOAD + [{"symbol": "\u725b\u6765USDT", "quoteVolume": "99000000000"}]
+    ranked = rank_symbols(payload, top=5)
+    assert ranked[0] == "BTCUSDT"
+    assert all(symbol.isascii() for symbol in ranked)
