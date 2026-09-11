@@ -111,8 +111,9 @@ DEFAULT_TIMEOUT_SECONDS = 15.0
 USER_AGENT = "blofin-recorder/1.0"
 
 
-def fetch_open_interest(
+def fetch_snapshot(
     *,
+    path: str,
     base_url: str = PRODUCTION_BASE_URL,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     opener: Optional[Callable[..., Any]] = None,
@@ -126,7 +127,7 @@ def fetch_open_interest(
     Raises on transport failure; the caller decides whether that is fatal
     (it is not - see `poll_once`).
     """
-    url = base_url.rstrip("/") + OPEN_INTEREST_PATH
+    url = base_url.rstrip("/") + path
     request = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": USER_AGENT},
@@ -198,14 +199,23 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-class OpenInterestPoller:
-    """Polls open interest for a set of instruments and archives the changes.
+class SnapshotPoller:
+    """Polls one batch market endpoint and archives whatever moved.
+
+    Subclasses set `CHANNEL` and `PATH`; everything else - the per-instrument
+    logs, the `ts` dedupe, the exclusive lock, the never-raise polling loop -
+    is the same problem whatever the endpoint returns. The lock is named after
+    the CHANNEL, so two pollers on different channels coexist on the same
+    instrument and two on the same channel still cannot.
 
     One poller serves any number of instruments, because one request covers
     the whole venue. Each instrument gets its own `RawEventLog` under
     `data/<INST-ID>/raw/`, so the per-instrument isolation that `record.py`
     exists to enforce holds here too: no shared file, ever.
     """
+
+    CHANNEL: str = ""
+    PATH: str = ""
 
     def __init__(
         self,
@@ -232,7 +242,7 @@ class OpenInterestPoller:
             inst_id: RawEventLog(
                 self.data_root / inst_id,
                 enabled=enabled,
-                channels={CHANNEL},
+                channels={self.CHANNEL},
                 # One row a minute: buffering 200 lines would hold the newest
                 # three hours of a cheap series in memory for no gain.
                 flush_lines=1,
@@ -281,12 +291,13 @@ class OpenInterestPoller:
         claimed: List[Path] = []
         try:
             for inst_id in inst_ids:
-                path = self.data_root / inst_id / "raw" / ".open-interest.lock"
+                path = (self.data_root / inst_id / "raw"
+                        / f".{self.CHANNEL}.lock")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 owner = _lock_owner(path)
                 if owner is not None and _pid_alive(owner):
                     raise SystemExit(
-                        f"Open interest for {inst_id} is already being "
+                        f"{self.CHANNEL} for {inst_id} is already being "
                         f"recorded by pid {owner}.\n"
                         f"Two pollers on one instrument corrupt the hour's "
                         f"archive beyond recovery -\nmeasured, not theorised. "
@@ -314,6 +325,24 @@ class OpenInterestPoller:
                 path.unlink(missing_ok=True)
         self._locks = []
 
+    # ---- what a subclass supplies ----------------------------------------
+
+    def fetch(self) -> List[Dict[str, Any]]:
+        """Every instrument's current value for this channel, in one request."""
+        return fetch_snapshot(
+            path=self.PATH,
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+            opener=self.opener,
+        )
+
+    def as_message(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Wrap a REST row in the websocket envelope the archive uses."""
+        return {
+            "arg": {"channel": self.CHANNEL, "instId": row.get("instId")},
+            "data": [row],
+        }
+
     # ---- polling ---------------------------------------------------------
 
     def poll_once(self, *, on_log: Optional[Callable[[str], Any]] = None) -> int:
@@ -325,16 +354,12 @@ class OpenInterestPoller:
         """
         self.polls += 1
         try:
-            rows = fetch_open_interest(
-                base_url=self.base_url,
-                timeout=self.timeout_seconds,
-                opener=self.opener,
-            )
+            rows = self.fetch()
         except Exception as exc:
             self.failures += 1
             if on_log:
-                on_log("[open-interest] poll failed: {0}: {1}".format(
-                    type(exc).__name__, exc))
+                on_log("[{0}] poll failed: {1}: {2}".format(
+                    self.CHANNEL, type(exc).__name__, exc))
             return 0
 
         self.last_success_at = time.time()
@@ -356,8 +381,9 @@ class OpenInterestPoller:
             # would otherwise fill the log with the same line every 20s.
             self._warned_missing.add(inst_id)
             if on_log:
-                on_log("[open-interest] {0} absent from the response - "
-                       "delisted, or a typo in the instrument list.".format(inst_id))
+                on_log("[{0}] {1} absent from the response - delisted, "
+                       "or a typo in the instrument list.".format(
+                           self.CHANNEL, inst_id))
 
         written = 0
         for inst_id, row in wanted.items():
@@ -365,7 +391,7 @@ class OpenInterestPoller:
             if ts and ts == self._last_ts.get(inst_id):
                 continue  # same minute, already archived
             self._last_ts[inst_id] = ts
-            self.logs[inst_id].write(CHANNEL, as_message(row))
+            self.logs[inst_id].write(self.CHANNEL, self.as_message(row))
             written += 1
         return written
 
@@ -400,3 +426,26 @@ class OpenInterestPoller:
                 else time.time() - self.last_success_at
             ),
         }
+
+
+class OpenInterestPoller(SnapshotPoller):
+    """Open interest, polled every 20s and written once a minute.
+
+    The endpoint publishes on the minute and ~15s late, so 20s spacing gives
+    three chances to catch each minute's value and the `ts` dedupe throws the
+    duplicates away. One timed-out request therefore costs nothing.
+    """
+
+    CHANNEL = CHANNEL
+    PATH = OPEN_INTEREST_PATH
+
+
+def fetch_open_interest(
+    *,
+    base_url: str = PRODUCTION_BASE_URL,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    opener: Optional[Callable[..., Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Every instrument's current open interest, in one request."""
+    return fetch_snapshot(path=OPEN_INTEREST_PATH, base_url=base_url,
+                          timeout=timeout, opener=opener)

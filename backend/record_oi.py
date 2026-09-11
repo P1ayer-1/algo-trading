@@ -56,6 +56,7 @@ from server import log, supervise  # noqa: E402
 from trading.openinterest import (  # noqa: E402
     DEFAULT_POLL_SECONDS,
     OpenInterestPoller,
+    SnapshotPoller,
     PRODUCTION_BASE_URL,
 )
 
@@ -90,27 +91,44 @@ def running_recorder_instruments() -> Optional[List[str]]:
     return None
 
 
-async def run(poller: OpenInterestPoller) -> None:
-    log("Polling open interest every "
+# What each channel's cadence actually means, so the banner cannot claim the
+# wrong thing about whichever one is running.
+CADENCE_NOTE = {
+    "open-interest":
+        "  One request covers every instrument; rows are written only when "
+        "the exchange's\n  minute-stamped value actually changes, so this is "
+        "one row per instrument per minute.",
+    "mark-price":
+        "  One request covers every instrument. This series publishes "
+        "CONTINUOUSLY rather\n  than on a boundary, so the poll interval IS "
+        "the sample rate - and it carries both\n  mark and index price, whose "
+        "difference is the basis nothing else here observes.",
+}
+
+
+async def run(poller: SnapshotPoller) -> None:
+    channel = poller.CHANNEL
+    log(f"Polling {channel} every "
         f"{poller.poll_seconds:.0f}s for {len(poller.instruments)} "
         "instrument(s).")
-    log("  One request covers every instrument; rows are written only when "
-        "the exchange's\n  minute-stamped value actually changes, so this is "
-        "one row per instrument per minute.")
+    note = CADENCE_NOTE.get(channel)
+    if note:
+        log(note)
     for inst_id in poller.instruments:
         log(f"  {inst_id:<18} -> {poller.data_root / inst_id / 'raw'}")
     log("Different channel from books/trades, so a live record.py's feed "
         "files are untouched.")
-    log("  A second OI poller on the same instrument is refused: two of them "
-        "destroy the\n  hour's file rather than duplicating it.")
+    log(f"  A second {channel} poller on the same instrument is refused: two "
+        f"of them destroy\n  the hour's file rather than duplicating it. A "
+        f"poller on a DIFFERENT channel is fine.")
 
     try:
         # Supervised for the same reason every other loop here is: a dropped
         # HTTP connection must not end an overnight collection run.
-        await supervise("open-interest", lambda: poller.run(on_log=log))
+        await supervise(channel, lambda: poller.run(on_log=log))
     finally:
         poller.close()
-        log(f"Open interest poller closed. {poller.rows_written} row(s) "
+        log(f"{channel} poller closed. {poller.rows_written} row(s) "
             f"written, {poller.failures} failed poll(s).")
 
 
@@ -125,8 +143,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Take the instrument list from a record.py already running on "
              "this machine, so the two cannot drift apart.")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
-    parser.add_argument("--poll-seconds", type=float,
-                        default=DEFAULT_POLL_SECONDS)
+    parser.add_argument(
+        "--channel", default="open-interest",
+        choices=["open-interest", "mark-price"],
+        help="Which market snapshot to poll. mark-price carries BOTH mark "
+             "and index price, and has no websocket channel at all - REST is "
+             "the only route to it. Safe to run alongside an open-interest "
+             "poller on the same instrument: the exclusive lock is named "
+             "after the channel.")
+    parser.add_argument("--poll-seconds", type=float, default=None,
+                        help="Default: 20s for open-interest (it publishes "
+                             "once a minute), 10s for mark-price (it "
+                             "publishes continuously, so this is the "
+                             "sample rate).")
     parser.add_argument("--base-url", default=PRODUCTION_BASE_URL)
     parser.add_argument(
         "--once", action="store_true",
@@ -161,12 +190,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             "response.\nNothing to do."
         )
 
-    poller = OpenInterestPoller(
+    if args.channel == "mark-price":
+        from trading.markprice import DEFAULT_POLL_SECONDS as MARK_POLL_SECONDS
+        from trading.markprice import MarkPricePoller
+
+        factory, default_poll = MarkPricePoller, MARK_POLL_SECONDS
+    else:
+        factory, default_poll = OpenInterestPoller, DEFAULT_POLL_SECONDS
+
+    poller = factory(
         instruments,
         data_dir=args.data_dir,
         base_url=args.base_url,
-        poll_seconds=args.poll_seconds,
+        poll_seconds=(default_poll if args.poll_seconds is None
+                      else args.poll_seconds),
     )
+    log(f"Polling {args.channel} for {len(instruments)} instrument(s) "
+        f"every {poller.poll_seconds:g}s.")
 
     if args.once:
         written = poller.poll_once(on_log=log)

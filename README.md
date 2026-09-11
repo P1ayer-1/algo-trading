@@ -52,7 +52,7 @@ first. Recording is therefore step one, not step four.
 ├── backend/
 │   ├── live-chart.py        # entrypoint: chart + one instrument's recorder
 │   ├── record.py             # entrypoint: N instruments, headless, no ports
-│   ├── record_oi.py          # entrypoint: open interest, alongside a live run
+│   ├── record_oi.py          # entrypoint: OI or mark-price, alongside a live run
 │   ├── plan_carry.py         # entrypoint: what a carry WOULD do. Sends nothing.
 │   ├── run_carry.py          # entrypoint: opens it. Dry unless --confirm.
 │   ├── monitor_carry.py      # entrypoint: scores an open carry. Sends nothing.
@@ -69,6 +69,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── recorder.py        # labelled feature rows -> CSV
 │   │   ├── ingest.py          # live book/trade websocket loop
 │   │   ├── openinterest.py    # OI poller — the input for others' liquidation levels
+│   │   ├── markprice.py       # mark + index price — the basis, REST-only
 │   │   ├── rawlog.py          # raw event archive (gzipped JSONL)
 │   │   ├── margin_tiers.py    # MMR for a size, from the account's own host
 │   │   ├── risk.py            # liquidation math, sizing, hard limits
@@ -117,6 +118,50 @@ first. Recording is therefore step one, not step four.
 into the other modules. If you're reading this codebase for the first time,
 read the backend files in the order listed above (config → market_data →
 support_resistance → state → server → live-chart.py).
+
+### What is actually recorded, and what cannot be recovered later
+
+Two layers, and the difference between them decides what is urgent:
+
+**The raw archive** (`data/<INST-ID>/raw/<day>/<channel>-<HH>.jsonl.gz`) holds
+every message unmodified, wrapped with a local receive time and a per-process
+counter: `{"t":…,"n":…,"m":{…}}`. Channels: `books`, `trades`, `funding-rate`
+over websocket, plus `open-interest` and `mark-price` polled over REST. About
+**1.35 GB/day across 15 instruments**.
+
+**The feature CSV** is a derived, deliberately lossy 1-second sample — 31
+features plus `fwd_ret_bps_{300,900,1800}s` and their labels. `replay.py`
+rebuilds it from raw with different parameters, so nothing in it is a
+commitment.
+
+The horizons are **seconds**: 5, 15 and 30 minutes. They used to be 1/5/30
+*seconds*, and that was the reason the bot could not work — measured on
+BTC-USDT, σ of the forward move is 0.45 bps at 1s and 2.41 bps at 30s against
+a 1.2–10 bps round trip, so at 30 seconds an oracle with perfect knowledge of
+the sign still loses money at taker fees. See `config.py` for the full
+calculation. Consequence: **nothing lands on disk for the first 30 minutes**
+after a restart, because a row cannot be written until its forward window
+closes.
+
+Anything derived can be recomputed from raw; anything never subscribed is
+gone for good. That asymmetry is why `mark-price` was added (2026-09-10):
+BloFin's public websocket refuses `mark-price`, `index-price`,
+`index-tickers`, `open-interest`, `price-limit` and `liquidation-orders` with
+`60012 Invalid request`, and its `tickers` channel carries only top-of-book,
+last trade and 24h stats — all of which `books` and `trades` already provide.
+`GET /api/v1/market/mark-price` returns mark **and** index together for all
+486 instruments in one request, and has no history endpoint. Mark minus the
+traded book is the basis: the `conv` cost `funding_carry.py` already prices,
+and the price a carry's liquidation is actually struck against.
+
+```
+python backend\record_oi.py --channel mark-price --match-running
+```
+
+Safe to start against a recorder that is already days in — different channel,
+different file, and the exclusive lock is named after the channel, so it
+coexists with an open-interest poller and still refuses a second mark-price
+one.
 
 ### Strategies: three verbs, and why they are separate files
 
