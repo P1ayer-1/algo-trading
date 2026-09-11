@@ -865,6 +865,55 @@ minutes instead of waiting days to collect one.
 
 ---
 
+## audit_raw.py — which archived hours a crash cut short
+
+```
+python backend\analysis\audit_raw.py
+python backend\analysis\audit_raw.py --verify
+```
+
+Read-only; safe against a live recorder. Until 2026-09-11 a restart inside an
+hour appended to that hour's file, and if the run before it had been
+hard-killed, the reader stopped at the trailerless gzip member and returned
+nothing after it — 0 of 10 records in the reproduction. The reader now
+recovers every member (`trading/rawlog.py`). This reports which hours that
+changes, and by how much.
+
+Run 2026-09-11 over all of `data/`: 3,555 files, 3,074 MB, 817s with
+`--verify`.
+
+| | files |
+|---|---|
+| clean, every member terminated | 3,357 |
+| unterminated last member only (75 of them still being recorded) | 194 |
+| torn member before the end — the old reader stopped early | **4** |
+
+| file | old reader | new reader |
+|---|---|---|
+| `BTC-USDT/raw/2026-09-09/books-01.jsonl.gz` | 5,832 | 10,728 |
+| `BTC-USDT/raw/2026-09-09/trades-01.jsonl.gz` | 525 | 946 |
+| `BTC-USDT/raw/2026-09-09/funding-rate-01.jsonl.gz` | 44 | 116 |
+| `BTC-USDT/raw/2026-09-11/open-interest-01.jsonl.gz` | 0 | 8 |
+
+**5,397 records recovered.** The three 2026-09-09 files are one incident: a
+run that died after 01:30:59 UTC and a restart at 01:33:38 that appended. Any
+replay of that hour silently lost the restart's 26 minutes of BTC-USDT book,
+trades and funding, and the last 4 to 18 records before the tear as well,
+because the read that raised took them with it. `--verify` read every file
+with both readers; on the other 3,551 they agree record for record.
+
+The open-interest hour is a different failure, and only partly recovered. The
+original poller (sequence 1861 onward) kept running while a second process
+appended a one-record member at 01:07:01 and closed, so the poller's later
+flushes landed *after* that member as headerless deflate continuing its own
+stream. The reader skips those 1,322 bytes and reports them as `junk`. Fed by
+hand to the torn member's decoder they decode cleanly — 40 more rows,
+01:07:30 to 01:44:20, where the stream ends unterminated — but that is two
+live writers interleaving, not a crash and a restart. Exclusive file creation
+now makes it impossible to write, so the recovery is not built in.
+
+---
+
 ## compact.py — Parquet conversion and storage report
 
 ```

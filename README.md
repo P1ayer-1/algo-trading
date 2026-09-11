@@ -431,6 +431,18 @@ intact. Worth knowing the shape of the loss, though: the raw archive is the
 irreplaceable half, and a crash is only ever as expensive as the time before
 someone notices.
 
+A *hard* kill turned out to cost more than that. Until 2026-09-11 a restart
+inside an hour appended to that hour's archive file, and the reader, meeting
+the killed run's trailerless gzip member, gave up there - losing the
+restart's records and the last few before the tear. `backend\analysis\audit_raw.py`
+over all 3,555 archive files found it had happened once: BTC-USDT, 2026-09-09
+01:00 UTC, a run that died after 01:30:59 and restarted at 01:33:38. The
+reader returned 6,401 records for that hour's books, trades and funding
+against 11,790 on disk. Both halves are fixed in `backend/trading/rawlog.py` -
+files are created exclusively, and the reader recovers every member - and one
+more file, an open-interest hour on 2026-09-11 where two live writers
+interleaved, is partly recovered (see `backend/analysis/README.md`).
+
 The other half of that lesson — a *stalled* feed, TCP still open and no
 messages arriving — is now handled too. It was the more dangerous of the two,
 because it raises nothing: `supervise` restarts loops that fail, and a loop
