@@ -1360,6 +1360,60 @@ ecord.py` runs N instruments headless in one process.
    no larger model has been run against the bar yet. Making that cheap is what
    the harness is for.
 
+9m. ~~**Gate the fade on the one signal that survived**~~ —
+   `backend\analysis\range_gated.py`. `contained` was the only target left
+   standing: IC +0.267 on 35 symbols over five years, positive on every one of
+   them. An IC is not money, so this converts it — the fade run twice over the
+   same out-of-sample bars, once ungated and once with entries allowed only
+   where the model says the range holds.
+
+   ```
+   python backend\analysis\range_gated.py --keep 0.5
+   ```
+
+   **Gating on it makes the fade worse.** Ten majors over a year: −24.2 bps
+   per trade gated against −9.2 ungated, all ten symbols degraded, and worse
+   than a control gate that trades as little at shuffled times (−11.8). On 35
+   symbols over five years, 49,056 trades:
+
+   | | bps per trade | 95%, whole-day blocks | trades |
+   |---|---|---|---|
+   | ungated | **−7.7** | [−13.3, −2.3] | 49,056 |
+   | gated | −10.6 | [−21.7, −0.3] | 19,717 |
+   | control gate | −7.2 | [−13.6, −1.2] | 35,496 |
+
+   **Why, and it is close to tautological:** predicted containment correlates
+   **+0.70 with the range WIDTH** at entry. The model learned that wide ranges
+   hold — true, and useless, because width was already measured at −15.9 bps
+   *when known perfectly*. Sorting the out-of-sample trades by prediction:
+
+   | quintile | range width | net bps | time exits | mean hold |
+   |---|---|---|---|---|
+   | lowest | 217 bps | −2.6 | 1% | 3.2h |
+   | middle | 355 bps | −6.2 | 5% | 5.6h |
+   | highest | 646 bps | −16.1 | 14% | 10.2h |
+
+   A wide range takes longer to traverse, so it reaches the time stop 14x more
+   often and pays taker to get out. The gate was not selecting sideways
+   markets; it was selecting big ranges.
+
+   **The by-product is the firmer result.** Step 9k could only say the fade was
+   not distinguishable from zero on one year of ten majors. Over five years and
+   35 symbols the ungated fade is **−7.7 bps per trade with an interval that
+   excludes zero**. It loses money, and now there are error bars saying so.
+
+   So all three things a range model could forecast are priced: the centre is
+   unpredictable (IC +0.011, under its own control), the width is predictable
+   and worth less than nothing, and containment is predictable, largely a
+   restatement of width, and loses more when traded. That is the case against
+   this strategy closed from three directions rather than one — and the harness
+   is what makes the next candidate cheap to test instead of cheap to argue
+   about.
+
+   `simulate` gained an optional entry gate for this. Exits are deliberately
+   never gated: a gate that could strand an open position is a far worse
+   instrument than one that declines to open another.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
