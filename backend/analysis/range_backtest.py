@@ -391,12 +391,20 @@ class Trades:
 
 def simulate(ohlc: Ohlc, rolling: RollingRange, params: RangeParams, costs: Costs,
              *, optimistic: bool, leverage: float,
-             start: int = 0, end: Optional[int] = None) -> Trades:
+             start: int = 0, end: Optional[int] = None,
+             allow: Optional[np.ndarray] = None) -> Trades:
     """Run one configuration over one series. One position at a time.
 
     Entries are considered on bars [start, end); exits may run past `end`.
     Levels freeze at entry - a stop that follows a moving range is a
     different strategy.
+
+    `allow` gates ENTRIES bar by bar: a model saying WHEN to run the fade,
+    without touching where the levels sit. Exits are deliberately not gated -
+    a position already open is managed to its stop, target or time stop
+    whatever the gate says next, because a gate that could strand a position
+    is a different and much worse instrument than one that declines to open
+    another.
     """
     n = len(ohlc)
     end = n if end is None else min(end, n)
@@ -412,6 +420,8 @@ def simulate(ohlc: Ohlc, rolling: RollingRange, params: RangeParams, costs: Cost
         ok = rolling.valid & (width > 0) & (rolling.width_bps >= params.min_width_bps)
         if params.max_trend_ratio is not None:
             ok &= rolling.trend_ratio <= params.max_trend_ratio
+        if allow is not None:
+            ok = ok & allow
         long_entry = low + params.entry_frac * width
         short_entry = high - params.entry_frac * width
         # Resting only: the bar must OPEN on the far side of the level, or an

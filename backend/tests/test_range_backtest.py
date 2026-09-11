@@ -444,3 +444,45 @@ def test_sideways_now_ranks_a_flat_stretch_against_the_trend_before_it():
     assert s["windows"] == 5
     # the other four windows each travelled edge to edge (ratio 1.0)
     assert s["trend_pctile"] == pytest.approx(0.2)
+
+
+# ---------------------------------------------------------------------------
+# The entry gate
+# ---------------------------------------------------------------------------
+
+
+def test_a_closed_gate_removes_the_entry():
+    """A model that says WHEN to fade acts by declining to open, and it must
+    not reach into the levels: same range, same bars, one fewer trade."""
+    rows = RANGE + [LONG_FILL, (99.3, 100.1, 99.25, 100.0)] + QUIET
+    ohlc = make_ohlc(rows)
+    params = RangeParams(lookback_minutes=4, entry_frac=0.1, stop_frac=0.25,
+                         target_frac=0.5, hold_minutes=10, min_width_bps=50.0)
+    costs = Costs(maker_bps=1.0, taker_bps=5.0, slippage_bps=0.0, through_bps=1.0)
+    rolling = RollingRange.build(ohlc, 4)
+
+    shut = np.ones(len(ohlc), dtype=bool)
+    shut[4] = False           # the bar the entry would have filled on
+    assert len(simulate(ohlc, rolling, params, costs, optimistic=False,
+                        leverage=5.0)) == 1
+    assert len(simulate(ohlc, rolling, params, costs, optimistic=False,
+                        leverage=5.0, allow=shut)) == 0
+
+
+def test_a_gate_that_shuts_after_entry_does_not_strand_the_position():
+    """Exits are never gated. A gate that could hold a position open past its
+    stop would be a far more dangerous instrument than one that declines to
+    open another."""
+    rows = RANGE + [LONG_FILL, (99.0, 99.1, 98.4, 98.6)] + QUIET
+    ohlc = make_ohlc(rows)
+    params = RangeParams(lookback_minutes=4, entry_frac=0.1, stop_frac=0.25,
+                         target_frac=0.5, hold_minutes=10, min_width_bps=50.0)
+    costs = Costs(maker_bps=1.0, taker_bps=5.0, slippage_bps=0.0, through_bps=1.0)
+    allow = np.zeros(len(ohlc), dtype=bool)
+    allow[4] = True           # open on bar 4, shut for every bar after it
+
+    trades = simulate(ohlc, RollingRange.build(ohlc, 4), params, costs,
+                      optimistic=False, leverage=5.0, allow=allow)
+    reason, exit_index, net = only(trades)
+    assert reason == STOP and exit_index == 5
+    assert net == pytest.approx(-76.56452, abs=1e-4)
