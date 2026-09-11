@@ -97,13 +97,16 @@ first. Recording is therefore step one, not step four.
 │   │   ├── funding_carry.py   # long spot + short perp: does funding pay?
 │   │   ├── carry_backtest.py  # the same position, run from every entry
 │   │   ├── range_backtest.py  # fade the range: bracketed 1m fills vs a shuffled-day control
+│   │   ├── range_information.py  # what a forecast range is worth: centre vs width
+│   │   ├── range_harness.py   # the bar every range model is scored on
+│   │   ├── fetch_klines.py    # bulk 1m klines, with the listing dates made visible
 │   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (702 tests)
+│   └── tests/                 # pytest suite (747 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -1241,6 +1244,81 @@ ecord.py` runs N instruments headless in one process.
    No planner or executor was built. The plan/execute/monitor split exists so
    that order code is asked for after the evidence, and the evidence is
    negative.
+
+9l. ~~**Price the forecast before building it**~~ —
+   `backend\analysis\range_information.py`, `backend\analysis\range_harness.py`
+   and `backend\analysis\fetch_klines.py`. Step 9k's fade lost money, and the
+   obvious rescue is to forecast the range with a model. This prices that
+   forecast before anyone builds one.
+
+   ```
+   python backend\analysis\range_information.py
+   python backend\analysis\range_harness.py --target centre --model ridge
+   ```
+
+   The fade is fed a range interpolated in log space between the trailing
+   range (no information) and the true future 24h high/low (perfect
+   information), with the centre and the width dialled in separately. Five
+   majors, a year of 1m bars, pessimistic fills, VIP 1:
+
+   | centre known | width known | bps per trade |
+   |---|---|---|
+   | 0% | 0% | −7.1 |
+   | 0% | **100%** | **−15.9** |
+   | 25% | 0% | +11.2 |
+   | 50% | 0% | +68.7 |
+   | 100% | 0% | +102.1 |
+
+   **Perfect knowledge of the next day's range WIDTH is worth less than
+   nothing — it makes the strategy worse.** All of the value is in the CENTRE,
+   and break-even sits at a centre IC of about **0.10**. A range forecast that
+   is symmetric around the current price — which is what a volatility model, a
+   quantile regression on the high/low, or a Monte Carlo path simulation
+   produces — has a centre IC of zero by construction. It forecasts the
+   worthless half. The predictable half and the profitable half are different
+   halves.
+
+   `range_harness.py` is the scoreboard that follows from that, so model
+   classes get measured instead of argued about: purged time split, effective
+   N (a year is ~363 independent 24h windows per symbol, not 8,712 rows), a
+   shuffled-label control over several seeds, sign agreement across symbols,
+   and an IC→bps conversion so the verdict is about money rather than
+   significance. A model is structural — `fit`/`predict`, no base class — and
+   `--dump` / `--predictions` scores one that cannot run in this process
+   (PyTorch, an LLM pipeline, an RL policy), with timestamp alignment checked
+   rather than trusted: a prediction file one row out of step scores like a
+   signal.
+
+   First entries on the board — ridge, ten majors, 110 out-of-sample days:
+
+   | target | pooled IC | control ceiling | reading |
+   |---|---|---|---|
+   | centre | +0.064 (t 2.12) | **+0.062** | does not separate from its own control, and is under the 0.097 break-even |
+   | width | +0.600 (t 24.7) | +0.289 | real, and measured above as worth nothing |
+   | contained | +0.242 (t 8.19) | +0.134 | the untested idea: it gates WHEN to fade, not where |
+
+   Two things to read carefully there. The centre model does not separate from
+   the same pipeline trained on shuffled targets, which is step 7 repeating on
+   a new target. And the shuffled control itself reaches |IC| 0.13–0.29,
+   because pooling symbols lets a prediction correlated with a symbol's
+   average level score without any timing skill at all — so per-symbol
+   demeaning belongs in the next version of the harness, and every pooled IC
+   here should be read against its control rather than against zero.
+
+   `fetch_klines.py` is the other half of the answer, since 363 windows cannot
+   resolve an IC below ~0.06 at two standard errors and no architecture fixes
+   that: 100 crypto perpetuals, five years of 1m bars, ~10 GB, ~90 requests
+   per symbol-year. Two things it refuses, both found by running it. Tokenised
+   equities and commodities — Binance lists gold, crude, silver and single
+   stocks as `TRADIFI_PERPETUAL`, and seven were in the top hundred by volume;
+   they trade in sessions, so their overnight gaps would read as market
+   structure. And symbols whose names are not ASCII — four CJK meme tickers in
+   the top hundred, unfetchable because the archive path is the symbol
+   verbatim, one of which sat sixth by volume and ended the first run.
+
+   What this does not settle: `contained` has never been converted into money,
+   which needs the gated backtest rather than an IC, and no larger model has
+   been run against the bar yet. Making that cheap is what the harness is for.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
