@@ -27,6 +27,11 @@ from typing import Dict, Optional
 # keeping a deny-list of tool directories means `data/replayed`, `data/bars`,
 # `data/cache`, `data/tardis` and anything added later are excluded for a
 # reason that stays true, instead of until someone forgets to update the list.
+#
+# That includes `data/hyperliquid`, a different VENUE whose coin directories
+# (`data/hyperliquid/BTC`) describe a different market from `data/BTC-USDT`
+# in near-identical events. It sits one level down and does not match, so no
+# BloFin tool can pick it up - see `trading/hyperliquid.py`.
 INSTRUMENT_DIR = re.compile(r"[A-Z0-9]+-[A-Z0-9]+")
 
 

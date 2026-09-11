@@ -53,6 +53,7 @@ first. Recording is therefore step one, not step four.
 │   ├── live-chart.py        # entrypoint: chart + one instrument's recorder
 │   ├── record.py             # entrypoint: N instruments, headless, no ports
 │   ├── record_oi.py          # entrypoint: OI or mark-price, alongside a live run
+│   ├── record_hyperliquid.py # entrypoint: Hyperliquid market data + liquidation map
 │   ├── plan_carry.py         # entrypoint: what a carry WOULD do. Sends nothing.
 │   ├── run_carry.py          # entrypoint: opens it. Dry unless --confirm.
 │   ├── monitor_carry.py      # entrypoint: scores an open carry. Sends nothing.
@@ -70,6 +71,8 @@ first. Recording is therefore step one, not step four.
 │   │   ├── ingest.py          # live book/trade websocket loop
 │   │   ├── openinterest.py    # OI poller — the input for others' liquidation levels
 │   │   ├── markprice.py       # mark + index price — the basis, REST-only
+│   │   ├── hyperliquid.py     # second venue: feed, account reads, rate budget
+│   │   ├── liquidation_map.py # others' liquidation levels, read off public positions
 │   │   ├── rawlog.py          # raw event archive (gzipped JSONL)
 │   │   ├── margin_tiers.py    # MMR for a size, from the account's own host
 │   │   ├── risk.py            # liquidation math, sizing, hard limits
@@ -97,12 +100,16 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (571 tests)
+│   └── tests/                 # pytest suite (646 tests)
 ├── data/                      # recorded data (gitignored)
-│   └── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT
-│       ├── features-*.csv     #     labelled features — regenerable
-│       ├── raw/               #     raw events — IRREPLACEABLE
-│       └── carry/             #     an open carry's frozen baseline + snapshots
+│   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
+│   │   ├── features-*.csv     #     labelled features — regenerable
+│   │   ├── raw/               #     raw events — IRREPLACEABLE
+│   │   └── carry/             #     an open carry's frozen baseline + snapshots
+│   └── hyperliquid/           #   a different VENUE, invisible to BloFin tools
+│       ├── <COIN>/raw/        #     l2Book, trades, activeAssetCtx — IRREPLACEABLE
+│       ├── <COIN>/liquidation-levels-*.jsonl  # the map — derived
+│       └── _accounts/         #     clearinghouseState per account — IRREPLACEABLE
 ├── frontend/
 │   ├── live-chart.html     # thin page shell
 │   ├── styles.css          # all page styling
@@ -292,6 +299,57 @@ That is a separate process writing a separate channel
 no history endpoint, which makes it capture-or-lose like the book — and it is
 the only public input to estimating where *other* traders get liquidated. See
 `trading/README.md` for what is and is not built on top of it.
+
+### Hyperliquid, and other traders' liquidation levels
+
+```
+python backend\record_hyperliquid.py --check     # validate coins live, print the budget
+python backend\record_hyperliquid.py             # BTC, ETH, SOL, HYPE by default
+```
+
+A second venue in a second process, sharing nothing with `record.py`.
+Hyperliquid's ledger is public: any account's positions come back with the
+exchange's own `liquidationPx`, and every trade names both accounts. So where
+other traders get liquidated is **read, not reconstructed** from open
+interest — which on BloFin is the only option. Each minute it writes a map per
+coin to `data/hyperliquid/<COIN>/liquidation-levels-<day>.jsonl` and prints
+a line:
+
+```
+BTC    mark 76,996  accounts 295  coverage L 2.9% S 3.5%  | 1%: $93k down / $0 up  2%: $776k down / $231k up ...
+```
+
+`2%: $776k down` is tracked longs whose own liquidation price lies within a 2%
+fall. **Read every figure through the coverage beside it.** See
+`trading/README.md` for what the map does and does not claim.
+
+First live run, 2026-09-11, 200 seconds, four coins, default budget:
+
+| | |
+|---|---|
+| account reads | 450/min — exactly the budget; 0 failed, 0 rate-limited |
+| accounts discovered | 669 in 3 minutes, queue still growing: discovery outruns reads, by design |
+| coverage after 3 minutes | 2–10% of open interest per side |
+| tracked long size with no liquidation price | 28–90%; shorts 0%, structurally |
+| reads that differed from the previous one | 92% — cross liquidation prices drift |
+
+Storage is dominated by the account archive, and it is not small:
+
+| | disk per day |
+|---|---|
+| `_accounts/` — `clearinghouseState` | **~580 MB** |
+| per coin — book, trades, asset context | 16–29 MB |
+| four coins, total | **~680 MB** |
+
+Account records compress only ~5x and reach 71 KB for an account holding
+dozens of positions (p90 15 KB), because whole accounts are kept: a cross
+liquidation price depends on everything else the account holds. That cost
+scales with `--weight-per-minute`, not with the number of coins. Three minutes
+extrapolated, so an order of magnitude until a full day has run.
+
+After a crash: `.recorder.lock` is left behind and taken over once its pid is
+gone, and the address book is saved every five minutes and on a clean exit, so
+a crash costs at most five minutes of discovered accounts.
 
 Each feed opens its own websocket and writes to its own `data/<INST-ID>/`, so
 one instrument desyncing, stalling or reconnecting cannot touch another's

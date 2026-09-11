@@ -353,3 +353,21 @@ MAX_UNREALIZED_LOSS = Decimal(os.getenv("BLOFIN_MAX_UNREALIZED_LOSS", "50"))
 # a position that has moved against you should be closed well before the
 # margin engine does it for you.
 MIN_OPEN_LIQ_BUFFER_PCT = Decimal(os.getenv("BLOFIN_MIN_OPEN_LIQ_BUFFER_PCT", "0.08"))
+
+# --- Hyperliquid ------------------------------------------------------------
+# A second venue, recorded by backend/record_hyperliquid.py. Its ledger is
+# public, so liquidation levels are read off real positions rather than
+# reconstructed from open interest - see trading/hyperliquid.py. Public data
+# only; no keys. The raw archive follows BLOFIN_RECORD_RAW like everything else.
+#
+# Coin names are Hyperliquid's own and case-sensitive: BTC, not BTC-USDT, and
+# kPEPE, not KPEPE. The recorder checks them against the live universe.
+HYPERLIQUID_COINS = os.getenv("HYPERLIQUID_COINS", "BTC,ETH,SOL,HYPE")
+# REST weight per minute spent reading accounts. The limit is 1,200 per IP and
+# an account read weighs 2, so 900 is 450 reads a minute with a quarter of the
+# limit left for anything else on this IP.
+HYPERLIQUID_WEIGHT_PER_MINUTE = int(os.getenv("HYPERLIQUID_WEIGHT_PER_MINUTE", "900"))
+# How often a liquidation map is drawn per coin, and its band width as a
+# fraction of mark (0.005 = 0.5%, ~$385 on BTC at $77k).
+HYPERLIQUID_MAP_SECONDS = float(os.getenv("HYPERLIQUID_MAP_SECONDS", "60"))
+HYPERLIQUID_BUCKET_PCT = float(os.getenv("HYPERLIQUID_BUCKET_PCT", "0.005"))

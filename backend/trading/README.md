@@ -19,6 +19,8 @@ data foundation has to exist before there is anything worth executing on.
 | `recorder.py` | Writes feature rows + forward labels to CSV | features |
 | `ingest.py` | The live websocket loop wiring the above together, with a stall watchdog | all of the above, BloFin SDK |
 | `openinterest.py` | Polls and archives open interest, the input a liquidation-cluster model needs | rawlog (stdlib HTTP, no SDK) |
+| `hyperliquid.py` | Second venue: book/trades/asset-context feed, accounts discovered from trades, `clearinghouseState` reads under a weight budget | rawlog, liquidation_map (stdlib HTTP, `websockets`) |
+| `liquidation_map.py` | Bands other traders' positions by distance to their exchange-reported liquidation price, with coverage | **nothing** |
 | `risk.py` | Liquidation math, position sizing, hard limits | **nothing** |
 
 `risk.py` importing nothing from this package is a deliberate constraint: the
@@ -137,7 +139,7 @@ about to open would be liquidated, so the engine can refuse it
 (`min_liquidation_buffer_pct`) or trip on it later
 (`min_open_liquidation_buffer_pct`).
 
-Nothing models **anyone else's**. Other traders' liquidation clusters are the
+On BloFin, nothing models **anyone else's**. Other traders' liquidation clusters are the
 thing a heatmap shows, and none of `books`, `trades` or `funding-rate` carries
 a single fact about someone else's position, so no amount of work on the
 existing feed could produce one.
@@ -163,6 +165,37 @@ intensity series and not a volume series.
 
 None of that is built. What exists is the recording, deliberately, because it
 is the half that expires.
+
+### Hyperliquid: read, not reconstructed
+
+Hyperliquid's ledger is public, which removes the model rather than improving
+it. `clearinghouseState` returns any account's positions with the exchange's
+own `liquidationPx`, and every fill on the `trades` channel names both
+accounts. So `hyperliquid.py` discovers accounts from the tape and reads them,
+and `liquidation_map.py` bands their positions by distance from the mark. No
+leverage mix is assumed anywhere.
+
+What is uncertain instead is printed beside every map, because each item can
+make a map look more complete than it is:
+
+| | what it means |
+|---|---|
+| coverage | tracked size / open interest. An account exists to the tracker only once it trades, so this starts near zero and builds over hours. |
+| no liq px | size whose position reports `liquidationPx: null`. Long-side only, structurally: price cannot fall below zero but can rise without limit, so every short has a price and a well-collateralised long may not. |
+| crossed | a liquidation price the mark has already passed — a stale reading or a liquidation in progress. In no band. |
+| age | notional-weighted age of the readings. A cross liquidation price drifts with the account's other positions. |
+
+The binding constraint is REST weight, not data: 1,200 per minute per IP at 2
+per read, against ~450 new accounts a minute on four coins. Reads go first to
+accounts that just traded — size only changes through a fill, and fills name
+both parties — then to aged holders by `age * sqrt(notional)`. An account
+holding no tracked coin is never refreshed, because opening one takes a trade.
+
+Two things it does not do yet. It does not detect liquidations as events: a
+position that vanished after the mark crossed its reported price is
+reconstructible from the two archives, but nothing reads them back. And
+whether a dense band actually moves price when the mark reaches it — the
+question the map exists for — has not been asked.
 
 ## Tests
 
