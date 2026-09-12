@@ -6,10 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A crypto trading research stack, mostly for BloFin, plus a Hyperliquid
 recorder. Despite the README's stated goal (an HFT, high-leverage bot), almost
-everything here **records data or evaluates it**. The only order paths belong
-to the funding-carry strategy (`run_carry.py` / `close_carry.py`), and both are
-dry unless `--confirm`, demo unless `--production`, and refuse `--production
---confirm` together. `README.md`'s roadmap is the lab notebook: each step
+everything here **records data or evaluates it**. The order paths belong to
+the funding-carry strategies (`run_carry.py` / `close_carry.py`,
+`run_carry_xs.py`) and the lead-quote paper quoter (`run_lead_quote.py`, which
+mirrors paper intents to demo as `post_only` orders); every one is dry unless
+`--confirm`, demo unless `--production`, and refuses `--production --confirm`
+together. `README.md`'s roadmap is the lab notebook: each step
 records what was built, what it measured, and the verdict. Read it before
 proposing strategy work — most obvious ideas have already been run and died on
 execution cost.
@@ -47,6 +49,16 @@ python backend\analysis\tranche_book.py --hold-days 3 --band 0.1 --lag 1        
 python backend\analysis\venue_stack.py --hold-days 3 --band 0.1 --lag 1               # BloFin + Hyperliquid as one book
 python backend\plan_carry_xs.py --hold-days 3 --momentum-weight 0.4 --min-volume 2000000  # the 9aa book, dry
 python backend\plan_carry_xs.py --notional 4000 --min-volume 2000000               # sends nothing
+python backend\analysis\fetch_bybit_oi.py --top 80                                 # hourly OI + klines from Bybit, once
+python backend\analysis\oi_factors.py --hold 4 --cost-bps 10                       # positioning factors on that grid
+python backend\analysis\listing_announcement.py --minutes --cost-bps 30 --events   # the announcement event study (9ad)
+python backend\announcement_watch.py --check                                       # then without --check: record BloFin after each announcement
+python backend\analysis\liquidation_signal.py                                      # Hyperliquid liquidation levels vs forward return; needs weeks of archive
+python backend\analysis\venue_lag_passive.py --date 2026-09-11 --instruments SUI-USDT --binance-dir <aggTrades dir> --edge-bps 7 --stop-bps 3 --passive-exit --exit-at fair   # the HF maker study (9ae)
+python backend\run_lead_quote.py --instruments SUI-USDT --measure-only               # feed lag on this host vs the 9ae gates
+python backend\run_lead_quote.py --instruments SUI-USDT --minutes 60                 # paper quote from production feeds, sends nothing
+python backend\run_lead_quote.py --instruments SUI-USDT --minutes 60 --confirm       # ...and mirror intents to DEMO as post_only orders
+python backend\run_lead_quote.py --summary data\SUI-USDT\lead_quote\<run>.jsonl      # read a run back
 ```
 
 `.env` at the repo root holds `API_KEY`/`SECRET`/`PASSPHRASE` and overrides such

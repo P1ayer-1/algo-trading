@@ -2954,6 +2954,329 @@ un_carry_xs.py --flatten --confirm
    the trade, and the cap on any single name is still the only control that
    does not depend on estimating a correlation that has not happened yet.
 
+9ad. **Eleven ways to make money inside eight hours without funding, and the
+   one that survived** — `backend\analysis\lead_lag.py`, `pump_fade.py`,
+   `listing_day.py`, `pair_reversion.py`, `venue_lag.py`, `fetch_bybit_oi.py`
+   + `oi_factors.py` + `oi_cascade.py`, `liquidation_signal.py`,
+   `fetch_premium_index.py` + `premium_signal.py`, `settlement_short.py --side long`,
+   `listing_announcement.py`, and `backend\announcement_watch.py`.
+
+   The brief on 2026-09-12: beat the carry book with something that is not a
+   funding carry and holds for at most eight hours. Each idea below has a
+   tool, a placebo or control, a year table, and a stated sign before the
+   run. Ten are negative and are written up so they are not run again. The
+   eleventh is the first sub-day result in this repo that clears its cost by
+   more than a rounding error, and it is an event, not a forecast — which is
+   the shape of the only other thing that ever worked here.
+
+   ```
+   python backend\analysis\listing_announcement.py --minutes --cost-bps 30 --events
+   python backend\announcement_watch.py --check
+   python backend\analysis\fetch_bybit_oi.py --top 80
+   python backend\analysis\oi_factors.py --hold 8 --cost-bps 10
+   python backend\analysis\liquidation_signal.py
+   ```
+
+   ### The ten that died, in the order they were run
+
+   - **BTC leads the alts** (`lead_lag.py`). After a 2-3 sd BTC move over
+     15 or 60 minutes, an equal-weight alt basket in BTC's direction hedged
+     with BTC: gross −1 to −4 bps at every setting, placebo identical, and
+     the pooled cross-correlation between BTC's last 15 minutes and the
+     alts' hedged next 15 minutes sits within ±0.015 in every year. Splitting
+     the basket into the alts that lagged and the ones that led changes
+     nothing. The lag, if it exists, is shorter than a 15-minute bar.
+   - **Fade the top of a pump** (`pump_fade.py`). `extreme_move.py`'s z ≥ 8
+     bucket looked like +23 bps. Delay the entry one bar past the print, one
+     event per coin per hold, and it is +5.0 ± 18.4 over four hours on 1,647
+     events, +2.0 ± 26.3 over eight, with a worst single event of −3,505 bps.
+     The median is positive; the mean is not, because the short is on the
+     wrong side of the tail.
+   - **The first hours of a new Binance perpetual** (`listing_day.py`). 73
+     listings; the median path bleeds −200 to −340 bps over 48 hours, and a
+     short from hour one to hour nine makes +80 ± 159 with the sign flipping
+     by year. Fifteen events a year at that dispersion is not a strategy.
+   - **Pairs at extremes** (`pair_reversion.py`). Each coin against its most
+     correlated peer (trailing 30 days, re-chosen daily), a 24-hour gap
+     beyond 2.5 sd, held four hours: 25,667 events, gross convergence +1.6
+     bps against a 10 bps round trip; 8-hour holds at 3 sd, +1.0. It is step
+     8's basis point again, conditioned harder.
+   - **BloFin's book lags Binance** (`venue_lag.py`). BloFin's archived book
+     against Binance aggTrades for the same day, one-second grid. An archive
+     gap first read as a −229 bps p1 that never closed; a freshness filter
+     (both venues updated within 3 s) removed it, and this is the check to
+     keep. On SUI the lead is real — BloFin's mid follows a Binance-BloFin
+     gap with slope 0.79 within 30 seconds — and a taker who buys the stale
+     ask nets **−0.03 bps at mid and −2.5 at the touch** after 30 seconds.
+     The lead exists and pays exactly the fee. ADA's Binance tick is 4.8 bps,
+     so its gap is quantisation.
+   - **Open interest** (`fetch_bybit_oi.py`, `oi_factors.py`). Bybit is the
+     one venue serving hourly OI history (back to 2022, ~80 names), the
+     first positioning series in any panel here. Ten factors — OI growth over
+     1/4/24 h, its z-score, new-longs (sign of return × OI change), OI level
+     against volume, OI churn — scored with `run_factor` at 8-hour holds, 10
+     bps, 20 shuffles: **every gross leg within ±2 bps** (best `doi_24_z`
+     +0.87 price, worst `rev_24` −2.00), controls at −14. The same at four
+     hours. Positioning at this resolution carries no cross-sectional
+     information a taker can pay for.
+   - **Liquidation levels** (`liquidation_signal.py`). Built for the
+     Hyperliquid archive, which on 2026-09-12 held 13.1 hours of BTC and
+     ETH: 787 snapshots each, coverage 7% of long and 15% of short open
+     interest, within-1% notional a median $44k on BTC. The magnet
+     correlation comes back negative (t −2 to −5) on **14 hourly clusters**,
+     and the overshoot test found no band swept. Fourteen clusters is a
+     smoke test; the tool is written to be re-run in weeks, and widening the
+     recorder past BTC/ETH is the operator's call (the running process was
+     left alone).
+   - **The settlement tail, honestly** (`settlement_short.py --side long`).
+     Step 9ab's +49 bps hour after a >10 bps settlement priced as a trade:
+     +53.5 per settlement (t 2.63) entered at the instant, **−3.9 with a
+     15-minute delay**. And the −4 h "placebo" that dismissed it reads
+     +72.8 — because the settled rate at T−4h contains four hours of future
+     premium. The effect is real and lives inside the first quarter hour.
+   - **The live premium index** (`fetch_premium_index.py`,
+     `premium_signal.py`). Binance Vision publishes the perp-index premium at
+     15 minutes, so the settlement study's lookahead can be removed. Ranked
+     on the negated premium at the bar close, 106 names, 10 bps: the price
+     leg is **+1.3 bps per hour and +2.2 per four hours** (IC +0.028, the
+     largest intraday IC this repo has measured, and every year positive)
+     against a turnover of 2.1 units — net −9.1 and −8.4. The tails are
+     worse: a 1h premium beyond ±10 bps, held one or four hours, has an
+     excess of about −1 bp either side on 78k and 106k events. The premium
+     reverts, by one basis point, which is what a basis is.
+   - **Intraday cascades read off OI** (`oi_cascade.py`). The hours where OI
+     fell with price (a forced flush) against the hours where it rose (new
+     shorts) or stayed flat, rebound priced at 1/4/8 hours from the close:
+     the flush rebounds −11.6 ± 6.0 excess at one hour and −7.7 ± 10.3 at
+     four on 6,600-6,900 events, indistinguishable from the placebo a day
+     later and from the OI-flat rows. The distinction OI was meant to add
+     adds nothing at hourly resolution; at one-hour holds the four OI
+     factors' price legs are −0.37 to +0.16.
+
+   ### The one that survived: the Binance listing announcement
+
+   `listing_announcement.py` reads Binance's own announcement catalogue
+   (2,253 articles, each with a millisecond release stamp), classifies each
+   title as a spot listing ("Binance Will List X (X)") or a futures launch
+   ("Binance Futures Will Launch USDⓈ-M XUSDT Perpetual"), and — because the
+   coin cannot be bought on Binance yet — reads what it did on **Bybit**, at
+   one minute, from 30 minutes before to nearly three hours after, with BTC
+   over the same window as the market term. 378 coins named since 2022, 157
+   of which Bybit already traded two hours before the release. Every number
+   is net of a **30 bps taker leg** (the spread of a thin coin in that minute
+   is the whole question, so the stress is the headline) and in excess of
+   BTC, from the close of the minute the article landed in — up to 59
+   seconds late.
+
+   | spot listing, n 46 | +1m | +5m | +15m | +60m | +120m |
+   |---|---|---|---|---|---|
+   | long from the announcement minute's close | +105 | +96 | +244 | **+416 ± 250** | **+551 ± 265** |
+   | median | −40 | +47 | +53 | +426 | +372 |
+   | entered one minute later | −60 | −69 | +79 | +251 | +386 |
+
+   The announcement minute itself is +1,339 (median +843) and nobody gets
+   it. What is left after it is four to five percent over the next two
+   hours, and it was there in 2023 (+859 at 60 m), 2024 (+575) and 2025
+   (+560); in 2026 it is +157 with a negative median on 15 events, which is
+   what a crowd of faster bots looks like and is the caveat on this leg.
+
+   | futures launch, n 111 | +1m | +5m | +15m | +60m | +120m |
+   |---|---|---|---|---|---|
+   | long from the announcement minute's close | −180 ± 44 | −281 ± 88 | **−313 ± 108** | −288 ± 116 | −249 |
+   | median | −140 | −212 | −180 | −346 | −274 |
+   | hit rate of the long | 27% | 31% | 33% | 30% | 39% |
+
+   The opposite trade, and the more robust one: the launch announcement
+   jumps the coin +707 (median +514) in its minute and gives a third of it
+   back within fifteen. **Short at the close of that minute, cover fifteen
+   minutes later, nets +190 to +250 bps** at 30 bps a leg, 67-70% of the
+   time, in 2024 (34 events), 2025 (62) and 2026 (15) alike. Bybit removes
+   delisted contracts from its API, so any survivorship here cuts *against*
+   this leg — the coins that went to zero afterwards are the ones missing.
+
+   **As one strategy on capital**, one unit per event, long spot listings
+   for 60 minutes and short futures launches for 15, daily P&L with zeros
+   on the 90% of days with no event:
+
+   | 30 bps/leg | events | bps/yr on capital | Sharpe (daily) | worst event |
+   |---|---|---|---|---|
+   | 2024 | 46 | +8,958 | 1.14 | |
+   | 2025 | 74 | +22,657 | 1.75 | |
+   | 2026 (to Sep) | 30 | +5,721 | 1.42 | |
+   | all, 2022-2026 | 157 | **+8,694** | **1.13** | −4,054 |
+   | futures leg alone | 111 | +8,514 | 1.09 | −3,128 |
+   | spot leg alone | 46 | +4,114 | 0.80 | −4,054 |
+   | at 50 bps/leg, both | 157 | +6,745 / +3,719 by leg | 0.87 / 0.73 | |
+
+   **Does it beat the carry book?** Not on Sharpe: 1.1-1.5 by year against
+   1.6, on 157 events rather than 243 weeks, and the interval on that is
+   wide. On return per unit of capital it is not close — 85% a year at 1x
+   against the carry book's 21% on gross — and it holds capital for minutes
+   a few times a week, so it is an overlay on the carry book's margin rather
+   than a competitor for it. That is the honest claim: the only sub-day idea
+   of eleven that clears a 60 bps round trip by a multiple, positive in
+   every year with more than five events, with a single-event tail of −40%
+   that sets the position size.
+
+   **What is not established, in order.** Every price is Bybit's; this
+   account trades BloFin, which lists 35 of the 54 spot-listed coins and 99
+   of the 174 futures-launched coins since 2024, and whose book in the
+   minute after an announcement has never been observed. The 30 bps leg is
+   a guess at that book. Reaction time matters: the futures leg is worth
+   +180 in the first minute and the tables are for an order sent within 60
+   seconds of the article. And the spot leg is decaying in 2026.
+
+   So the next thing is not an executor. `backend\announcement_watch.py`
+   polls the catalogue every ten seconds and, for every new listing or
+   launch article naming a coin BloFin lists, samples BloFin's top of book
+   and BTC-USDT's every two seconds for 150 minutes to
+   `data/announcements/`, article beside it, and prints the spread at the
+   first sample and the mid at +1/2/5/15/60/120 minutes. It has no order
+   path. When a dozen of those CSVs agree with the Bybit tables, the
+   executor is the thing to ask for by name.
+
+9ae. **High frequency: be the stale side's counterparty, not its taker** —
+   `backend\analysis\venue_lag_passive.py`.
+
+   ```
+   python backend\analysis\venue_lag_passive.py --date 2026-09-11 --instruments SUI-USDT,DOGE-USDT --binance-dir <aggTrades dir> --edge-bps 7 --stop-bps 3 --passive-exit --exit-at fair
+   python backend\analysis\venue_lag_passive.py --date 2026-09-11 --instruments SUI-USDT --binance-dir <dir> --unconditional 10
+   ```
+
+   Step 9ad's `venue_lag.py` left one live number behind: BloFin's mid
+   follows Binance with a slope of 0.79 inside thirty seconds, and a taker
+   who lifts the stale ask earns exactly the fee. The brief on 2026-09-12
+   was something high-frequency, and this is the same lead used from inside
+   the book. No Binance account is involved anywhere: Binance is the public
+   trade feed, and every order is on BloFin.
+
+   **The mechanism.** When Binance's mid is `edge` bps above BloFin's
+   `ask - tick`, post a bid at `ask - tick`. Nobody on BloFin quotes there
+   yet, so the order is alone and first at its level; the next BloFin seller
+   who has not seen the Binance print hits it, at the maker fee, at a price
+   already known to be below fair. The simulation is event by event on the
+   recorder's own book-and-trade archive with Binance aggTrades (plus 150 ms
+   of feed latency) as the leader: a fill is the first sell-aggressor print
+   at or below the order, or the ask coming down through it; the order is
+   cancelled when the bid overtakes it, when Binance comes back, or after
+   10 s. One order or position per side. The control posts the same orders
+   on a ten-second clock with no signal — step 9ac's plain touch quote.
+
+   **The lead turns a passive fill from adverse to favourable.** 2026-09-11,
+   marked out at BloFin's mid, net of the 0.6 bps maker fee:
+
+   | | fill rate | fills/day | markout at 30 s | 60 s |
+   |---|---|---|---|---|
+   | SUI, signal (edge 3) | 24.7% | 405 | **+2.99 ± 0.74** | +4.23 |
+   | SUI, clock | 11.5% | 1,152 | −2.09 ± 0.40 | −2.05 |
+   | DOGE, signal | 21.5% | 128 | +1.98 ± 2.27 | +2.89 |
+   | DOGE, clock | 9.0% | 984 | −2.54 ± 0.37 | −2.70 |
+   | AVAX, signal | 14.4% | 152 | +3.50 ± 1.78 | +2.84 |
+   | AVAX, clock | 5.5% | 632 | −2.63 ± 0.50 | −2.44 |
+
+   Five to six basis points per fill separate the two rows on every
+   instrument, and the signalled quote fills twice as often. That is the
+   whole edge, and every version of the exit below is an attempt not to give
+   it back.
+
+   **The exit decides the sign, and it took three versions.** A taker exit
+   at the far touch after 30 s pays 5 bps plus half a spread and nets −3.7
+   to −5.3. A maker exit one tick past entry fills at once for +0.5 and
+   leaves the 10–30% of fills that go wrong to a forced taker exit at −12 to
+   −27; net −0.3 to −4.5. A maker exit at the **Binance-implied fair** (the
+   leader's mid rounded to the tick, never below entry + tick, pessimistic
+   on queue position) nets +4 to +7 on the 60–88% that fill and still loses
+   the rest at −11 to −35. What fixes it is using the leader on the way out
+   too: **cross out at once if Binance moves `stop` bps through the entry**,
+   so the informed fills are cut at −6 to −10 instead of −20. Three days,
+   four instruments, pessimistic queue, 120 s maximum hold, net bps per fill:
+
+   | edge / stop | SUI 11 / 10 / 09 | DOGE | AVAX | BTC | positive cells |
+   |---|---|---|---|---|---|
+   | 3 / 3 | −0.2 / −1.7 / −2.8 | −1.6 / +1.7 / +0.4 | −1.1 / −2.6 / −2.7 | +0.9 / +0.5 / +0.4 | 6 / 12 |
+   | 5 / 3 | +4.4 / +2.9 / +0.5 | +0.1 / +3.7 / +2.0 | +1.8 / −0.7 / +0.3 | +4.0 / +1.9 / +3.9 | 11 / 12 |
+   | **7 / 3** | **+7.1 / +3.4 / +1.4** | **+2.1 / +6.8 / +5.1** | **+3.3 / +0.8 / +3.8** | **+7.4 / +2.3 / +5.2** | **12 / 12** |
+
+   The return per fill rises monotonically with the edge — 0, +2, +4 bps —
+   which is what a real signal does and what a peak found by search does
+   not. At 7 / 3 the fill counts are 14–175 a day per instrument (fill rate
+   24–33%, median wait under a second, median hold 2–18 s) and the three
+   days sum to about **290 bps a day per instrument on the notional of one
+   order**. The optimistic queue bound at 5 / 3 adds about +1.5 per fill.
+
+   **Where it does not work, and what it needs.** ADA, whose tick is 4.8
+   bps, loses −3 a fill on all three days: a one-tick step is a whole spread
+   there, and "fair rounded to the tick" is not a price. LTC is zero. And
+   the edge is a latency edge: rerun with 500 ms instead of 150 ms of feed
+   latency, SUI falls to +0.5, DOGE to −5.7 and AVAX to −3.5, with only BTC
+   holding. The strategy exists at a Tokyo-hosted feed and does not exist
+   from a home connection, and nothing here has measured which of those
+   this machine is.
+
+   What is still assumed, in order of how much it could move the result:
+   the order is filled in full by any print at its price (size is not
+   modelled, and the flow being caught is thin); BloFin's feed latency to
+   here is the 150 ms the recorder measured as `t - ts`, and its order
+   latency is zero; the parameters were chosen from three edges and two
+   stops on the same three days; and three days is three days. The next
+   thing is not a bigger backtest — the archive grows a day per day — it is
+   a paper quoter that posts and cancels on demo with real latency and logs
+   what fills, which is the executor question this repo asks for by name.
+
+   ### The paper quoter — `backend\trading\strategies\lead_quote\`, `backend\run_lead_quote.py`
+
+   ```
+   python backend\run_lead_quote.py --instruments SUI-USDT --measure-only
+   python backend\run_lead_quote.py --instruments SUI-USDT --minutes 60
+   python backend\run_lead_quote.py --instruments SUI-USDT --minutes 60 --confirm
+   python backend\run_lead_quote.py --instruments SUI-USDT --confirm --probe 10
+   python backend\run_lead_quote.py --summary data\SUI-USDT\lead_quote\<run>.jsonl
+   ```
+
+   Three verbs, as the others. `quoter.py` is the backtest's rule set as an
+   event-driven object with no I/O and no path to the order endpoint (a
+   test greps that); `plan.py` gates on the two things 9ae died of — a tick
+   over 2.5 bps of price, a feed lag over 350 ms, with a warning above 200;
+   `execute.py` runs PRODUCTION feeds (Binance's public `bookTicker` and
+   BloFin's books and trades — Binance is a data source, never an account)
+   and fills the quoter from the production tape on paper, which is the
+   reference result because the demo book is not the market; `monitor.py`
+   reads the log back. `--confirm` additionally mirrors every intent to the
+   demo account as a real `post_only` order, cancel or reduce-only exit and
+   times each acknowledgement, and `--probe` sends far-from-touch orders and
+   cancels them to time the venue with no fill possible: the number to
+   compare a Germany box with a Tokyo one.
+
+   **First runs, 2026-09-12, from the development machine:**
+
+   | | |
+   |---|---|
+   | leader feed lag (Binance event time to receipt) | p50 81–98 ms |
+   | follower feed lag (BloFin `ts` to receipt) | p50 78–90 ms, p99 up to 546 |
+   | demo order acknowledgement, post_only and cancel | **p50 186 ms, p90 199, p99 257** (n 20) |
+   | five-minute paper run | 1 post, 1 fill, maker exit **+8.51 bps** |
+   | five-minute demo run | 0 posts: spread sat under two ticks the whole time |
+
+   Both feed lags include whatever clock offset this machine carries, so
+   they are upper bounds on the network; the order round trip is a real
+   measurement and it is the one the backtest could not make. At 186 ms a
+   post arrives roughly when the study's 150 ms feed assumption says the
+   opportunity is half gone, which is the case for a host near the venues
+   and the number to beat from one.
+
+   **The first demo run closed a position it did not open.** Shutdown read
+   the account's positions and sent a reduce-only market order for a SUI
+   short of 1,677 contracts left over from earlier demo work. Demo money, no
+   harm, and precisely the behaviour `strategies/__init__.py` exists to
+   forbid. The runner now accumulates its own fills from the venue's order
+   stream and closes only that quantity; anything else the account holds is
+   reported as a `PROBLEM` and left alone, and a test holds it there.
+
+   What this does not yet say: whether the paper fill rate and net per fill
+   over hours match the backtest's 24–33% and +2 to +7 (one fill is one
+   fill), and whether a demo `post_only` at `ask - tick` is ever filled by
+   the demo book at all. Run it for a day; read it back with `--summary`.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

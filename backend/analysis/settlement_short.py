@@ -65,6 +65,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--placebo-hours", type=float, default=0.0,
                         help="shift the entry by this many hours (negative = before T)")
     parser.add_argument("--top-symbols", type=int, default=8)
+    parser.add_argument("--side", choices=("short", "long"), default="short",
+                        help="long: buy coins whose signal rate is strictly ABOVE the threshold "
+                             "(the positive-tail continuation of settlement_event.py)")
     args = parser.parse_args(argv)
     cost_leg = float(config.TAKER_FEE_BPS) if args.cost_bps is None else args.cost_bps
     round_trip = 2 * cost_leg
@@ -100,7 +103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         rate = grid.funding[signal_row]
         has = (grid.funding_periods[signal_row] > 0) & np.isfinite(rate) & eligible[t]
-        pick = has & (rate < args.threshold)
+        pick = has & ((rate > args.threshold) if args.side == "long" else (rate < args.threshold))
         if not pick.any():
             continue
         entry = t + delay_bars + shift_bars
@@ -113,7 +116,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ok = np.isfinite(move) & complete[entry, idx] & complete[exit_row, idx]
         if not ok.any():
             continue
-        pnl = -move[ok] - round_trip                    # short: profit when price falls
+        sign = 1.0 if args.side == "long" else -1.0
+        pnl = sign * move[ok] - round_trip              # short: profit when price falls
         per_settlement.append((t, float(pnl.mean()), int(ok.sum())))
         for s, v in zip(idx[ok], pnl):
             per_symbol[grid.symbols[s]].append(v)
@@ -129,8 +133,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dates = np.array([stamps[r][:10] for r in rows])
     years = np.array([d[:4] for d in dates])
 
-    print("signal={} threshold<{:g} hold={:g}h delay={}m placebo={:+g}h cost {:.0f}/leg".format(
-        args.signal, args.threshold, args.hold_hours, args.entry_delay_min,
+    print("side={} signal={} threshold{}{:g} hold={:g}h delay={}m placebo={:+g}h cost {:.0f}/leg".format(
+        args.side, args.signal, ">" if args.side == "long" else "<", args.threshold, args.hold_hours, args.entry_delay_min,
         args.placebo_hours, cost_leg))
     print("{} trades at {} settlements over {} days; {:.2f} trades per settlement with a trade".format(
         total_trades, len(nets), len(np.unique(dates)), total_trades / len(nets)))
