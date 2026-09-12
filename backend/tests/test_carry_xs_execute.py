@@ -13,6 +13,7 @@ import pytest
 
 from trading.strategies import Outcome
 from trading.strategies.carry_xs import BookConfig, Candidate, plan_book
+from trading.strategies.carry_xs.broker import Rules
 from trading.strategies.carry_xs.execute import (
     BookExecutor,
     ExecutionResult,
@@ -27,10 +28,13 @@ class FakeBroker:
     """Records every call. Rejects whatever `reject` names."""
 
     def __init__(self, positions=None, quotes=None, reject=(), raises=(),
-                 contract_values=None, marks=None):
+                 contract_values=None, marks=None, lot="0.01",
+                 min_size="0.01"):
         self._positions = dict(positions or {})
         self._quotes = dict(quotes or {})
         self._marks = dict(marks or {})
+        self._lot = Decimal(lot)
+        self._min_size = Decimal(min_size)
         # Default 1 base unit per contract, so a test that does not care about
         # the multiplier reads in plain dollars.
         self._contract_values = dict(contract_values
@@ -39,6 +43,9 @@ class FakeBroker:
                                          "A-USDT": Decimal("1")})
         for name in list(self._positions):
             self._contract_values.setdefault(name, Decimal("1"))
+        for index in range(30):
+            self._contract_values.setdefault(
+                "C{:02d}-USDT".format(index), Decimal("1"))
         self.reject = set(reject)
         self.raises = set(raises)
         self.sent = []
@@ -69,8 +76,10 @@ class FakeBroker:
                  "markPrice": str(self._marks.get(inst_id, Decimal("100")))}
                 for inst_id, size in self._positions.items() if size != 0]
 
-    def contract_values(self):
-        return dict(self._contract_values)
+    def instrument_rules(self):
+        return {name: Rules(contract_value=value,
+                            lot_size=self._lot, min_size=self._min_size)
+                for name, value in self._contract_values.items()}
 
     def quote(self, inst_id):
         return self._quotes.get(inst_id, {"bid": Decimal("99.99"),
@@ -502,3 +511,86 @@ def test_net_after_tracks_the_book_not_the_orders():
     orders = plan_orders({"A": Decimal("5")}, {}, units)
     # Closing a $500 long ends at zero exposure, not at -$500.
     assert orders[0].net_after == Decimal("0")
+
+
+# ---------------------------------------------------------------------------
+# Size rules, both of which a live run rejected
+# ---------------------------------------------------------------------------
+
+
+def test_every_order_is_rounded_to_the_lot_it_will_be_validated_against():
+    """`152002 Parameter size error`, four times, on the first live run.
+
+    The repair sized itself as `excess / unit` and sent the result raw -
+    `0.2276622802836378615352929061` contracts. Rounding where a size is
+    COMPUTED is not enough, because the next code path that computes one has
+    to remember; it happens on the way out instead.
+    """
+    from trading.strategies.carry_xs.execute import round_to_lot
+
+    assert round_to_lot(Decimal("0.2276622802836378615"), Decimal("0.01")) \
+        == Decimal("0.22")
+    assert round_to_lot(Decimal("1.99"), Decimal("0.1")) == Decimal("1.9")
+    assert round_to_lot(Decimal("4.31"), Decimal("1")) == Decimal("4")
+    # No lot rule known: pass it through rather than inventing one.
+    assert round_to_lot(Decimal("4.31"), Decimal("0")) == Decimal("4.31")
+
+
+def test_a_repair_order_is_rounded_and_dropped_when_it_rounds_below_minimum():
+    broker = FakeBroker(lot="0.1", min_size="0.1")
+    plan = a_plan()
+    shorts = {leg.inst_id for leg in plan.legs if leg.ok and leg.side == "sell"}
+    broker.reject = shorts
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).reconcile(plan)
+    for order in result.orders:
+        if order.reason != "repair":
+            continue
+        assert order.contracts % Decimal("0.1") == 0, order.contracts
+        assert order.contracts >= Decimal("0.1")
+
+
+def test_an_order_below_the_minimum_size_is_never_sent():
+    """A leg too small to be legal is not a leg, and sending it just collects a
+    rejection while leaving the book short by that amount anyway."""
+    rules = {"A": Rules(contract_value=Decimal("1"), lot_size=Decimal("1"),
+                        min_size=Decimal("5"))}
+    orders = plan_orders({}, {"A": Decimal("3")}, {"A": Decimal("100")}, rules)
+    assert orders == []
+
+
+def test_a_close_is_exempt_from_the_minimum_size():
+    """The exchange lets a position be closed whatever its size.
+
+    Applying the opening minimum to a close would strand a small position
+    forever - and small positions are exactly what a partially failed rebalance
+    leaves behind.
+    """
+    rules = {"A": Rules(contract_value=Decimal("1"), lot_size=Decimal("0.01"),
+                        min_size=Decimal("5"))}
+    orders = plan_orders({"A": Decimal("3")}, {}, {"A": Decimal("100")}, rules)
+    assert len(orders) == 1
+    assert orders[0].reduce_only and orders[0].contracts == Decimal("3")
+
+
+def test_sizes_are_rounded_down_so_a_leg_never_exceeds_its_target():
+    rules = {"A": Rules(contract_value=Decimal("1"), lot_size=Decimal("0.1"),
+                        min_size=Decimal("0.1"))}
+    orders = plan_orders({}, {"A": Decimal("4.39")}, {"A": Decimal("100")}, rules)
+    assert orders[0].contracts == Decimal("4.3")
+
+
+def test_an_instrument_the_account_cannot_trade_is_dropped_and_reported():
+    """Demo lists 87 instruments against production's 488.
+
+    A plan built on production prices names instruments this account has never
+    heard of. Sending them one at a time collects one rejection each and leaves
+    the book quietly short; dropping them up front and saying so does not.
+    """
+    broker = FakeBroker()
+    plan = a_plan()
+    unlisted = [leg.inst_id for leg in plan.legs if leg.ok][0]
+    broker._contract_values.pop(unlisted, None)
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).reconcile(plan)
+    assert unlisted not in [order["instId"] for order in broker.sent]
+    assert any("not listed on this account's host" in problem
+               for problem in result.problems)

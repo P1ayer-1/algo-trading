@@ -135,10 +135,25 @@ def daily_vol_bps(api, inst_id: str, *, days: int = 31) -> float:
 
 
 def gather(api, *, min_volume: float, carry_days: int, min_funding_days: int,
-           limit: Optional[int] = None) -> List[Candidate]:
+           limit: Optional[int] = None, rules_api=None) -> List[Candidate]:
+    """Candidates, with prices from `api` and SIZE RULES from `rules_api`.
+
+    The split is the point. Prices, funding and volume come from production
+    because demo's book is not the market and a plan built on it would rank
+    coins by a spread nobody is quoting. But contract value, lot size and
+    minimum size come from the host the order will be SENT to, because that is
+    the host that validates it: measured 2026-09-12, demo lists 87 instruments
+    against production's 488 and the lot size differs on 10 of the 87 they
+    share - DOGE 0.01 against 0.1, ZEC 0.1 against 1. Sizing on the wrong one
+    produces a plan that reads perfectly and is rejected leg by leg with
+    `152002 Parameter size error`, which is what the first live run did.
+
+    `rules_api` defaults to `api`, so a caller trading production gets the
+    behaviour it already had.
+    """
     tickers = api.getTickers().get("data") or []
     instruments = {row.get("instId"): row
-                   for row in (api.getInstruments().get("data") or [])}
+                   for row in ((rules_api or api).getInstruments().get("data") or [])}
 
     shortlist = []
     for row in tickers:

@@ -13,6 +13,7 @@ $0.265 in step 9h. Capability removed is capability that cannot be misused.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +23,15 @@ def _decimal(value: Any, default: str = "0") -> Decimal:
         return Decimal(str(value))
     except Exception:  # noqa: BLE001
         return Decimal(default)
+
+
+@dataclass(frozen=True)
+class Rules:
+    """What the exchange will validate an order's size against."""
+
+    contract_value: Decimal
+    lot_size: Decimal
+    min_size: Decimal
 
 
 class BlofinPerpBroker:
@@ -62,21 +72,33 @@ class BlofinPerpBroker:
                                   sign=True)
         return [row for row in (payload.get("data") or []) if isinstance(row, dict)]
 
-    def contract_values(self) -> Dict[str, Decimal]:
-        """`{inst_id: base units per contract}` for every listed swap.
+    def instrument_rules(self) -> Dict[str, "Rules"]:
+        """Contract value, lot size and minimum size, FROM THE ACCOUNT'S HOST.
 
-        One call, and it covers instruments the plan does not mention - a
-        leftover position from some earlier run still has to be priced, and
-        pricing it on contract count would be wrong by the contract multiplier,
-        which on BloFin ranges from 0.001 (BTC) to 1000 (DOGE).
+        This is read from the trading client rather than from the public market
+        API, and the distinction is not pedantic. Measured 2026-09-12: demo
+        lists 87 instruments against production's 488, and the lot size differs
+        on 10 of the 87 they share - DOGE is 0.01 on production and 0.1 on
+        demo, ZEC is 0.1 against 1. A plan sized on production's rules and sent
+        to demo is rejected with `152002 Parameter size error`, which is what
+        happened on the first live run.
+
+        It is the same rule `plan_carry.py` already follows for margin tiers,
+        and for the same reason: prices come from production because demo's
+        book is not the market, but anything the exchange VALIDATES an order
+        against has to come from the exchange that will validate it.
         """
-        payload = self.market.getInstruments()
-        out: Dict[str, Decimal] = {}
+        payload = self.client.get("/api/v1/market/instruments",
+                                  params={"instType": "SWAP"})
+        out: Dict[str, Rules] = {}
         for row in payload.get("data") or []:
             inst_id = str(row.get("instId") or "")
             value = _decimal(row.get("contractValue"), "0")
             if inst_id and value > 0:
-                out[inst_id] = value
+                out[inst_id] = Rules(
+                    contract_value=value,
+                    lot_size=_decimal(row.get("lotSize"), "0"),
+                    min_size=_decimal(row.get("minSize"), "0"))
         return out
 
     def quote(self, inst_id: str) -> Optional[Dict[str, Decimal]]:

@@ -57,7 +57,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from .plan import BookPlan
@@ -80,7 +80,7 @@ class Broker(Protocol):
 
     def positions(self) -> List[Dict[str, Any]]: ...
 
-    def contract_values(self) -> Dict[str, Decimal]: ...
+    def instrument_rules(self) -> Dict[str, Any]: ...
 
     def quote(self, inst_id: str) -> Optional[Dict[str, Decimal]]: ...
 
@@ -197,6 +197,20 @@ def target_book(plan: BookPlan) -> Dict[str, Decimal]:
     return target
 
 
+def round_to_lot(contracts: Decimal, lot: Decimal) -> Decimal:
+    """Down to a whole lot. Anything sent to the exchange goes through here.
+
+    The first live run rejected four repair orders with `152002 Parameter size
+    error` because the repair sized itself as `excess / unit` and sent the
+    result raw - `0.2276622802836378615352929061` contracts. Rounding at the
+    point of sizing is not enough; it has to happen on the way OUT, because
+    every future code path that computes a size will otherwise have to remember.
+    """
+    if lot <= 0:
+        return contracts
+    return (contracts / lot).to_integral_value(rounding=ROUND_DOWN) * lot
+
+
 def unit_values(plan: BookPlan, contract_values: Dict[str, Decimal],
                 marks: Optional[Dict[str, Decimal]] = None) -> Dict[str, Decimal]:
     """`{inst_id: USD per contract}` = contract value x price.
@@ -224,7 +238,8 @@ def unit_values(plan: BookPlan, contract_values: Dict[str, Decimal],
 
 
 def plan_orders(current: Dict[str, Decimal], target: Dict[str, Decimal],
-                unit_usd: Dict[str, Decimal]) -> List[Order]:
+                unit_usd: Dict[str, Decimal],
+                rules: Optional[Dict[str, Any]] = None) -> List[Order]:
     """The deltas, interleaved so the running net exposure stays small.
 
     An order is `reduce_only` whenever it moves a position TOWARD zero without
@@ -241,9 +256,20 @@ def plan_orders(current: Dict[str, Decimal], target: Dict[str, Decimal],
             continue
         unit = unit_usd.get(inst_id, ZERO)
 
+        rule = (rules or {}).get(inst_id)
+
         def make(delta: Decimal, reduce_only: bool, reason: str) -> None:
             if delta == 0:
                 return
+            if rule is not None:
+                # A CLOSE is exempt from the minimum: the exchange lets a
+                # position be closed whatever its size, and refusing to shut
+                # one because it is small would strand it forever.
+                size = round_to_lot(abs(delta), rule.lot_size)
+                closing = reduce_only and abs(delta) == abs(have)
+                if size <= 0 or (size < rule.min_size and not closing):
+                    return
+                delta = size if delta > 0 else -size
             raw.append(Order(
                 inst_id=inst_id, side="buy" if delta > 0 else "sell",
                 contracts=abs(delta), reduce_only=reduce_only, reason=reason,
@@ -382,13 +408,27 @@ class BookExecutor:
             if mark > 0:
                 marks[str(row.get("instId") or "")] = mark
         target = target_book(plan)
-        unit_usd = unit_values(plan, self.broker.contract_values(), marks)
+        rules = self.broker.instrument_rules()
+        unit_usd = unit_values(
+            plan, {name: rule.contract_value for name, rule in rules.items()},
+            marks)
+
+        # An instrument the ACCOUNT'S host does not list cannot be traded on
+        # it, whatever the plan says. Demo lists 87 against production's 488,
+        # so a plan built on production prices will name instruments this
+        # account has never heard of, and they would each fail one at a time.
+        missing = sorted(name for name in target if name not in rules)
+        for name in missing:
+            target.pop(name, None)
+            result.problems.append(
+                name + " is not listed on this account's host, so it cannot be "
+                "traded here; the book is short by that leg")
 
         result.gross_before_usd = sum(
             (abs(size) * unit_usd.get(inst_id, ZERO)
              for inst_id, size in current.items()), ZERO)
 
-        orders = plan_orders(current, target, unit_usd)
+        orders = plan_orders(current, target, unit_usd, rules)
         if not orders:
             result.already_correct = True
             result.reconciled = True
@@ -436,13 +476,14 @@ class BookExecutor:
 
         if self.settle_seconds:
             self.sleep(self.settle_seconds)
-        self._verify_and_repair(unit_usd, result, tag)
+        self._verify_and_repair(unit_usd, rules, result, tag)
         return result
 
     # -- after ------------------------------------------------------------
 
     def _verify_and_repair(self, unit_usd: Dict[str, Decimal],
-                           result: ExecutionResult, tag: str) -> None:
+                           rules: Dict[str, Any], result: ExecutionResult,
+                           tag: str) -> None:
         """Read the book back and, if it is directional, shrink the heavy side.
 
         Verification is against the EXCHANGE rather than against the orders
@@ -501,7 +542,16 @@ class BookExecutor:
             unit = unit_usd.get(inst_id, ZERO)
             if unit <= 0:
                 continue
+            rule = rules.get(inst_id)
             trim = min(abs(size), excess / unit)
+            if rule is not None:
+                trim = round_to_lot(trim, rule.lot_size)
+                # A trim below the minimum cannot be sent. Skipping it and
+                # moving to the next position is right: the repair is a
+                # best-effort shrink, and the final check below reports
+                # whatever it could not fix rather than pretending it did.
+                if trim < rule.min_size:
+                    continue
             if trim <= 0:
                 continue
             order = result.add(Order(

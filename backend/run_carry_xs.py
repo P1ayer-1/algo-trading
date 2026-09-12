@@ -173,6 +173,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # a funding rate and a spread that nobody is actually quoting.
     public = Client()
     market = MarketAPI(public)
+    # Size rules from the host the orders go to; prices from production.
+    account_market = MarketAPI(client)
 
     config = BookConfig(
         top_frac=args.top_frac, hold_days=args.hold_days,
@@ -184,7 +186,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     candidates = gather(market, min_volume=args.min_volume,
                         carry_days=args.carry_days,
                         min_funding_days=args.min_funding_days,
-                        limit=args.max_instruments)
+                        limit=args.max_instruments,
+                        rules_api=account_market)
     if not candidates:
         raise SystemExit(
             "No instruments cleared the ${:,.0f}/24h filter.".format(
