@@ -1697,6 +1697,119 @@ ecord.py` runs N instruments headless in one process.
    shuffled control is not distinguishable from zero**. A failure of any of
    those is a failure of the result, not an occasion for a different cut.
 
+   ### The out-of-sample run, on the venue whose data had not been looked at
+
+   `backend\analysis\panel_blofin.py` builds the identical schema from BloFin's
+   own endpoints — `getCandlesticks(bar="1D")` returns 1,339 days and
+   `getFundingRate()` returns all 488 instruments' rates and funding cadence in
+   one call — so `factor_panel.py` reads it unchanged. 47 USDT perps clear $1M
+   a day on that venue, against 108 on Binance; its cross-section is a third
+   the width, and the quoted spread runs p25 1.05 / median 2.86 / p75 4.83 bps.
+
+   Running the frozen specification once, on 174 non-overlapping weeks from
+   2023-05 to 2026-09:
+
+   | | Binance (in sample) | BloFin (out of sample) |
+   |---|---|---|
+   | net bps per week | +40.5 | **+44.2** |
+   | 95% block interval | [+15.6, +63.5] | **[−2.8, +91.6]** |
+   | Sharpe | 1.60 | 1.05 |
+   | funding leg | +14.8 | **+18.2** |
+   | shuffled control | −2.3 | +4.5 |
+   | eligible names, median | 56 | 15 |
+
+   **Against the three predictions written in advance: net positive, yes;
+   funding leg positive, yes; control not distinguishable from zero, yes.** The
+   funding leg is positive in all four BloFin years too (+11.0, +21.6, +15.6,
+   +23.9), so across two venues that is nine calendar years out of nine.
+
+   What the table does not let anyone claim is significance. BloFin's interval
+   spans zero, and it does so for a reason visible in the last row: a median of
+   15 eligible names gives four or five positions a side, so the book's
+   standard deviation is 303 bps a week against Binance's 239 on the same
+   strategy. 2023 lost 36.8 bps a week there — and its funding leg was still
+   +11.0, with the price leg taking the loss, which is the same split the
+   Binance sample shows.
+
+   Two caveats on reading this as a replication. The two venues quote funding
+   on overlapping coins, so the samples are correlated rather than independent
+   — what differs is the universe, three of the five years, the price series,
+   the funding formula and the cap. And a one-day decision lag costs about a
+   tenth of the return rather than the result (+40.5 → +36.0 on Binance, with
+   the funding leg going +14.8 → +14.4), so none of this rests on acting at the
+   instant of settlement.
+
+9q. **The same coin, two venues, two funding rates** —
+   `backend\analysis\funding_dispersion.py`.
+
+   ```
+   python backend\analysis\funding_dispersion.py --hold-days 30 --top 8
+   ```
+
+   Step 9e's cash-and-carry was constrained by its spot leg in three ways: no
+   borrow, so only POSITIVE funding is harvestable; a spot spread of 4-50 bps
+   against a perp spread under 2; and the full notional tied up in spot.
+   Replace the spot leg with **the same coin's perp on another venue** and all
+   three go away — the pair is delta-neutral by construction, harvests the
+   funding DIFFERENCE whichever sign either leg has, and both legs are perps.
+
+   **BloFin's alt perps charge structurally more funding than Binance's**, and
+   it is not an artifact of cadence: both venues settle exactly 3.0 times a day
+   on every coin checked. Over 36,282 coin-days on 42 coins:
+
+   | coin | BloFin bps/day | Binance bps/day | difference | days BloFin higher | 2026 only |
+   |---|---|---|---|---|---|
+   | DOGE | +6.79 | +2.23 | **+4.55** | 84% | +4.71 (94%) |
+   | SUI | +6.02 | +1.51 | **+4.51** | 89% | +4.92 (94%) |
+   | ADA | +5.41 | +1.94 | +3.47 | 78% | +3.09 (81%) |
+   | SOL | +4.61 | +1.36 | +3.25 | 79% | +2.65 (75%) |
+   | ETH | +3.10 | +2.02 | +1.08 | 74% | +1.03 (76%) |
+   | BTC | +2.66 | +2.00 | +0.66 | 64% | **−0.60 (37%)** |
+
+   BTC is the row that makes the rest mean something, exactly as it was in step
+   9c: the difference is near zero on the most arbitraged contract and turns
+   negative there in 2026, so this is not a blanket offset between two data
+   sources. It is concentrated in the alts, which is where a smaller,
+   leverage-oriented venue would have the more crowded longs.
+
+   Short the dearer venue's perp, long the cheaper one's, 8 pairs at a time,
+   30-day non-overlapping holds:
+
+   | cost per leg | funding | divergence | round trip | net | 95% | Sharpe | worst |
+   |---|---|---|---|---|---|---|---|
+   | 5 bps | +70.6 | −0.4 | −10.0 | **+60.2** | [+38.9, +86.0] | 4.77 | −27 |
+   | 10 bps | +70.6 | −0.4 | −20.0 | +50.2 | [+28.9, +76.0] | 3.98 | −37 |
+   | 15 bps | +70.6 | −0.4 | −30.0 | +40.2 | [+18.9, +66.0] | 3.18 | −47 |
+
+   **The divergence leg is −0.4 bps.** Both legs are the same underlying, so
+   the coin's own move cancels and what is left is the gap between two venues'
+   marks — which is the entire reason the Sharpe is 3 to 5 where the
+   cross-sectional book's is 1.6. The worst 30-day period in 43 is −27 bps.
+
+   Four things that keep this from being an obvious yes:
+
+   - **A random-pair control earns +43.0 of the +60.2.** Two thirds of the
+     return is structural rather than selection: the trade is "be short this
+     venue's alts and long the other's", and choosing the widest pairs adds
+     about 40%. That is a weaker and more fragile claim than a selection edge,
+     because it is one bet repeated, not eight.
+   - **It needs a Binance futures account**, which this project does not have
+     and which is not available everywhere. Everything else here needs one
+     venue; this needs two, with two margin pools that cannot net.
+   - **43 independent 30-day holds**, of which 2023's eleven made nothing
+     (−0 / −10 / −20 across the cost column) and 2024-2026's made +82, +101 and
+     +50. A premium that appeared in 2024 is not the same evidence as one
+     present throughout.
+   - **Holding a leveraged short on the smaller venue for a month is venue
+     risk**, and no backtest prices it. The legs also margin separately, so a
+     move that leaves the pair flat can still liquidate one side — the failure
+     `monitor.py` was written for in 9i, now with the two halves on different
+     exchanges and no single account to read.
+
+   At 6.1%/yr on gross notional at 10 bps a leg, this is a Sharpe story rather
+   than a return story: it pays to run levered or not at all, and the leverage
+   is where the venue and liquidation risks live.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
