@@ -1,12 +1,23 @@
 """Cross-sectional funding carry: LONG the cheap perps, SHORT the dear ones.
 
-    plan.py   sizes the whole book, prices the risk, says whether to do it
+    plan.py     sizes the whole book, prices the risk, says whether to do it
+    execute.py  moves the exchange from whatever it holds to that book
+    broker.py   the REST calls execute.py is written against
 
-There is no `execute.py` and no `monitor.py` here, and that absence is
-deliberate rather than unfinished. The repo's rule is that order-sending code
-is asked for after the evidence, by name; the evidence for this book exists
-(step 9q) and the order path does not, so nothing in this package can place a
-trade. `plan.py` imports no broker.
+`plan.py` still imports no broker and has no path to `placeOrder`, which is
+checkable with a grep and is checked that way - the order path lives in
+`execute.py` and nowhere else, so every sizing and margin question is settled
+while the answer is still text.
+
+There is one verb rather than an open and a close, and that follows from the
+strategy: this book is REBALANCED weekly, so "open" is the case where the
+exchange holds nothing and "close" is the case where the target is empty.
+`reconcile` covers all three and is idempotent, because twelve legs is twelve
+chances to be interrupted and the answer to "what if it dies halfway" has to be
+"run it again".
+
+There is no `monitor.py` yet. Nothing has been traded, so there is nothing to
+read back.
 
 What this is, against the other carry
 -------------------------------------
@@ -27,6 +38,8 @@ does not have: thirty legs margin separately, and the book is directional
 between the first fill and the last.
 """
 
+from .execute import BookExecutor, ExecutionResult, Order
 from .plan import BookConfig, BookPlan, Candidate, LegPlan, plan_book
 
-__all__ = ["BookConfig", "BookPlan", "Candidate", "LegPlan", "plan_book"]
+__all__ = ["BookConfig", "BookExecutor", "BookPlan", "Candidate",
+           "ExecutionResult", "LegPlan", "Order", "plan_book"]

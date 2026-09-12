@@ -107,6 +107,10 @@ class LegPlan:
     contracts: Decimal = ZERO
     base: Decimal = ZERO
     price: Decimal = ZERO
+    # USD per contract = contract_value * price. A contract is a different
+    # amount of money on every instrument (BloFin: 0.001 BTC, 1000 DOGE), so
+    # anything that sizes or balances on contract COUNT balances nothing.
+    contract_value: Decimal = Decimal("1")
     notional_usd: Decimal = ZERO
     target_notional_usd: Decimal = ZERO
     carry_bps_per_day: float = 0.0
@@ -318,7 +322,8 @@ def plan_book(candidates: Sequence[Candidate], config: Optional[BookConfig] = No
         for candidate in members:
             leg = LegPlan(inst_id=candidate.inst_id, side=side,
                           carry_bps_per_day=candidate.carry_bps_per_day,
-                          spread_bps=candidate.spread_bps)
+                          spread_bps=candidate.spread_bps,
+                          contract_value=candidate.contract_value)
             # Cross the spread: buy the ask, sell the bid. Pricing a plan at
             # the mid understates the round trip by half a spread per leg, and
             # on this venue a median spread of 2.86 bps makes that 2.86 bps of
