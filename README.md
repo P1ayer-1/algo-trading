@@ -1590,6 +1590,113 @@ ecord.py` runs N instruments headless in one process.
    (0.04–0.07), so the mechanism works and learned that the daily range carries
    most of what there is. There is simply nothing there to combine.
 
+9p. **A cross-section of perpetuals, held for a week** —
+   `backend\analysis\panel_daily.py` and `backend\analysis\factor_panel.py`.
+
+   ```
+   python backend\analysis\panel_daily.py
+   python backend\analysis\factor_panel.py --vol-scale --hold-days 7 --top-frac 0.3
+   ```
+
+   **The observation that motivated it.** Steps 6 through 9o all forecast price
+   over seconds to one day, and all of them died on cost rather than on
+   prediction. The one branch that ever cleared its cost — the funding carry of
+   9e-9j — cleared it by not forecasting anything: it is a cash flow held for
+   30 days, so a 32 bps four-leg round trip is amortised over hundreds of bps
+   of collected funding. Every dead branch and the one live one differ in the
+   same two variables, and the quadrant nothing here had tested is **many
+   instruments, held for weeks**. At a 7-day hold a 10 bps round trip sits
+   against a cross-sectional return dispersion of several hundred bps, so the
+   break-even IC is roughly 0.02 against the 0.177 that killed step 9l.
+
+   `panel_daily.py` folds the 5.7 GB 1-minute archive into 108 perpetuals x
+   1,825 days and joins Binance funding onto it. Two alignments decide the
+   whole result and both are tested: a row closes at 00:00 UTC, and funding for
+   day D is what ACCRUED during day D — the settlement stamped 00:00 on D+1,
+   rounded to its nominal minute first, because settlements print milliseconds
+   late and a raw `-1ms` leaves them on the wrong side of midnight. Bucketing
+   them a day early hands every row tomorrow's carry today.
+
+   `factor_panel.py` scores factors as money. Holding periods do not overlap,
+   so the rebalance count IS the effective N and no correction is offered; the
+   label is market-neutral and net of funding; the universe is point-in-time on
+   both history and liquidity; cost is charged on turnover rather than per
+   position; and gross is split into its **price** and **funding** legs,
+   because for a carry factor that split is the result.
+
+   **Seventeen factors, and the carry family is the one that stands up.** At a
+   7-day hold, top/bottom 30%, inverse-vol sized, 10 bps per unit traded (twice
+   the VIP 1 taker fee):
+
+   | factor | net bps/period | 95% block | Sharpe | ann% | control |
+   |---|---|---|---|---|---|
+   | carry_7 | **+40.5** | [+15.6, +63.5] | 1.60 | +21.1 | −2.3 |
+   | carry_mom (60/40 rank blend) | **+44.5** | [+18.0, +68.5] | 1.57 | +23.2 | −0.0 |
+   | mom_14 | +12.5 | [−14.7, +37.7] | 0.36 | +6.5 | −7.2 |
+   | carry_demeaned | +4.3 | [−23.7, +32.7] | 0.15 | +2.2 | −5.4 |
+   | carry_accel | −6.5 | [−34.5, +20.5] | −0.23 | −3.4 | +3.4 |
+
+   Four things distinguish this from the previous nineteen results, and they
+   are the reason it is written up rather than discarded:
+
+   - **The funding leg is a cash flow, and it is the same size every year.**
+     Split by calendar year, carry_7's funding leg reads +18.1, +15.5, +18.1,
+     +18.1, +31.3 bps per week. Its price leg reads +62.5, +4.2, −9.8, +72.5,
+     +38.8. The stable half is the half that is not a forecast, which is
+     exactly the shape of the only other thing that ever worked here.
+   - **It replicates in 12 of 12 random halves of the universe.** Splitting the
+     cross-section rather than the timeline gives as many replications as there
+     are ways to cut it, over identical dates and regimes; both halves were
+     positive in all six splits tried, at Sharpe 0.59 to 1.97. A handful of
+     lucky symbols cannot do that.
+   - **95 of 96 specification-grid cells are positive** — holds of 3/7/14/30
+     days, top 10/20/30%, costs of 5/10/20/30 bps, and universes cut at $5M and
+     $50M a day. The one negative is the most hostile corner of the grid. It
+     degrades with cost and with liquidity exactly as it should, rather than
+     having a peak where the search stopped.
+   - **The signal is the LEVEL of funding, not a change in it.** Subtracting
+     each coin's own 180-day mean destroys the effect (+4.3), and so does
+     ranking on acceleration (−6.5). That makes it a persistent risk premium
+     rather than a crowding-timing signal, which is both the more believable
+     reading and the one that implies low turnover.
+
+   **What it costs when it is wrong.** The worst week was 2024-02-26 at
+   **−1,991 bps** on gross notional: SHIB +127%, PEPE +136% and BONK +103% in
+   seven days, and the book was short all three because they had the highest
+   funding. That is not a bug in the backtest, it is the trade — a carry book
+   is short whatever is crowded, and occasionally the crowd is right and
+   violent. Worst drawdown over the five years is 40% of gross notional.
+   Momentum is the natural hedge (the two return series correlate **−0.06**),
+   and a 60/40 blend cuts the worst week to −881 while raising Sharpe.
+
+   **What is not established.** Everything above is Binance, and this account
+   trades BloFin. Spreads are a constant rather than a history. The universe is
+   the hundred most-traded contracts as of 2026-09-11, so it is
+   survivorship-selected — least badly for carry, which ranks on a cash flow
+   rather than on past price, but not innocently. And after seventeen factors
+   and four sweeps the specification has been looked at enough times to be
+   fitted whether or not anything was deliberately optimised.
+
+   ### Pre-registration, written before the second venue was looked at
+
+   The defence against that last point is not another control on the same
+   sample. It is to freeze the specification and evaluate it once on data that
+   has never been seen, so this is committed **before** `panel_blofin.py` is
+   run. The frozen specification:
+
+   | | |
+   |---|---|
+   | factor | `carry_7` — negated trailing 7-day mean funding, bps/day |
+   | universe | point in time: >= 90 complete days, >= $5M median daily volume over the trailing 30 |
+   | book | long top 30%, short bottom 30%, dollar-neutral, sized 1/vol_30, each side renormalised |
+   | hold | 7 days, non-overlapping |
+   | cost | 10 bps per unit of notional traded |
+
+   The prediction, stated in advance: on BloFin's own instruments, funding and
+   daily closes, **net is positive, the funding leg is positive, and the
+   shuffled control is not distinguishable from zero**. A failure of any of
+   those is a failure of the result, not an occasion for a different cut.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

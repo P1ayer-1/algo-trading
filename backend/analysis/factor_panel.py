@@ -283,7 +283,59 @@ def build_features(panel: Panel) -> Dict[str, np.ndarray]:
         features["rvshock_7"] = -(_trailing_mean(panel.rv, 7)
                                   / _trailing_mean(panel.rv, 30))
 
+    # Is the carry signal the LEVEL of funding or a coin's deviation from its
+    # own norm? They are different bets and the distinction is testable. A coin
+    # that has paid 3 bps a day for a year is not "expensive" in any surprising
+    # sense - it is structurally so, and the level factor is short it
+    # permanently. Subtracting each coin's own trailing mean keeps only the
+    # transient part. If the demeaned version scores as well, the effect is
+    # about changes in crowding; if only the level scores, it is a persistent
+    # risk premium and the two imply very different position turnover.
+    own_mean = _trailing_mean(features["carry_7"], 180)
+    features["carry_demeaned"] = features["carry_7"] - own_mean
+    features["carry_persistent"] = own_mean
+    # Funding accelerating: this week's rate against this month's.
+    features["carry_accel"] = features["carry_3"] - features["carry_30"]
+
+    # One book rather than two. Blending the RETURNS of two books assumes both
+    # are run and both are paid for; rank-averaging the scores runs a single
+    # book, which nets the positions a symbol would hold in both and pays the
+    # turnover once. Ranks rather than z-scores because funding has a fat right
+    # tail and a z-score would let one extreme name set the whole combination.
+    features["carry_mom"] = _rank_blend(
+        (features["carry_7"], 0.6), (features["mom_14"], 0.4))
+    features["carry_mom_even"] = _rank_blend(
+        (features["carry_7"], 0.5), (features["mom_14"], 0.5))
+
     return features
+
+
+def _rank_blend(*weighted: Tuple[np.ndarray, float]) -> np.ndarray:
+    """Weighted average of within-date percentile ranks.
+
+    Ranks are taken across the symbols present on each date, so a date with 30
+    names and one with 80 contribute on the same 0..1 scale. Rows where any
+    input is missing are NaN rather than imputed: a blend that silently falls
+    back to one of its components on the dates where the other is unavailable
+    is two different strategies sharing a name.
+    """
+    shape = weighted[0][0].shape
+    out = np.full(shape, np.nan)
+    for d in range(shape[0]):
+        usable = np.ones(shape[1], dtype=bool)
+        for values, _ in weighted:
+            usable &= np.isfinite(values[d])
+        index = np.flatnonzero(usable)
+        if len(index) < 2:
+            continue
+        total = 0.0
+        blended = np.zeros(len(index))
+        for values, weight in weighted:
+            order = np.argsort(np.argsort(values[d][index]))
+            blended += weight * (order / (len(index) - 1.0))
+            total += weight
+        out[d, index] = blended / total
+    return out
 
 
 # ---------------------------------------------------------------------------
