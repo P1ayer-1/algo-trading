@@ -101,6 +101,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── range_harness.py   # the bar every range model is scored on
 │   │   ├── range_gated.py     # trade the fade only when a model says the range holds
 │   │   ├── range_multiscale.py # ranges at 4h/1d/3d/7d, each side scored separately
+│   │   ├── attention_model.py # attention across timeframes, numpy, gradient-checked
 │   │   ├── reversion_scale.py # is the reversion real, or is it the spread?
 │   │   ├── fetch_klines.py    # bulk 1m klines, with the listing dates made visible
 │   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
@@ -109,7 +110,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (785 tests)
+│   └── tests/                 # pytest suite (795 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -1533,6 +1534,61 @@ ecord.py` runs N instruments headless in one process.
    The model is not merely forecasting the size of the next move — it leans one
    way or the other, driven by the momentum and range-position features. The
    lean is simply uninformative about where price actually lands.
+
+9p. ~~**Attention across timeframes**~~ — `backend\analysis\attention_model.py`,
+   `range_multiscale.py --model attention`. Step 9o combined the scales
+   linearly, which cannot rule out that the scales interact. This puts one
+   token per scale and lets them read each other before anything is predicted.
+
+   ```
+   python backend\analysis\range_multiscale.py --model attention --scale-hours 4,24,72,168
+   ```
+
+   ~1,300 parameters over four tokens, in numpy with hand-derived gradients —
+   torch would be a multi-GB dependency for matrices this size, in an analysis
+   layer that needs numpy alone. A hand-derived backward pass is worth exactly
+   what its gradient check is worth, so the first test is central finite
+   differences on **every** parameter, and the second plants a cross-scale
+   PRODUCT no linear model can represent, which attention must beat ridge on by
+   30% of MSE.
+
+   **That second test earned its place immediately.** The first version
+   mean-pooled the tokens, and since the input projection is shared across
+   scales, the head saw only the average token — it could not recover even a
+   plain linear target. Concatenating the tokens fixed it. Without a
+   planted-signal test, an underfitting model's failure would have been written
+   up as a fact about the market.
+
+   **Ten majors, one year (80,640 rows): worse than ridge everywhere.**
+   Break targets 0.276–0.500 against ridge's 0.305–0.538; centre −0.027 against
+   −0.025. A capacity sweep made it worse rather than better — d64 over 60
+   epochs drops `break_up@1d` to **+0.374** against ridge's +0.534, which is
+   overfitting a target whose signal is mostly linear.
+
+   **35 symbols, five years (1,480,232 rows): parity on the learnable target,
+   nothing on the one that pays.**
+
+   | target | ridge | attention |
+   |---|---|---|
+   | centre | +0.020 (control 0.001) | +0.012 (control **0.024**) |
+   | break_up@1d | +0.512 (control 0.102) | **+0.518** (control **0.299**) |
+   | fit time, centre | 6s | 775s |
+
+   Read the controls, not the headline. Ridge clears its own noise floor by
+   **0.410** on `break_up@1d`; attention by 0.219, because the same pipeline
+   fitted on shuffled labels still reaches 0.299. On the centre, attention sits
+   *below* its own control.
+
+   **The data argument was half right.** 18x more data moved attention from
+   clearly worse (−0.066 on `break_up@1d`) to nominal parity (+0.006), exactly
+   as "it is data-hungry" predicts. It closed that gap on the target that was
+   never worth money, and closed nothing on the centre. Capacity was not the
+   binding constraint at either sample size.
+
+   One part is worth keeping: the attention map is coherent. Every scale reads
+   the **1d and 3d** tokens (weights 0.29–0.43) and nearly ignores 4h
+   (0.04–0.07), so the mechanism works and learned that the daily range carries
+   most of what there is. There is simply nothing there to combine.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
