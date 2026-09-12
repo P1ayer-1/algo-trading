@@ -1,0 +1,21 @@
+name: crypto_bot
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  # backend/analysis runs on numpy alone; pandas backs the daily/panel CSVs
+  - numpy
+  - pandas
+  - scipy          # backend/analysis/train_model.py only
+  - lightgbm       # backend/analysis/train_model.py only
+  - requests       # via the vendored blofin SDK, and REST polling (OI, mark-price, Bybit)
+  - websockets     # via the vendored blofin SDK, and trading/hyperliquid.py
+  - python-dotenv  # config.py loads .env
+  - pytest         # backend/pytest.ini
+  # optional, only for backend/analysis/compact.py once the raw archive is large:
+  # - pyarrow
+  # - duckdb
+  - pip:
+      # vendored separate git repo (see config.py, which puts its src/ on sys.path)
+      - -e ./blofin-sdk-python
