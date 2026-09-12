@@ -42,9 +42,21 @@ Every factor is run beside a control that shuffles the factor's values across
 symbols WITHIN each rebalance date. That keeps the number of positions, the
 holding period, the universe, the turnover and the cost identical, and
 destroys only the pairing between a symbol and its score. A factor that does
-not beat this is not selecting symbols, whatever its t-statistic says. The
-control is run over several seeds and its best draw is reported, because the
-question is whether the factor beats the luckiest noise, not the average noise.
+not beat this is not selecting symbols, whatever its t-statistic says.
+
+**The control is reported as a distribution, not as a single number**, and that
+is a correction rather than a preference. An earlier version reported the best
+of five shuffles, which is a MAX statistic: with a standard error near 25 bps
+the luckiest of five draws sits about 1.2 standard deviations up, so a control
+of +35 was what noise looked like and got read once as the control beating the
+factor. It misleads in both directions - a lucky draw can also flatter a weak
+factor by making the bar look like one it cleared. So `ctrl` is now the MEAN
+over `--control-seeds` shuffles and `pct` is the share of them the real book
+beat, which is an empirical one-sided p-value and the number to read.
+
+A useful property of the control mean: it lands near minus the cost, because a
+shuffled book pays the same turnover and earns nothing. If it does not, the
+cost model and the turnover disagree with each other.
 
 What this cannot fix
 --------------------
@@ -554,10 +566,54 @@ def _weights(scores: np.ndarray, eligible: np.ndarray, top_frac: float,
     return weights, len(longs), len(shorts)
 
 
+def load_spreads(path: Path, symbols: Sequence[str], *, taker_fee_bps: float,
+                 default_spread_bps: float) -> np.ndarray:
+    """Per-symbol cost per unit of notional traded: fee plus half the spread.
+
+    `--cost-bps` charges every instrument the same, which is the assumption the
+    live planner immediately contradicted: on BloFin, BTC quotes 0.01 bps and
+    NEAR 16.9, and the carry book wants to SHORT the wide ones, because wide
+    spreads and crowded longs live on the same instruments. A flat cost is
+    therefore not a neutral simplification - it is one that flatters this
+    particular strategy.
+
+    A symbol with no measured spread gets `default_spread_bps` rather than the
+    cheap end, and the count of those is reported: filling a gap with the
+    median would quietly price the unmeasured names as typical when the reason
+    they are missing is usually that they are small.
+    """
+    measured: Dict[str, float] = {}
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    measured[row["symbol"]] = float(row["spread_bps"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+    costs = np.empty(len(symbols))
+    missing = []
+    for index, symbol in enumerate(symbols):
+        spread = measured.get(symbol)
+        if spread is None:
+            spread = default_spread_bps
+            missing.append(symbol)
+        costs[index] = taker_fee_bps + spread / 2.0
+    print("Per-instrument cost from {}: median {:.2f} bps, max {:.2f} bps"
+          .format(path.name, float(np.median(costs)), float(costs.max())))
+    if missing:
+        print("  {} of {} symbols had no measured spread and were charged the "
+              "{:.1f} bps default: {}".format(
+                  len(missing), len(symbols), default_spread_bps,
+                  ", ".join(sorted(missing)[:8])
+                  + (" ..." if len(missing) > 8 else "")))
+    return costs
+
+
 def run_factor(panel: Panel, scores: np.ndarray, eligible: np.ndarray, *,
                hold_days: int, top_frac: float, cost_bps: float,
                start: int, shuffle_seed: Optional[int] = None,
-               risk: Optional[np.ndarray] = None) -> Result:
+               risk: Optional[np.ndarray] = None,
+               cost_per_symbol: Optional[np.ndarray] = None) -> Result:
     """Hold a dollar-neutral book on non-overlapping `hold_days` periods.
 
     `shuffle_seed` permutes each date's scores across the eligible symbols,
@@ -615,8 +671,13 @@ def run_factor(panel: Panel, scores: np.ndarray, eligible: np.ndarray, *,
             price_leg[held], nan=0.0)))
         funding_part = float(np.nansum(weights[held] * funding_leg[held]))
 
-        turnover = float(np.abs(weights - previous).sum())
-        net = gross - turnover * cost_bps
+        traded = np.abs(weights - previous)
+        turnover = float(traded.sum())
+        if cost_per_symbol is not None:
+            charged = float((traded * cost_per_symbol).sum())
+        else:
+            charged = turnover * cost_bps
+        net = gross - charged
         previous = weights
 
         result.periods.append(Rebalance(
@@ -671,26 +732,31 @@ def print_report(rows: Sequence[Tuple[str, Dict[str, float], Dict[str, float],
           "returns are bps per period on gross notional")
     print()
     header = ("factor", "net", "95% block", "Sharpe", "ann%", "hit", "turn",
-              "IC", "beta", "alpha", "price", "fund", "ctrl net")
-    print("{:<14} {:>8} {:>18} {:>7} {:>7} {:>5} {:>5} {:>7} {:>6} {:>7} "
-          "{:>7} {:>6} {:>9}".format(*header))
+              "beta", "alpha", "price", "fund", "ctrl", "pct")
+    print("{:<14} {:>8} {:>18} {:>7} {:>7} {:>5} {:>5} {:>6} {:>7} "
+          "{:>7} {:>6} {:>8} {:>6}".format(*header))
     print("-" * 126)
     for name, real, control, interval in rows:
         if not real:
             continue
         print("{:<14} {:>8.1f} {:>18} {:>7.2f} {:>7.1f} {:>5.0%} "
-              "{:>5.2f} {:>7.3f} {:>6.2f} {:>7.1f} {:>7.1f} {:>6.1f} "
-              "{:>9.1f}".format(
+              "{:>5.2f} {:>6.2f} {:>7.1f} {:>7.1f} {:>6.1f} "
+              "{:>8.1f} {:>6.0%}".format(
                   name, real["net_bps"],
                   "[{:+.1f}, {:+.1f}]".format(interval[0], interval[1]),
                   real["sharpe"], real["annual_pct"], real["hit"],
-                  real["turnover"], real["ic"], real["beta"],
+                  real["turnover"], real["beta"],
                   real["alpha_bps"], real["price_bps"], real["funding_bps"],
-                  control.get("net_bps", float("nan"))))
+                  control.get("net_bps", float("nan")),
+                  control.get("percentile", float("nan"))))
     print()
     print("`price` and `fund` split gross into the price move and the funding "
           "collected. For the carry family that split is the result: a return "
           "from `fund` is a cash flow, one from `price` is a forecast.")
+    print("`ctrl` is the MEAN of the shuffled controls and `pct` the share of "
+          "them the real book beat - an empirical one-sided p-value. `ctrl` "
+          "should land near minus the cost, since a shuffled book pays the "
+          "same turnover and earns nothing.")
 
 
 def print_years(rows: Sequence[Tuple[str, Dict[str, float], Dict[str, float],
@@ -859,7 +925,7 @@ def verdict(rows: Sequence[Tuple[str, Dict[str, float], Dict[str, float],
     print()
     survivors = [
         (name, real, control, interval) for name, real, control, interval in rows
-        if real and interval[0] > 0.0 and real["net_bps"] > control.get("net_bps", 0.0)
+        if real and interval[0] > 0.0 and control.get("percentile", 0.0) >= 0.95
     ]
     if not survivors:
         print("VERDICT: nothing clears. No factor has a bootstrap interval above "
@@ -875,15 +941,16 @@ def verdict(rows: Sequence[Tuple[str, Dict[str, float], Dict[str, float],
     for name, real, control, interval in survivors:
         print("  {:<14} {:+.1f} bps/period  [{:+.1f}, {:+.1f}]  "
               "Sharpe {:.2f}  {:+.1f}%/yr  beta {:+.2f}  alpha {:+.1f} "
-              "(t {:.2f})  control {:+.1f}".format(
+              "(t {:.2f})  beat {:.0%} of shuffles".format(
                   name, real["net_bps"], interval[0], interval[1],
                   real["sharpe"], real["annual_pct"], real["beta"],
-                  real["alpha_bps"], real["alpha_t"], control.get("net_bps", 0.0)))
+                  real["alpha_bps"], real["alpha_t"],
+                  control.get("percentile", 0.0)))
     print()
     print(str(len(survivors)) + " of " + str(len(rows)) + " factors tested "
           "cleared, so read that as " + str(len(survivors)) + " draws in "
           + str(len(rows)) + ". The columns that decide it are `alpha` (net of "
-          "the market the book is carrying) and `ctrl net`, not the interval.")
+          "the market the book is carrying) and `pct`, not the interval.")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -898,8 +965,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-volume", type=float, default=5e6,
                         help="median daily quote volume over the trailing month")
     parser.add_argument("--factors", help="comma-separated; default all")
-    parser.add_argument("--control-seeds", type=int, default=5)
+    parser.add_argument("--control-seeds", type=int, default=50,
+                        help="shuffles per factor; the report gives their "
+                             "mean and the percentile the real book beat")
     parser.add_argument("--detail", help="comma-separated factors to break down by year")
+    parser.add_argument("--spreads", type=Path, default=None,
+                        help="CSV of measured per-symbol spreads; charges each "
+                             "instrument its own fee + half spread instead of --cost-bps")
+    parser.add_argument("--default-spread-bps", type=float, default=10.0,
+                        help="charged to symbols absent from --spreads")
     parser.add_argument("--sweep", help="one factor over the whole specification grid")
     parser.add_argument("--split", help="one factor over random halves of the universe")
     parser.add_argument("--vol-scale", action="store_true",
@@ -951,25 +1025,40 @@ def main(argv: Optional[List[str]] = None) -> int:
     # negation. Taken from the same feature so the sizing cannot see a day the
     # features cannot.
     risk = -features["lowvol_30"] if args.vol_scale else None
+    cost_per_symbol = None
+    if args.spreads:
+        cost_per_symbol = load_spreads(
+            args.spreads, panel.symbols, taker_fee_bps=cost_bps,
+            default_spread_bps=args.default_spread_bps)
 
     rows = []
     results: Dict[str, Result] = {}
     for name in names:
         real = run_factor(panel, features[name], eligible, hold_days=args.hold_days,
                           top_frac=args.top_frac, cost_bps=cost_bps,
-                          start=args.start, risk=risk)
+                          start=args.start, risk=risk,
+                          cost_per_symbol=cost_per_symbol)
         real.name = name
         results[name] = real
         controls = [
             run_factor(panel, features[name], eligible, hold_days=args.hold_days,
                        top_frac=args.top_frac, cost_bps=cost_bps, start=args.start,
-                       shuffle_seed=seed, risk=risk)
+                       shuffle_seed=seed, risk=risk,
+                       cost_per_symbol=cost_per_symbol)
             for seed in range(args.control_seeds)
         ]
         summaries = [c.summary(periods_per_year) for c in controls]
-        best_control = max((s for s in summaries if s),
-                           key=lambda s: s["net_bps"], default={})
         summary = real.summary(periods_per_year)
+        control_nets = np.array([s["net_bps"] for s in summaries if s])
+        best_control: Dict[str, float] = {}
+        if len(control_nets):
+            best_control = {
+                "net_bps": float(control_nets.mean()),
+                "sd": float(control_nets.std(ddof=1)) if len(control_nets) > 1 else 0.0,
+                "ic": float(np.mean([s["ic"] for s in summaries if s])),
+                "percentile": (float((control_nets < summary["net_bps"]).mean())
+                               if summary else float("nan")),
+            }
         interval = (block_bootstrap(real.net) if summary
                     else (float("nan"), float("nan")))
         rows.append((name, summary, best_control, interval))

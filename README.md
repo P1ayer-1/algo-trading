@@ -1590,7 +1590,7 @@ ecord.py` runs N instruments headless in one process.
    (0.04–0.07), so the mechanism works and learned that the daily range carries
    most of what there is. There is simply nothing there to combine.
 
-9p. **A cross-section of perpetuals, held for a week** —
+9q. **A cross-section of perpetuals, held for a week** —
    `backend\analysis\panel_daily.py` and `backend\analysis\factor_panel.py`.
 
    ```
@@ -1715,11 +1715,15 @@ ecord.py` runs N instruments headless in one process.
    | 95% block interval | [+15.6, +63.5] | **[−2.8, +91.6]** |
    | Sharpe | 1.60 | 1.05 |
    | funding leg | +14.8 | **+18.2** |
-   | shuffled control | −2.3 | +4.5 |
+   | shuffled control (best of 5) | −2.3 | +4.5 |
    | eligible names, median | 56 | 15 |
 
    **Against the three predictions written in advance: net positive, yes;
-   funding leg positive, yes; control not distinguishable from zero, yes.** The
+   funding leg positive, yes; control not distinguishable from zero, yes.**
+   (The control column here is the best of five shuffles, which step 9s shows
+   was the wrong statistic to report. On 200 shuffles the control MEAN is −13.3
+   and the real book beats 99% of them, so the verdict holds and the number
+   quoted above does not — read 9s's table instead.) The
    funding leg is positive in all four BloFin years too (+11.0, +21.6, +15.6,
    +23.9), so across two venues that is nine calendar years out of nine.
 
@@ -1739,7 +1743,7 @@ ecord.py` runs N instruments headless in one process.
    the funding leg going +14.8 → +14.4), so none of this rests on acting at the
    instant of settlement.
 
-9q. **The same coin, two venues, two funding rates** —
+9r. **The same coin, two venues, two funding rates** —
    `backend\analysis\funding_dispersion.py`.
 
    ```
@@ -1809,6 +1813,108 @@ ecord.py` runs N instruments headless in one process.
    At 6.1%/yr on gross notional at 10 bps a leg, this is a Sharpe story rather
    than a return story: it pays to run levered or not at all, and the leverage
    is where the venue and liquidation risks live.
+
+9s. **A third venue, a correction, and a planner** —
+   `backend\analysis\panel_hyperliquid.py`, `backend\trading\strategies\carry_xs\`
+   and `backend\plan_carry_xs.py`.
+
+   ```
+   python backend\analysis\panel_hyperliquid.py --top 60
+   python backend\plan_carry_xs.py --notional 4000 --min-volume 2000000
+   ```
+
+   ### The correction: the control was being read as a maximum
+
+   Steps 9q and 9r reported the BEST of five shuffled controls. That is a max
+   statistic. With a standard error near 25 bps the luckiest of five draws sits
+   about 1.2 standard deviations up, so "control +35" was what noise looks like
+   — and on the first Hyperliquid run it read as *the control beating the
+   factor*, which it was not. It misleads in both directions: a lucky draw can
+   equally flatter a weak factor by making the bar look like one it cleared.
+
+   `factor_panel.py` now reports the control MEAN and `pct`, the share of
+   shuffles the real book beat, which is an empirical one-sided p-value. On 200
+   shuffles per venue, at the frozen specification:
+
+   | venue | periods | real | control mean | control sd | **pct** |
+   |---|---|---|---|---|---|
+   | Binance | 243 | +40.5 | −14.2 | 10.9 | **100.0%** |
+   | BloFin | 174 | +44.2 | −13.3 | 21.4 | **99.0%** |
+   | Hyperliquid | 138 | +31.2 | −15.8 | 25.0 | **95.0%** |
+
+   The control means land near minus the cost, which is the check that the cost
+   model and the turnover agree: a shuffled book pays the same turnover and
+   earns nothing. The three venues are not independent — they quote funding on
+   overlapping coins — but the universes, the dates, the price series, the
+   funding formulas and the cadences all differ, and Hyperliquid settles
+   **hourly** against the other two's three times a day.
+
+   **One thing on Hyperliquid points the wrong way and belongs here rather than
+   in a footnote.** Its funding leg decays across the sample — +30.9, +21.5,
+   +12.0, +10.3 bps a week by year — and 2025 netted +4.6. On a venue that
+   launched into this period and grew fast, a premium that shrinks year on year
+   is what an opportunity being competed away looks like. Binance's funding leg
+   over five years did not decay (+18.1, +15.5, +18.1, +18.1, +31.3), so this is
+   not yet a statement about the effect as a whole. It is the single most
+   important thing to keep measuring.
+
+   ### Spreads are no longer a constant
+
+   The one assumption left in 9q was a flat cost. `--spreads` now charges each
+   instrument its own fee plus half its measured spread, from the snapshot
+   `panel_blofin.py` writes. On BloFin that is a median of 6.43 bps and a max of
+   12.21 per unit traded, and it does not break the result — it slightly
+   improves on the flat 10 bps, which was conservative:
+
+   | BloFin, $2M/day universe, median 22 names | net | 95% block | Sharpe | pct |
+   |---|---|---|---|---|
+   | flat 10 bps | +43.7 | [+6.1, +80.8] | 1.23 | 100% |
+   | measured per-instrument spreads | **+46.4** | [+8.6, +83.2] | 1.30 | 100% |
+
+   Note the universe: at the pre-registered $5M floor BloFin gives a median of
+   15 names, and at $2M it gives 22 and an interval clear of zero. That is a
+   post-hoc cut and is reported as one — the pre-registered result stands at
+   $5M, where it passed all three predictions with a wide interval.
+
+   ### The planner, and what running it live said
+
+   `trading/strategies/carry_xs/plan.py` sizes the book: point-in-time
+   eligibility, inverse-volatility weights capped at 25% a name, lots rounded
+   down, both sides re-weighted across their survivors and then trimmed to
+   whatever the weaker one can fill, liquidation priced per leg, and refusals
+   plural. It imports no broker and there is no path from it to `placeOrder` —
+   a grep, and now also a test that greps. There is deliberately **no
+   `execute.py`**: the evidence justifies a plan, and order-sending code is
+   asked for by name.
+
+   Running it against BloFin was worth more than another backtest, because it
+   contradicted an assumption immediately. At the pre-registered $5M floor the
+   venue offers **eleven** instruments today, three a side, and NEAR quoting
+   16.9 bps pushed the round trip to 14.0 against 9.1 bps of carry. It refused,
+   correctly. At a $2M floor, 29 instruments and 12 legs:
+
+   | | |
+   |---|---|
+   | carry spread | +7.03 bps/day between the two baskets |
+   | expected funding | +24.6 bps per 7-day hold, per unit of gross |
+   | round trip | −12.7 bps (taker + half spread, both ways) |
+   | expected net | **+11.9 bps** = $4.69 on $3,965 gross |
+   | break-even | 3.6 days |
+   | net exposure | $-9.45, 0.24% of gross |
+
+   Three things that table makes concrete and no backtest did. The venue's
+   tradeable cross-section is **29 names, not 108**, so the book is a third the
+   width the strongest evidence was measured on. The round trip is dominated by
+   spread rather than fee — 12.7 bps against a 10 bps taker round trip — and the
+   book wants to short exactly the wide names, because wide spreads and crowded
+   longs sit on the same instruments. And at $3,965 gross against names trading
+   $2-10M a day, capacity is the next binding constraint, not edge.
+
+   **What is still missing, in order.** No executor, so none of this trades. No
+   monitor, so a book that is on has no scoreboard — and unlike the two-leg
+   carry, this one has twelve legs that margin separately. Capacity is
+   unmeasured. And the Hyperliquid decay is a live question that only more time
+   answers.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
