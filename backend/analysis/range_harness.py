@@ -319,8 +319,12 @@ def evaluate(datasets: Sequence[Dataset], make_model: Callable[[], Model], targe
     datasets = [dataset for dataset in datasets if len(dataset)]
     if not datasets:
         raise SystemExit("No dataset has any rows.")
-    if target not in TARGETS:
-        raise SystemExit(f"Unknown target {target!r}. Known: {', '.join(TARGETS)}")
+    if target not in datasets[0].targets:
+        # Validated against what the dataset actually carries rather than the
+        # CLI list, so a study can add targets (per-scale breaks, say) and
+        # still be scored on this bar instead of inventing its own.
+        known = ", ".join(sorted(datasets[0].targets))
+        raise SystemExit(f"Unknown target {target!r}. This dataset carries: {known}")
 
     horizon_ms = datasets[0].horizon_minutes * MINUTE_MS
     split = split_timestamp(datasets, train_fraction)

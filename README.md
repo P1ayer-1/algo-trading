@@ -100,6 +100,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── range_information.py  # what a forecast range is worth: centre vs width
 │   │   ├── range_harness.py   # the bar every range model is scored on
 │   │   ├── range_gated.py     # trade the fade only when a model says the range holds
+│   │   ├── range_multiscale.py # ranges at 4h/1d/3d/7d, each side scored separately
 │   │   ├── reversion_scale.py # is the reversion real, or is it the spread?
 │   │   ├── fetch_klines.py    # bulk 1m klines, with the listing dates made visible
 │   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
@@ -108,7 +109,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (772 tests)
+│   └── tests/                 # pytest suite (785 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -1479,6 +1480,59 @@ ecord.py` runs N instruments headless in one process.
    variance ratio looks like a strategy that should earn +16. The statistic was
    never measuring what it appeared to measure, and this is the check to run
    **before** writing the next reversion strategy rather than after.
+
+9o. ~~**Ranges at several timeframes, per side**~~ —
+   `backend\analysis\range_multiscale.py`. Step 9l scored one symmetric
+   `contained` target — did price stay inside *both* edges of *one* range —
+   which collapses the two sides into a bit and throws the direction away.
+   This computes the range at 4h, 1d, 3d and 7d, predicts each side of each
+   scale separately, and asks whether knowing which scales break says where
+   price ends up.
+
+   ```
+   python backend\analysis\range_multiscale.py --scale-hours 4,24,72,168
+   ```
+
+   **What the idea reduces to.** A break at scale L is
+   `log(future_high/close) > log(range_high_L/close)`, and the left side does
+   not depend on L. So nested ranges are a **discretised CDF of the same two
+   quantities** — the next 24h up- and down-excursion — read at different
+   thresholds. The scales re-parameterise location (the centre) and spread (the
+   width) rather than adding a third thing. That is an argument for a low prior
+   and not a result, and it has a real hole: these are tail *classifications*,
+   and a classifier on a tail can find structure a least-squares fit on a mean
+   misses. So it was measured.
+
+   **Predicting the breaks works, and is the easy half.** On 35 symbols over
+   five years: IC **0.37–0.55** at every scale on both sides, **35/35 symbols
+   positive**, against controls of 0.09–0.18. A wide range holds and a narrow
+   one breaks.
+
+   **Predicting direction: it worked on one year and dissolved on five.**
+
+   | | 10 majors, 1 yr | 35 symbols, 5 yrs |
+   |---|---|---|
+   | centre, 1d features alone | +0.075 (ctrl 0.062) | +0.013 (ctrl 0.016) |
+   | centre, all four scales | −0.025 (ctrl 0.065) | +0.020 (ctrl 0.014) |
+   | **gap between the two sides** | **+0.078** (ctrl 0.057) | **+0.008** (ctrl 0.026) |
+
+   On one year the per-side framing looked like a real improvement: +0.078
+   where regressing the centre on the same features gave −0.025, above its own
+   control, and the gap scored +0.088 to +0.097 at the 1d, 3d and 7d scales.
+   On the full sample it is +0.008 against a control ceiling of 0.026 — below
+   the noise floor, and 22x short of the 0.177 break-even.
+
+   **That is now the third target to decay the same way**, after the centre
+   (+0.064 → +0.011) and the gated fade. A result on one year of ten majors
+   that sits just above its control is what a draw looks like; the expanded
+   sample is what tells the two apart, which is the whole reason step 9l built
+   it.
+
+   One thing that did NOT behave as predicted, and is worth keeping: the two
+   sides come back **negatively correlated, −0.41 to −0.75**, on both samples.
+   The model is not merely forecasting the size of the next move — it leans one
+   way or the other, driven by the momentum and range-position features. The
+   lean is simply uninformative about where price actually lands.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
