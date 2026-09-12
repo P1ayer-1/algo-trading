@@ -2126,6 +2126,53 @@ ecord.py` runs N instruments headless in one process.
    (The earlier write-up of that week quoted +127%, +136% and +103%. Those were
    log returns read as percentages; the simple returns are the ones above.)
 
+9w. **Rank crowding instead of carry, and reject it** —
+   `backend\analysis\factor_panel.py --reference-panel`.
+
+   Step 9t found a funding ladder between venues, which raises a question
+   `carry_7` does not answer. `carry_7` ranks a coin against the rest of ITS
+   OWN venue's cross-section, so a venue-wide offset cancels out of it. The
+   cross-venue version asks something different: which coin is crowded HERE
+   specifically — funding high relative to the same coin elsewhere. That is a
+   different signal rather than a rescaling, and it has an appealing story,
+   which is exactly why it needed testing rather than adopting.
+
+   `carry_rel_*` is that signal: this venue's funding minus the same coin's
+   funding on a reference venue, matched canonically, trailing-averaged and
+   negated. The reference funding is a FEATURE only — the label keeps using the
+   venue's own funding, because a BloFin position pays BloFin's rate whatever
+   Binance charges, and a test pins that.
+
+   **On BloFin it looks like an improvement. Everywhere else it is not.**
+
+   | | net | Sharpe | price leg | **funding leg** | pct |
+   |---|---|---|---|---|---|
+   | BloFin, carry_7 | +43.7 | 1.23 | +32.2 | **+19.5** | 100% |
+   | BloFin, carry_rel_7 | **+48.0** | **1.43** | +43.3 | **+13.4** | 100% |
+   | Hyperliquid $2M, carry_7 | −32.2 | −0.73 | −40.6 | **+17.8** | 20% |
+   | Hyperliquid $2M, carry_rel_7 | −40.0 | −0.88 | −38.7 | **+9.8** | 10% |
+   | Hyperliquid $5M, carry_7 | +20.7 | 0.53 | +15.3 | **+15.1** | 96% |
+   | Hyperliquid $5M, carry_rel_7 | +10.1 | 0.26 | +14.5 | **+7.2** | 88% |
+   | Hyperliquid $10M, carry_7 | −18.6 | −0.39 | −21.2 | **+12.9** | 44% |
+   | Hyperliquid $10M, carry_rel_7 | +2.4 | 0.05 | +9.3 | **+5.4** | 76% |
+
+   **Rejected, and the funding column is why.** The relative signal roughly
+   HALVES the funding leg in every cell — 19.5 to 13.4, 17.8 to 9.8, 15.1 to
+   7.2, 12.9 to 5.4 — while its total depends on a price leg that is larger and
+   no more reliable. That is trading the component this project has shown to be
+   stable across fifteen venue-by-floor cells for the component it has shown to
+   be venue-specific, and the one cut where the total came out ahead is not
+   worth that swap.
+
+   It also does not rescue Hyperliquid, which was the real test: if ranking by
+   venue-specific crowding were the better signal, it should work where ranking
+   by carry level failed. It does not.
+
+   The mechanical reason for the halved funding leg is not subtle, and it is
+   the argument against the idea rather than a detail of it: subtracting
+   another venue's funding removes most of the level a carry book is paid FOR.
+   The residual is a crowding forecast wearing a carry factor's name.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

@@ -419,3 +419,63 @@ def test_cluster_weighting_gives_a_cluster_one_clusters_worth_of_money():
     # singleton each get half of the short side.
     assert abs(shorts[:3].sum()) == pytest.approx(abs(shorts[3]))
     assert np.abs(weights).sum() == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Cross-venue reference funding
+# ---------------------------------------------------------------------------
+
+
+def test_reference_funding_is_a_feature_and_never_the_label():
+    """A BloFin position pays BloFin's funding, whatever Binance charges.
+
+    `carry_rel_*` may rank on the difference between venues, but the return of
+    holding the position must keep using this venue's own funding - swapping it
+    would price the trade on an exchange it is not being made on, and the error
+    would look like a better strategy rather than like a bug.
+    """
+    from analysis.factor_panel import attach_reference_funding
+
+    close = np.ones((40, 2)) * 100.0
+    mine = panel(close, funding=np.full((40, 2), 6.0), symbols=["BTCUSDT", "ETHUSDT"])
+    theirs = panel(close, funding=np.full((40, 2), 1.0), symbols=["BTC", "ETH"])
+    theirs.dates = list(mine.dates)
+    assert attach_reference_funding(mine, theirs) == 2
+
+    # The label still charges 6 bps a day, not 5.
+    result = holding_return(mine, 0, 3)
+    assert result[0] == pytest.approx(-18.0)
+
+
+def test_reference_funding_matches_coins_across_naming_conventions():
+    from analysis.factor_panel import attach_reference_funding
+
+    close = np.ones((40, 2)) * 100.0
+    mine = panel(close, funding=np.full((40, 2), 6.0),
+                 symbols=["1000PEPEUSDT", "BTCUSDT"])
+    theirs = panel(close, funding=np.full((40, 2), 1.0), symbols=["kPEPE", "BTC"])
+    theirs.dates = list(mine.dates)
+    assert attach_reference_funding(mine, theirs) == 2
+    assert np.allclose(mine.reference_funding, 1.0)
+
+
+def test_an_unmatched_coin_stays_nan_rather_than_scoring_as_uncrowded():
+    """Zero is the MIDDLE of this signal's range, not one end of it.
+
+    Filling a missing reference with zero would score a coin the other venue
+    does not list as perfectly average crowding, which is a claim, and the
+    wrong one.
+    """
+    from analysis.factor_panel import attach_reference_funding
+
+    close = np.ones((40, 2)) * 100.0
+    mine = panel(close, funding=np.full((40, 2), 6.0),
+                 symbols=["ONLYHEREUSDT", "BTCUSDT"])
+    theirs = panel(np.ones((40, 1)) * 100.0, funding=np.full((40, 1), 1.0),
+                   symbols=["BTC"])
+    theirs.dates = list(mine.dates)
+    assert attach_reference_funding(mine, theirs) == 1
+
+    features = build_features(mine)
+    assert not np.isfinite(features["carry_rel_7"][39, 0])
+    assert features["carry_rel_7"][39, 1] == pytest.approx(-5.0)

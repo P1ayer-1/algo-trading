@@ -117,6 +117,11 @@ class Panel:
     low: np.ndarray
     taker: np.ndarray
     complete: np.ndarray          # bool: the day has ~all its minutes
+    # Optional: the SAME coins' funding on another venue, aligned to this grid.
+    # Only ever a FEATURE input. The label must keep using this venue's own
+    # funding, because that is what a position here actually pays - swapping it
+    # would price the trade on an exchange it is not being made on.
+    reference_funding: Optional[np.ndarray] = None
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -181,6 +186,51 @@ def load_panel(path: Path, *, min_minutes: int = MINUTES_PER_DAY - 10) -> Panel:
                  taker, complete)
 
 
+def attach_reference_funding(panel: Panel, other: Panel) -> int:
+    """Align another venue's funding onto this panel's grid, by canonical coin.
+
+    Step 9t found a funding ladder between venues, which raises a different
+    question from the one `carry_7` asks. `carry_7` ranks a coin by its funding
+    against the rest of THIS venue's cross-section, so a venue-wide offset
+    cancels out of it. The cross-venue version asks which coin is crowded
+    HERE specifically - high funding relative to the same coin elsewhere - and
+    that is a different signal, not a rescaling of the same one.
+
+    Returns the number of coins matched. Coins the other venue does not carry
+    are left NaN, so `carry_rel_*` simply does not score them rather than
+    scoring them against a zero that would read as "not crowded".
+    """
+    from analysis.funding_dispersion import canonical
+
+    def columns(target: Panel) -> Dict[str, int]:
+        seen: Dict[str, int] = {}
+        clashes = set()
+        for index, symbol in enumerate(target.symbols):
+            base = canonical(symbol)
+            if base in seen:
+                clashes.add(base)
+            seen[base] = index
+        for base in clashes:
+            seen.pop(base, None)
+        return seen
+
+    mine, theirs = columns(panel), columns(other)
+    other_row = {date: index for index, date in enumerate(other.dates)}
+    reference = np.full(panel.close.shape, np.nan)
+    matched = 0
+    for base, column in mine.items():
+        if base not in theirs:
+            continue
+        matched += 1
+        source = theirs[base]
+        for row, date in enumerate(panel.dates):
+            index = other_row.get(date)
+            if index is not None:
+                reference[row, column] = other.funding[index, source]
+    panel.reference_funding = reference
+    return matched
+
+
 # ---------------------------------------------------------------------------
 # Features. Every one of these is closed at the end of day `d`.
 # ---------------------------------------------------------------------------
@@ -197,6 +247,25 @@ def _trailing_sum(values: np.ndarray, window: int) -> np.ndarray:
     cumulative = np.cumsum(filled, axis=0)
     out[window - 1:] = cumulative[window - 1:]
     out[window:] -= cumulative[:-window]
+    return out
+
+
+def _trailing_sum_nan(values: np.ndarray, window: int) -> np.ndarray:
+    """Trailing sum that propagates missing data instead of reading it as zero.
+
+    `_trailing_sum` treats NaN as zero, which is right for funding (a day with
+    no settlement accrued nothing) and wrong for a DIFFERENCE between venues: a
+    day the other venue did not quote is unknown, not a day of zero crowding,
+    and zero is the middle of this signal's range rather than one end of it.
+    """
+    out = np.full(values.shape, np.nan)
+    for d in range(window - 1, values.shape[0]):
+        block = values[d - window + 1:d + 1]
+        if block.shape[0]:
+            usable = np.isfinite(block).sum(axis=0)
+            with np.errstate(invalid="ignore"):
+                total = np.nansum(block, axis=0)
+            out[d] = np.where(usable >= window - 1, total, np.nan)
     return out
 
 
@@ -308,6 +377,14 @@ def build_features(panel: Panel) -> Dict[str, np.ndarray]:
     features["carry_persistent"] = own_mean
     # Funding accelerating: this week's rate against this month's.
     features["carry_accel"] = features["carry_3"] - features["carry_30"]
+
+    # Crowding on THIS venue specifically, rather than this coin's carry. Only
+    # built when a reference venue has been attached.
+    if panel.reference_funding is not None:
+        difference = panel.funding - panel.reference_funding
+        for window in (3, 7, 30):
+            features["carry_rel_" + str(window)] = (
+                -_trailing_sum_nan(difference, window) / window)
 
     # One book rather than two. Blending the RETURNS of two books assumes both
     # are run and both are paid for; rank-averaging the scores runs a single
@@ -1120,6 +1197,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="shuffles per factor; the report gives their "
                              "mean and the percentile the real book beat")
     parser.add_argument("--detail", help="comma-separated factors to break down by year")
+    parser.add_argument("--reference-panel", type=Path, default=None,
+                        help="another venue's panel; enables the carry_rel_* "
+                             "factors, which rank a coin by its funding here "
+                             "against the same coin's funding there")
     parser.add_argument("--cluster-lookback", type=int, default=0,
                         metavar="DAYS",
                         help="group names by trailing return correlation over "
@@ -1148,6 +1229,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         cost_bps = float(config.TAKER_FEE_BPS)
 
     panel = load_panel(args.panel)
+    if args.reference_panel:
+        matched = attach_reference_funding(panel, load_panel(args.reference_panel))
+        print("Reference funding from {}: {} of {} coins matched".format(
+            args.reference_panel.name, matched, len(panel.symbols)))
     features = build_features(panel)
     names = ([n.strip() for n in args.factors.split(",") if n.strip()]
              if args.factors else sorted(features))
