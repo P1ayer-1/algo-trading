@@ -137,6 +137,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-spread-bps", type=float, default=30.0,
                         help="skip an opening leg whose spread is wider than "
                              "this when it is about to be sent")
+    parser.add_argument("--repair-only", action="store_true",
+                        help="do not rebalance: just bring the book back to "
+                             "neutral with reduce_only trims. This is what the "
+                             "monitor's not-neutral alert points at.")
     parser.add_argument("--confirm", action="store_true",
                         help="Actually send the orders. Without this it is a "
                              "rehearsal.")
@@ -182,6 +186,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_funding_days=args.min_funding_days,
         gross_notional_usd=args.notional, leverage=args.leverage)
 
+    executor_kwargs = dict(dry_run=not args.confirm, on_log=log,
+                           max_spread_bps=args.max_spread_bps,
+                           net_tolerance_frac=config.delta_tolerance_frac)
+
+    if args.repair_only:
+        if args.confirm:
+            log("--confirm given: these reduce_only trims WILL be sent to "
+                + environment + ".")
+        executor = BookExecutor(
+            BlofinPerpBroker(client, TradingAPI(client), account_market),
+            **executor_kwargs)
+        result = executor.repair_only()
+        report(result)
+        return 0 if result.ok else 1
+
     log(environment + ": building the plan from live prices...")
     candidates = gather(market, min_volume=args.min_volume,
                         carry_days=args.carry_days,
@@ -206,12 +225,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         log("--confirm given: these orders WILL be sent to " + environment + ".")
 
     executor = BookExecutor(
-        BlofinPerpBroker(client, TradingAPI(client), market),
-        dry_run=not args.confirm,
-        on_log=log,
-        max_spread_bps=args.max_spread_bps,
-        net_tolerance_frac=config.delta_tolerance_frac,
-    )
+        BlofinPerpBroker(client, TradingAPI(client), account_market),
+        **executor_kwargs)
     result = executor.reconcile(plan)
     report(result)
     return 0 if result.ok else 1

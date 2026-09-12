@@ -2,6 +2,7 @@
 
     plan.py     sizes the whole book, prices the risk, says whether to do it
     execute.py  moves the exchange from whatever it holds to that book
+    monitor.py  reads it back and scores it. READ ONLY, no broker import
     broker.py   the REST calls execute.py is written against
 
 `plan.py` still imports no broker and has no path to `placeOrder`, which is
@@ -16,8 +17,9 @@ exchange holds nothing and "close" is the case where the target is empty.
 chances to be interrupted and the answer to "what if it dies halfway" has to be
 "run it again".
 
-There is no `monitor.py` yet. Nothing has been traded, so there is nothing to
-read back.
+`monitor.py` does not import `broker.py`. The broker can place orders, and a
+monitor holding one would be one typo from being an executor, so the monitor
+defines its own four-method `Reader` and none of them writes.
 
 What this is, against the other carry
 -------------------------------------
@@ -39,7 +41,9 @@ between the first fill and the last.
 """
 
 from .execute import BookExecutor, ExecutionResult, Order
+from .monitor import Baseline, BookReport, Snapshot, compare
 from .plan import BookConfig, BookPlan, Candidate, LegPlan, plan_book
 
-__all__ = ["BookConfig", "BookExecutor", "BookPlan", "Candidate",
-           "ExecutionResult", "LegPlan", "Order", "plan_book"]
+__all__ = ["Baseline", "BookConfig", "BookExecutor", "BookPlan", "BookReport",
+           "Candidate", "ExecutionResult", "LegPlan", "Order", "Snapshot",
+           "compare", "plan_book"]

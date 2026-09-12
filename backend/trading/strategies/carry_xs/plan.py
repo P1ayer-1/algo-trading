@@ -14,7 +14,12 @@ so only positive funding is harvestable; a spot spread of 4-50 bps; and the
 full notional tied up in spot.
 
 This one is perps on both sides across MANY instruments. It harvests funding of
-either sign, needs no spot leg, and needs margin rather than notional. What it
+either sign, needs no spot leg, and needs margin rather than notional. It also
+uses CROSS margin where the two-leg carry deliberately uses isolated, and the
+reason the choice flips is that the risk flips with it: there, cross would back
+a short with the spot leg's cash and turn a hedge into a bigger blast radius;
+here both legs are perps in one futures account and genuinely offset, so
+isolated would liquidate individual legs on moves the book as a whole survives. What it
 buys with that is a price exposure the other does not have: the legs are
 different coins, so nothing cancels, and the book's weekly standard deviation
 is about 240 bps. The worst week measured was −1,991 bps, in February 2024,
@@ -115,6 +120,13 @@ class LegPlan:
     target_notional_usd: Decimal = ZERO
     carry_bps_per_day: float = 0.0
     spread_bps: float = 0.0
+    # Where this leg would liquidate IF IT WERE THE ONLY POSITION, at this
+    # leverage, on isolated margin. The executor sends cross, under which the
+    # legs share one margin pool and the winners fund the losers - so for a
+    # dollar-neutral book the real liquidation sits much further away than this
+    # and is an ACCOUNT-level number, not a per-leg one. This is therefore a
+    # conservative bound and is labelled as one; `monitor.py` reads the real
+    # account margin ratio back from the exchange.
     liquidation_price: Optional[Decimal] = None
     liquidation_distance: Optional[Decimal] = None
 

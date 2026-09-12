@@ -109,13 +109,14 @@ first. Recording is therefore step one, not step four.
 │   │   ├── panel_hyperliquid.py # and from Hyperliquid, which funds hourly
 │   │   ├── factor_panel.py    # cross-sectional factors scored as money, not IC
 │   │   ├── funding_dispersion.py # the same coin's funding on two venues
+│   │   ├── panel_venue.py     # any venue behind one adapter: bybit, mexc, kraken...
 │   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (878 tests)
+│   └── tests/                 # pytest suite (966 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -494,7 +495,7 @@ cd backend
 python -m pytest
 ```
 
-878 tests covering the order book's gap handling, the OFI recursion, the
+966 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -2249,6 +2250,104 @@ ecord.py` runs N instruments headless in one process.
    it returns ~90 settlements however large a limit it is given, which is 30
    days, so `--list` says so rather than producing a short panel that looks
    like the others.
+
+9y. **Give the book three verbs** — `backend\trading\strategies\carry_xs\`,
+   `backend\run_carry_xs.py`, `backend\monitor_carry_xs.py`.
+
+   ```
+   python backend\plan_carry_xs.py --notional 10000 --min-volume 2000000
+   python backend\run_carry_xs.py  --notional 10000 --min-volume 2000000 --confirm
+   python backend\monitor_carry_xs.py
+   python backend\run_carry_xs.py  --repair-only
+   ```
+
+   The cross-sectional book now has the same three verbs as the two-leg carry,
+   with two deliberate differences.
+
+   **One verb where the carry has two.** `reconcile` replaces open and close,
+   because this book is REBALANCED weekly: "open" is the case where the
+   exchange holds nothing and "close" is the case where the target is empty.
+   It is idempotent — every decision comes from positions read back from the
+   exchange — which matters because twelve legs is twelve chances to be
+   interrupted, and the answer to "what if it dies halfway" has to be "run it
+   again".
+
+   **Repair, not unwind.** `strategies/carry` unwinds a half-open carry; this
+   must not inherit that, because closing eleven positions the plan wants
+   because the twelfth was rejected costs a full round trip to undo a book that
+   is 92% correct. A failed leg leaves an imbalance which is reduced — always
+   `reduce_only`, so the repair can only shrink risk — and reported whether or
+   not the reduction worked. `--repair-only` does it without rebalancing, which
+   is the right move mid-hold and is what the monitor's `not-neutral` alert
+   points at.
+
+   Orders are **interleaved** so the partly-filled book stays near neutral, and
+   the running total starts from the exposure the account ALREADY carries
+   rather than from zero — the two are the same thing only when the account
+   begins flat, which on a rebalance it never does. Against an account holding
+   $69k of leftover BTC that difference is the whole safety property: measured
+   $310 of worst intermediate exposure on a $3,949 book, against $69k if the
+   counter starts at zero.
+
+   ### Running it live found three bugs no unit test had
+
+   - **Notional was `contracts x price`, ignoring contract value.** A BloFin
+     BTC contract is 0.001 BTC and a DOGE contract is 1000 DOGE, so it reported
+     a real position as **$68.9 million** and a TRX leg as $0.49 — both wrong
+     by exactly the multiplier, and the interleaving was balancing that.
+   - **Size rules were read from PRODUCTION while orders went to DEMO.** Demo
+     lists 87 instruments against production's 488 and the lot size differs on
+     10 of the 87 they share: DOGE 0.01 against 0.1, ZEC 0.1 against 1. Six
+     orders came back `152002 Parameter size error`. This repo already knew the
+     rule — `plan_carry.py` reads margin tiers from the account's host because
+     demo and production MMR differ — and it applies to anything the exchange
+     VALIDATES. Prices still come from production, because demo's book is not
+     the market.
+   - **The repair sent un-rounded sizes**, `0.2276622802836378615352929061`
+     contracts, because it sized itself as `excess / unit`. Rounding where a
+     size is computed is not enough; it now happens on the way OUT, so the next
+     code path that computes one does not have to remember.
+
+   A fourth was invisible to the suite entirely: a syntax error shipped in
+   `plan_carry_xs.py` and 922 tests stayed green, because the tests import the
+   strategy packages and nothing imported the command-line files that wrap
+   them. `test_entrypoints_import.py` now parses every entrypoint and checks
+   no source file carries a stray control character, which is what a shell
+   heredoc makes of `\a` in a Windows path.
+
+   ### The monitor, and what it says about the book that is on
+
+   `monitor.py` does not import the broker. The broker can place orders and a
+   monitor holding one would be one typo from being an executor, so it defines
+   its own four-method `Reader` and a test walks the AST to assert neither
+   `place_perp` nor any broker import appears in it.
+
+   Two things a cross-margined book changes. The margin ratio is
+   **account-level** — all eight live positions report an identical one, which
+   is what confirms they share a pool — so the risk question has a single
+   answer that is read rather than modelled. And the plan's per-leg `solo liq`
+   is explicitly a bound: it assumes isolated margin, which this book does not
+   use, and is conservative by construction.
+
+   Funding is derived the same way step 9i derives it, because this API version
+   still publishes no bills endpoint: `funding = sum(realizedPnl) + fees`. On
+   the live book, minutes after opening and before any settlement, `realizedPnl`
+   summed to **−2.0241** against fees of **+2.0240** — the derivation returns
+   zero when zero is the true answer, which is the same check the two-leg
+   version passed. It gets the same control too: the public funding history,
+   signed by side, priced at today's notional.
+
+   The first reading was not clean, and that is the point of having one. The
+   book on the demo account came back **4.15% net long** against a 2% tolerance
+   — exactly as the failed run left it, with DOGE and ZEC never placed. The
+   monitor raised `not-neutral` as critical, exited 2, and `--repair-only`
+   priced the fix as a single trim: sell 0.21 TRX contracts, $71.30,
+   `reduce_only`.
+
+   Still missing: nothing writes a baseline at execution time, so the monitor
+   reconstructs and freezes one on first sight (like step 9i's, and for the
+   same reason). And the epoch model is untested against a real rebalance,
+   because there has not been one.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.

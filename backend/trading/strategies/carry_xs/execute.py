@@ -479,6 +479,91 @@ class BookExecutor:
         self._verify_and_repair(unit_usd, rules, result, tag)
         return result
 
+    def repair_only(self) -> ExecutionResult:
+        """Bring the book back to neutral and change nothing else.
+
+        `reconcile` moves the book to TODAY'S plan, which is the right thing at
+        rebalance time and the wrong thing in the middle of a hold: a book that
+        is merely lopsided because one leg failed does not need its other ten
+        positions re-chosen, it needs the imbalance taken off. This is the
+        minimal intervention, and it is `reduce_only` throughout, so the worst
+        case of running it is a smaller book.
+
+        It is what the monitor's `not-neutral` alert points at.
+        """
+        result = ExecutionResult(dry_run=self.dry_run)
+        rules = self.broker.instrument_rules()
+        marks = {}
+        for row in self.broker.positions():
+            mark = _decimal(row.get("markPrice"))
+            if mark > 0:
+                marks[str(row.get("instId") or "")] = mark
+        unit_usd = unit_values(
+            BookPlan(), {name: rule.contract_value for name, rule in rules.items()},
+            marks)
+
+        book = current_book(self.broker)
+        gross = sum((abs(size) * unit_usd.get(name, ZERO)
+                     for name, size in book.items()), ZERO)
+        signed = sum((size * unit_usd.get(name, ZERO)
+                      for name, size in book.items()), ZERO)
+        result.gross_before_usd = gross
+        if gross <= 0:
+            result.already_correct = True
+            result.reconciled = True
+            self.log("Nothing open.")
+            return result
+
+        drift = abs(signed) / gross
+        self.log("Book is ${:,.2f} net on ${:,.2f} gross ({:.2%}).".format(
+            signed, gross, drift))
+        if drift <= Decimal(str(self.net_tolerance_frac)):
+            result.already_correct = True
+            result.reconciled = True
+            result.net_after_usd, result.gross_after_usd = signed, gross
+            self.log("Inside tolerance. Nothing to do.")
+            return result
+
+        if self.dry_run:
+            # Price the trims without sending them, so a rehearsal shows the
+            # same orders a live run would place.
+            self._plan_repair(unit_usd, rules, book, signed, gross, result)
+            self.log("Dry run: nothing was sent.")
+            return result
+
+        self._verify_and_repair(unit_usd, rules, result, uuid.uuid4().hex[:8])
+        return result
+
+    def _plan_repair(self, unit_usd, rules, book, signed, gross,
+                     result: ExecutionResult) -> None:
+        """The trims a repair would send. Shared shape with the live path."""
+        heavy_long = signed > 0
+        excess = abs(signed) - Decimal(str(self.net_tolerance_frac)) * gross
+        candidates = sorted(
+            ((name, size) for name, size in book.items()
+             if (size > 0) == heavy_long and size != 0),
+            key=lambda item: abs(item[1]) * unit_usd.get(item[0], ZERO),
+            reverse=True)
+        for name, size in candidates:
+            if excess <= 0:
+                break
+            unit = unit_usd.get(name, ZERO)
+            if unit <= 0:
+                continue
+            trim = min(abs(size), excess / unit)
+            rule = rules.get(name)
+            if rule is not None:
+                trim = round_to_lot(trim, rule.lot_size)
+                if trim < rule.min_size:
+                    continue
+            if trim <= 0:
+                continue
+            result.add(Order(
+                inst_id=name, side="sell" if size > 0 else "buy",
+                contracts=trim, reduce_only=True, reason="repair",
+                notional_usd=trim * unit))
+            excess -= trim * unit
+
     # -- after ------------------------------------------------------------
 
     def _verify_and_repair(self, unit_usd: Dict[str, Decimal],

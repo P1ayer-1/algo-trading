@@ -222,7 +222,7 @@ def show(plan: BookPlan, config: BookConfig) -> None:
         print(label)
         print("  {:<16}{:>12}{:>14}{:>12}{:>11}{:>10}".format(
             "instrument", "contracts", "notional $", "carry/day", "spread bps",
-            "liq away"))
+            "solo liq"))
         for leg in sorted(legs, key=lambda item: -item.notional_usd):
             if not leg.ok:
                 continue
@@ -239,7 +239,13 @@ def show(plan: BookPlan, config: BookConfig) -> None:
         plan.net_notional_usd,
         abs(plan.net_notional_usd) / plan.gross_notional_usd
         if plan.gross_notional_usd else 0))
-    print("  margin at {}x       ${:,.2f}".format(plan.leverage, plan.margin_usd))
+    print("  margin at {}x       ${:,.2f}  (cross: the legs share one pool)"
+          .format(plan.leverage, plan.margin_usd))
+    print()
+    print("  `solo liq` is where a leg would liquidate IF IT WERE THE ONLY")
+    print("  position, on isolated margin. The book is sent CROSS, so the real")
+    print("  liquidation is an account-level number and sits much further")
+    print("  away. Read it as a bound, and read the real one from the monitor.")
     print()
     print("ECONOMICS, per {}-day hold, per unit of gross notional".format(
         config.hold_days))
