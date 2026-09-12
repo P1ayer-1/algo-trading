@@ -116,7 +116,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (981 tests)
+│   └── tests/                 # pytest suite (992 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -495,7 +495,7 @@ cd backend
 python -m pytest
 ```
 
-981 tests covering the order book's gap handling, the OFI recursion, the
+992 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -2457,6 +2457,85 @@ un_carry_xs.py --flatten --confirm
    reconstructs and freezes one on first sight (like step 9i's, and for the
    same reason). And the epoch model is untested against a real rebalance,
    because there has not been one.
+
+9z. **The touch formula is a moderate-distance instrument, and the book is
+   the worst place to push it** - `backendnalysis	ouch_calibration.py`.
+
+   ```
+   python backendnalysis	ouch_calibration.py
+   ```
+
+   Step 9o left a calibrated engine - `P(touch) = 2*Phi(-d / (sigma*sqrt(H)))`,
+   the reflection principle - and the obvious next move was to point it at the
+   thing that makes money and replace a static risk buffer with a probability:
+   "P(mark touches liquidation before you exit) = 0.4%" instead of "liquidation
+   must be 15% away". Before wiring that into `carry_xs`, the assumption got
+   tested, and it does not hold where it would have been used.
+
+   The reflection principle needs BROWNIAN motion, which is stronger than a
+   random walk: not just uncorrelated increments but Gaussian ones. The
+   variance-ratio test that justified the formula (VR 1.00-1.13) only checked
+   the first. Crypto is uncorrelated and fat-tailed at once, and every risk
+   question worth asking lives in the tail the variance ratio never looked at.
+
+   Non-overlapping 7-day returns, standardised and pooled, counted against what
+   a Gaussian predicts at each distance. Two populations, because they answer
+   different questions - and the book is pooled over six grid cells so the
+   answer is not one specification's luck:
+
+   ```
+   distance      single assets        the book
+                 (62 symbols,      (6 cells, 1,458
+                 10,298 obs)            periods)
+     1.0 sd            0.8x             0.7x
+     2.0 sd            0.9x             0.9x
+     2.5 sd            1.7x             2.2x
+     3.0 sd            3.2x             7.6x
+     4.0 sd           24.5x           173.2x
+     5.0 sd               -        16,748.9x
+   usable to           2.5 sd           2.0 sd
+   ```
+
+   **It is calibrated out to about 2 sigma and not past it.** That is the
+   regime step 9o validated it in, and the result there stands - this does not
+   retract it. What it retracts is the extrapolation: the formula is not a tail
+   model and was never tested as one. Liquidation, ruin and "how bad can one
+   week be" are 4-sigma questions, and there it is wrong by one to two orders
+   of magnitude. So the headline application proposed for it - a liquidation
+   gate - is precisely the use it cannot support.
+
+   **The book's tail is seven times fatter than its own legs'.** 173x against
+   24.5x at 4 sigma, excess kurtosis +9.38 against +2.42. That is the opposite
+   of what diversification is supposed to do, and step 9v already named the
+   mechanism: in February 2024 the book was short SHIB, PEPE and BONK because
+   they had the highest funding, they returned +256%, +288% and +180% in a
+   week, and in the 90 days beforehand their residual correlations were +0.12,
+   -0.13 and +0.21. The correlation that did the damage did not exist in the
+   data yet. A dollar-neutral cross-section is not a diversified book; it is a
+   crowding bet, and crowding is exactly what shows up as a fat tail.
+
+   What it costs to get this wrong, for a $2,000 weekly loss budget:
+
+   ```
+   Gaussian at the 1/n quantile       -532 bps  ->  $37,599 gross
+   empirical 1st percentile           -444 bps  ->  $45,086 gross
+   worst actually observed            -976 bps  ->  $20,500 gross
+   ```
+
+   The Gaussian would let you run 1.8x too big, and the worst observed is
+   itself one draw from 243 periods, so $20,500 is not a bound either.
+
+   There is one thing left for it. `max_weight_frac` is already the right kind
+   of control - a cap that does not depend on having estimated the risk - and
+   for WEIGHTING the formula adds nothing anyway: at a fixed distance
+   `2*Phi(-d/(sigma*sqrt(H)))` is a monotone transform of sigma, so it ranks
+   legs identically to the inverse-vol weighting `_side_weights` already does.
+   It only carries information where the DISTANCE differs per leg, which under
+   the cross margin this book uses it does not. Its honest remaining use is the
+   1-to-2-sigma questions the monitor already asks: how likely the net drifts
+   past the 2% tolerance before the rebalance, and how likely the account
+   margin ratio reaches the 300 warning level. Both are worth having and
+   neither is where the money is.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
