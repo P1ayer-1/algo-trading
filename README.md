@@ -116,7 +116,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (992 tests)
+│   └── tests/                 # pytest suite (998 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -495,7 +495,7 @@ cd backend
 python -m pytest
 ```
 
-992 tests covering the order book's gap handling, the OFI recursion, the
+998 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -513,7 +513,7 @@ Done:
 1. ~~**Risk/liquidation module**~~ — `backend/trading/risk.py`. Standalone and
    tested, as planned. ~~Its MMR assumption still needs validating against
    BloFin's real tier table.~~ **Validated 2026-09-09** against a real demo
-   position via `backendnalysisalidate_liquidation.py`: 0.0568% relative
+   position via `backend\analysis\validate_liquidation.py`: 0.0568% relative
    error, and the MMR actually applied read out as exactly 0.500%. The 5.68
    bps residual is BloFin's liquidation fee rate, which the clean derivation
    omits and `fee_buffer_bps` should be set to ~6 to absorb. See
@@ -838,7 +838,7 @@ Next, in order:
    That last one is now the cheap missing measurement rather than a deposit
    decision, and step 9c is it.
 
-9c. ~~**What are BloFin's own spreads?**~~ — `backendnalysislofin_spread_survey.py`.
+9c. ~~**What are BloFin's own spreads?**~~ — `backend\analysis\blofin_spread_survey.py`.
    Everything the passive branch believes about execution cost was measured on
    a venue this account does not trade on. BloFin's `getTickers()` returns best
    bid/ask for every instrument, unauthenticated, in one REST call, so the
@@ -890,7 +890,7 @@ Next, in order:
 
    Both need exactly what `recorder.py` already produces, pointed at one of
    these instruments instead of BTC-USDT. That is step 9d, and
-   `backendnalysisenue_compare.py` is the tool that reads the answer out:
+   `backend\analysis\venue_compare.py` is the tool that reads the answer out:
    it runs the identical `passive_sim` pipeline over both venues for the same
    instruments and reports the paired difference in adverse selection, with
    BTC-USDT as a control for the fact that the two sides are different days.
@@ -928,7 +928,7 @@ ecord.py` runs N instruments headless in one process.
    that made the venue comparison credible, and it carries the existing
    prediction-branch history, which now lives in `data/BTC-USDT/`.
 
-9e. **Funding carry** — `backendnalysisunding_carry.py`. Every branch so
+9e. **Funding carry** — `backend\analysis\funding_carry.py`. Every branch so
    far died on execution cost against a forecast that was too small. Carry
    needs no forecast: hold spot, short the perp against it, collect funding
    while delta-neutral.
@@ -995,7 +995,7 @@ ecord.py` runs N instruments headless in one process.
      at all — a delta-neutral position still has a leveraged leg that can be
      liquidated.
 
-9f. ~~**Backtest the carry**~~ — `backendnalysis\carry_backtest.py`. The
+9f. ~~**Backtest the carry**~~ — `backend\analysis\carry_backtest.py`. The
    screen in 9e answers "does the median funding rate cover the round trip?",
    which is not a P&L: it assumes you enter today at today's spread and that
    funding behaves like its median for a month. This runs the position from
@@ -1036,7 +1036,7 @@ ecord.py` runs N instruments headless in one process.
    is the smaller assumption, since the four-leg cost is tens of bps against
    funding swings of hundreds.
 
-9g. ~~**Plan the carry**~~ — `backend	rading\carry.py` and
+9g. ~~**Plan the carry**~~ — `backend\trading\carry.py` and
    `backend\plan_carry.py`. The analysis says which instruments to carry and
    what they earned; neither says what to *do*. This computes the orders,
    the capital, the liquidation price and the expected return, and prints
@@ -2458,11 +2458,71 @@ un_carry_xs.py --flatten --confirm
    same reason). And the epoch model is untested against a real rebalance,
    because there has not been one.
 
-9z. **The touch formula is a moderate-distance instrument, and the book is
-   the worst place to push it** - `backendnalysis	ouch_calibration.py`.
+9y2. **The first real epoch transition, and the $4.05 of funding that was
+   not funding** - `backend\trading\strategies\carry_xs\monitor.py`.
+
+   Step 9y shipped the epoch model untested, because no rebalance had happened
+   yet. One has now: an 8-leg book was closed and a 10-leg one opened. The
+   epoch machinery worked - it named DOGE and ZEC as new, refused to score the
+   new book against the old forecast, and archived on request. What it did NOT
+   do was stop the funding derivation running across the boundary anyway:
 
    ```
-   python backendnalysis	ouch_calibration.py
+   derived             $+4.0505   = sum(realizedPnl) + fees
+   public-rate control $+0.0000   = settlements x notional, by side
+   realised rate       +87.107 bps/day on gross
+   planned rate         +6.275 bps/day
+   ```
+
+   Fourteen times the forecast on a book 72 minutes old, and every cent of it
+   stale fees. `funding = sum(realizedPnl) + fees` only holds when both terms
+   cover the same trades, and `realizedPnl` is a property of a position that
+   VANISHES when the position closes. The fee window came from the baseline, so
+   it swept in $4.4844 from the previous epoch - 7 opens, a repair and 8 closes
+   - whose matching PnL had already left with the positions.
+
+   **The control is what caught it.** `funding-disagrees` fired because the
+   public-rate estimate said $0.0000 and meant it: no settlement had crossed in
+   72 minutes, so zero was the true answer. A derived number without an
+   independent control would have reported the best week in the strategy's
+   history.
+
+   The first fix was wrong in an instructive way. Bounding each leg by its own
+   `createTime` returned $0.0000 of fees on a book that had just paid $5.80 of
+   them, because **every position is stamped 20-35 ms AFTER the fill that
+   opened it** - BCH 27 ms, ZEC 35 ms, measured across all ten legs - so
+   `ts >= created_ms` excluded every opening fill. Two clocks compared at
+   millisecond precision, which is the same bug shape as the funding
+   settlements that print milliseconds late and landed on the wrong side of
+   midnight in `panel_daily.py`.
+
+   The right fix uses no clock at all. Both a position and its fills carry
+   `positionId`, so "did this fee belong to a position that is still open" is
+   an identity, not a comparison:
+
+   ```
+   fees on current positions   $5.798122434
+   sum(realizedPnl)           -$5.798122434
+   derived funding             $0.000000000
+   fees on closed positions    $4.050492516   <- exactly the phantom funding
+   ```
+
+   Nine decimal places, and the discarded term is precisely the number that had
+   been reported as profit. The timestamp path survives only as a fallback for
+   a venue reporting no position id, with 5 seconds of tolerance - 140x the
+   worst observed skew.
+
+   Two things this leaves. The derivation is now robust to a STALE baseline,
+   which matters because a stale baseline is exactly when nobody is checking.
+   And the new baseline froze with no forecast, because nothing carries the
+   plan's expected rate into the monitor - the same gap step 9y named - so
+   `funding-short` cannot fire until one is supplied by hand.
+
+9z. **The touch formula is a moderate-distance instrument, and the book is
+   the worst place to push it** - `backend\analysis\touch_calibration.py`.
+
+   ```
+   python backend\analysis\touch_calibration.py
    ```
 
    Step 9o left a calibrated engine - `P(touch) = 2*Phi(-d / (sigma*sqrt(H)))`,

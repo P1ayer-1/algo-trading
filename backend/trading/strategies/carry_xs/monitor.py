@@ -69,6 +69,13 @@ from trading.risk import RiskLimits
 
 ZERO = Decimal("0")
 
+# A position is stamped AFTER the fill that opened it. Measured on BloFin
+# 2026-09-12 across ten legs: 20-35 ms late, worst 35 (ZEC). Only used when a
+# venue reports no position id to match on; five seconds is 140x the worst
+# observed skew and still far short of any real gap between a close and a
+# re-open on the same instrument.
+CREATE_TIME_SKEW_MS = 5_000
+
 
 def _d(value: Any, default: str = "0") -> Decimal:
     try:
@@ -105,6 +112,10 @@ class Leg:
     realized_pnl_usd: Decimal
     liquidation_price: Optional[Decimal]
     created_ms: int
+    # The exchange's own id for this position. Fills carry it too, which is the
+    # only EXACT way to say which fees belong to a position still open - see
+    # `fees_since`, where matching on timestamps instead was wrong by $4.05.
+    position_id: str = ""
 
     @property
     def side(self) -> str:
@@ -165,6 +176,7 @@ def read_snapshot(reader: Reader, contract_values: Dict[str, Decimal],
             liquidation_price=(_d(row.get("liquidationPrice"))
                                if row.get("liquidationPrice") else None),
             created_ms=int(_d(row.get("createTime"))),
+            position_id=str(row.get("positionId") or ""),
         ))
         # Cross margin gives every position the SAME account-level ratio, so
         # reading it from any one of them is reading the account's.
@@ -179,15 +191,78 @@ def read_snapshot(reader: Reader, contract_values: Dict[str, Decimal],
     return snapshot
 
 
-def fees_since(fills: Iterable[Dict[str, Any]]) -> Decimal:
-    """Total fees paid, signed as the venue reports them.
+def fees_since(fills: Iterable[Dict[str, Any]], legs: Sequence["Leg"] = (),
+               *, since_ms: int = 0) -> Decimal:
+    """Fees paid ON THE POSITIONS THAT ARE STILL OPEN, per leg.
 
-    Not through `abs()`: a maker rebate reported as a negative fee has to
-    cancel correctly in the funding derivation, and forcing a sign here would
-    turn a credit into a charge.
+    Signed as the venue reports them, not through `abs()`: a maker rebate
+    reported as a negative fee has to cancel correctly in the derivation, and
+    forcing a sign here would turn a credit into a charge.
+
+    The per-leg window is the whole correctness argument. `funding =
+    sum(realizedPnl) + fees` only holds when the two terms cover the same
+    trades, and `realizedPnl` is a property of a position that VANISHES when
+    the position closes. Summing every fill in the window instead charges the
+    book for positions whose matching PnL is already gone.
+
+    Measured on the live demo book 2026-09-12, which is why this is not
+    hypothetical. The baseline had been frozen against an 8-leg book; that book
+    was closed by hand and a 10-leg one opened. Scoring the new positions
+    against the old baseline's window swept in $4.4844 of fees from the
+    previous epoch - 7 opens, a repair and 8 closes - and the derivation
+    reported +$4.05 of funding on a book 72 minutes old, a realised +87.107
+    bps/day against a planned +6.275. Fourteen times the forecast, and every
+    cent of it stale fees.
+
+    Bounding each leg at its own `createTime` makes the window the positions'
+    rather than the baseline's, so the number is right even when the baseline
+    is stale - which is exactly when nobody is checking. Same bound
+    `implied_funding` uses, for the same reason. On that book it returns
+    $5.7981 against `sum(realizedPnl)` of -$5.7981: zero funding, which is the
+    true answer 72 minutes in with no settlement crossed, and it agrees with
+    the public-rate control to the cent.
+
+    Matched on `positionId`, which both a position and its fills carry, so the
+    question "did this fee belong to a position that is still open" is answered
+    by an identity and not by a clock. The first attempt at this bounded each
+    leg by its own `createTime` instead and returned $0.0000 on that same book,
+    because every position is stamped 20-35 ms AFTER the fill that opened it -
+    BCH 27 ms, ZEC 35 ms, measured - so `ts >= created_ms` excluded every
+    opening fill. Two clocks compared at millisecond precision, which is the
+    same bug shape as the funding settlements that print milliseconds late and
+    landed on the wrong side of midnight in `panel_daily.py`.
+
+    The timestamp path survives only as a fallback for a venue that reports no
+    position id, with enough tolerance to absorb that skew.
+
+    With no legs supplied there is nothing to match against, so it sums the
+    window as given.
     """
+    if not legs:
+        total = ZERO
+        for fill in fills:
+            total += _d(fill.get("fee"))
+        return total
+
+    ids = {leg.position_id for leg in legs if leg.position_id}
     total = ZERO
+
+    if ids:
+        for fill in fills:
+            # A fill whose position is gone took its realizedPnl with it, so
+            # counting the fee would be one side of a cancellation.
+            if str(fill.get("positionId") or "") in ids:
+                total += _d(fill.get("fee"))
+        return total
+
+    starts: Dict[str, int] = {}
+    for leg in legs:
+        starts[leg.inst_id] = max(int(since_ms),
+                                  int(leg.created_ms) - CREATE_TIME_SKEW_MS)
     for fill in fills:
+        start = starts.get(str(fill.get("instId") or ""))
+        if start is None or int(_d(fill.get("ts"))) < start:
+            continue
         total += _d(fill.get("fee"))
     return total
 

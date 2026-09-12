@@ -47,6 +47,10 @@ def test_the_strategy_packages_parse_too():
         ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
+MANGLED = ((0x07, "bell", "a"), (0x08, "backspace", "b"),
+           (0x0b, "vertical tab", "v"), (0x0c, "form feed", "f"))
+
+
 def test_no_source_file_carries_a_stray_control_character():
     """A bell or a form feed in a source file is a botched `\\a` or `\\f`.
 
@@ -57,5 +61,32 @@ def test_no_source_file_carries_a_stray_control_character():
         if "__pycache__" in path.parts:
             continue
         raw = path.read_bytes()
-        for code, name in ((0x07, "bell"), (0x0c, "form feed"), (0x08, "backspace")):
-            assert bytes([code]) not in raw, "{} in {}".format(name, path)
+        for code, name, letter in MANGLED:
+            assert bytes([code]) not in raw, "{} in {} (a mangled backslash-{})".format(
+                name, path, letter)
+
+
+def test_the_prose_files_are_not_mangled_either():
+    """The same corruption, in the files that are actually read.
+
+    The check above only ever scanned `backend/**/*.py`, and the damage had
+    been accumulating for months in README.md - which is this project's lab
+    notebook and the most-read file in it. Found 2026-09-12: 7 bells, 4 tabs,
+    2 vertical tabs, 1 form feed and 1 backspace, every one of them a Windows
+    path a shell heredoc had eaten. `backend\\analysis\\touch_calibration.py`
+    had been rendered as `backend<BEL>nalysis<TAB>ouch_calibration.py`, which
+    is not a path anyone can type.
+
+    A tab is legal in most prose, so it is only a finding HERE: nothing in
+    these files is meant to be tab-indented, and every tab yet seen in them was
+    a `\\t` that used to be part of `backend\\trading`.
+    """
+    root = BACKEND.parent
+    for name in ("README.md", "CLAUDE.md"):
+        path = root / name
+        if not path.exists():
+            continue
+        raw = path.read_bytes()
+        for code, label, letter in MANGLED + ((0x09, "tab", "t"),):
+            assert bytes([code]) not in raw, \
+                "{} in {} (a mangled backslash-{})".format(label, name, letter)

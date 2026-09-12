@@ -201,7 +201,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     fills = reader.fills(since_ms=baseline.opened_ms)
     report = compare(baseline, snapshot,
-                     fees_usd=fees_since(fills),
+                     fees_usd=fees_since(fills, snapshot.legs,
+                                         since_ms=baseline.opened_ms),
                      implied_usd=implied_funding(reader, snapshot,
                                                  since_ms=baseline.opened_ms),
                      limits=RiskLimits())

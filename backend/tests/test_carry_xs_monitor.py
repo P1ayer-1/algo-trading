@@ -50,11 +50,14 @@ class FakeReader:
 
 
 def position(inst_id, contracts, *, mark="100", unreal="0", realised="0",
-             liq=None, created=T0, margin_ratio="2000"):
-    return {"instId": inst_id, "positions": str(contracts), "markPrice": mark,
-            "unrealizedPnl": unreal, "realizedPnl": realised,
-            "liquidationPrice": str(liq) if liq is not None else "",
-            "createTime": str(created), "marginRatio": margin_ratio}
+             liq=None, created=T0, margin_ratio="2000", position_id=None):
+    row = {"instId": inst_id, "positions": str(contracts), "markPrice": mark,
+           "unrealizedPnl": unreal, "realizedPnl": realised,
+           "liquidationPrice": str(liq) if liq is not None else "",
+           "createTime": str(created), "marginRatio": margin_ratio}
+    if position_id is not None:
+        row["positionId"] = str(position_id)
+    return row
 
 
 VALUES = {name: Decimal("1") for name in ("A-USDT", "B-USDT", "C-USDT", "D-USDT")}
@@ -312,3 +315,148 @@ def test_an_empty_account_reports_flat_and_not_a_crisis():
                      fees_usd=Decimal("0"), implied_usd=Decimal("0"))
     assert not report.open
     assert not report.critical
+
+
+# ---------------------------------------------------------------------------
+# The fee window, which a stale baseline made wrong on the live book
+# ---------------------------------------------------------------------------
+
+
+def test_fees_exclude_positions_the_book_no_longer_holds():
+    """`funding = sum(realizedPnl) + fees` only holds when both terms cover the
+    same trades, and `realizedPnl` VANISHES when a position closes.
+
+    Measured on the live demo book 2026-09-12. The baseline had been frozen
+    against an 8-leg book; that book was closed by hand and a 10-leg one
+    opened. Summing every fill in the baseline's window swept in $4.4844 of
+    fees from the previous epoch and reported +$4.05 of funding on a book 72
+    minutes old - a realised +87.107 bps/day against a planned +6.275, fourteen
+    times the forecast, every cent of it stale fees.
+    """
+    reader = FakeReader(positions=[
+        position("A-USDT", "10", created=T0 + 40 * 60_000, realised="-3"),
+        position("B-USDT", "-10", created=T0 + 40 * 60_000, realised="-2.798122"),
+    ])
+    snapshot = read_snapshot(reader, VALUES, now_ms=T0 + 30 * DAY_MS)
+
+    fills = [
+        # The previous epoch: opened, repaired and closed before these legs
+        # existed. Their realizedPnl went with the positions.
+        {"instId": "C-USDT", "ts": str(T0), "fee": "2.2"},
+        {"instId": "D-USDT", "ts": str(T0 + 60_000), "fee": "2.2844"},
+        # A name the book holds AGAIN, but traded before this position opened.
+        {"instId": "A-USDT", "ts": str(T0 + 60_000), "fee": "1.5"},
+        # The current epoch.
+        {"instId": "A-USDT", "ts": str(T0 + 40 * 60_000), "fee": "3"},
+        {"instId": "B-USDT", "ts": str(T0 + 40 * 60_000), "fee": "2.798122"},
+    ]
+
+    contaminated = fees_since(fills)
+    assert contaminated == Decimal("11.782522")
+
+    fees = fees_since(fills, snapshot.legs, since_ms=T0)
+    assert fees == Decimal("5.798122")
+
+    # Which is the whole point: it cancels realizedPnl exactly, so the
+    # derivation returns zero - the true answer before any settlement.
+    realised = sum(leg.realized_pnl_usd for leg in snapshot.legs)
+    assert realised + fees == Decimal("0")
+
+
+def test_the_fee_window_is_the_positions_own_not_the_baselines():
+    """A stale baseline is exactly when nobody is checking.
+
+    Bounding each leg at its own `createTime` rather than at the baseline's
+    `opened_ms` makes the derivation right even when the baseline describes a
+    book that no longer exists.
+    """
+    reader = FakeReader(positions=[
+        position("A-USDT", "10", created=T0 + 10 * DAY_MS, realised="-1"),
+    ])
+    snapshot = read_snapshot(reader, VALUES, now_ms=T0 + 30 * DAY_MS)
+    fills = [
+        {"instId": "A-USDT", "ts": str(T0 + 1 * DAY_MS), "fee": "9"},
+        {"instId": "A-USDT", "ts": str(T0 + 10 * DAY_MS), "fee": "1"},
+    ]
+    # A baseline ten days stale would otherwise sweep in the older fill.
+    assert fees_since(fills, snapshot.legs, since_ms=T0) == Decimal("1")
+
+
+def test_the_fee_window_still_respects_a_baseline_later_than_the_position():
+    """`since_ms` is a floor, not a suggestion: a leg opened before the epoch
+    began is scored from the epoch, not from the position."""
+    reader = FakeReader(positions=[
+        position("A-USDT", "10", created=T0, realised="-1"),
+    ])
+    snapshot = read_snapshot(reader, VALUES, now_ms=T0 + 30 * DAY_MS)
+    fills = [
+        {"instId": "A-USDT", "ts": str(T0), "fee": "9"},
+        {"instId": "A-USDT", "ts": str(T0 + 5 * DAY_MS), "fee": "1"},
+    ]
+    assert fees_since(fills, snapshot.legs,
+                      since_ms=T0 + 5 * DAY_MS) == Decimal("1")
+
+
+def test_a_maker_rebate_still_cancels_with_the_right_sign():
+    """Not through abs(): forcing a sign turns a credit into a charge."""
+    reader = FakeReader(positions=[
+        position("A-USDT", "10", created=T0, realised="0"),
+    ])
+    snapshot = read_snapshot(reader, VALUES, now_ms=T0 + 30 * DAY_MS)
+    fills = [{"instId": "A-USDT", "ts": str(T0), "fee": "-0.25"}]
+    assert fees_since(fills, snapshot.legs, since_ms=T0) == Decimal("-0.25")
+
+
+def test_fees_are_matched_to_positions_by_id_not_by_time():
+    """The exact version of the same question, and the one actually used.
+
+    Both a position and its fills carry `positionId`, so "did this fee belong
+    to a position that is still open" is answered by an identity rather than by
+    comparing two clocks.
+    """
+    reader = FakeReader(positions=[
+        position("A-USDT", "10", created=T0, realised="-3", position_id="p1"),
+        position("B-USDT", "-10", created=T0, realised="-2.798122",
+                 position_id="p2"),
+    ])
+    snapshot = read_snapshot(reader, VALUES, now_ms=T0 + DAY_MS)
+    fills = [
+        {"instId": "A-USDT", "ts": str(T0), "fee": "3", "positionId": "p1"},
+        {"instId": "B-USDT", "ts": str(T0), "fee": "2.798122",
+         "positionId": "p2"},
+        # Same instrument, an earlier position that has since closed. Its
+        # realizedPnl went with it, so its fee must not be counted.
+        {"instId": "A-USDT", "ts": str(T0), "fee": "4.050492",
+         "positionId": "p0"},
+    ]
+    fees = fees_since(fills, snapshot.legs, since_ms=T0)
+    assert fees == Decimal("5.798122")
+    assert sum(leg.realized_pnl_usd for leg in snapshot.legs) + fees == Decimal("0")
+
+
+def test_a_position_stamped_after_its_own_opening_fill_still_counts():
+    """The bug the id match exists to avoid, at the size it actually occurred.
+
+    On BloFin every position is stamped 20-35 ms AFTER the fill that opened it
+    - BCH 27 ms, ZEC 35 ms, measured 2026-09-12. A `ts >= created_ms` bound
+    therefore excluded every opening fill and reported $0.0000 of fees on a
+    book that had just paid $5.80 of them. Two clocks compared at millisecond
+    precision, which is the same shape as the funding settlements that print
+    milliseconds late in `panel_daily.py`.
+    """
+    reader = FakeReader(positions=[
+        position("A-USDT", "10", created=T0 + 35, realised="-1",
+                 position_id="p1"),
+    ])
+    snapshot = read_snapshot(reader, VALUES, now_ms=T0 + DAY_MS)
+    fill = [{"instId": "A-USDT", "ts": str(T0), "fee": "1",
+             "positionId": "p1"}]
+    assert fees_since(fill, snapshot.legs, since_ms=T0) == Decimal("1")
+
+    # And the fallback, for a venue that reports no id, absorbs the same skew.
+    no_id = FakeReader(positions=[
+        position("A-USDT", "10", created=T0 + 35, realised="-1"),
+    ])
+    legs = read_snapshot(no_id, VALUES, now_ms=T0 + DAY_MS).legs
+    assert not legs[0].position_id
+    assert fees_since(fill, legs, since_ms=0) == Decimal("1")
