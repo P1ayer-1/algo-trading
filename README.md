@@ -104,13 +104,18 @@ first. Recording is therefore step one, not step four.
 │   │   ├── attention_model.py # attention across timeframes, numpy, gradient-checked
 │   │   ├── reversion_scale.py # is the reversion real, or is it the spread?
 │   │   ├── fetch_klines.py    # bulk 1m klines, with the listing dates made visible
+│   │   ├── panel_daily.py     # 1m archive -> a daily panel, Binance funding joined
+│   │   ├── panel_blofin.py    # the same schema from BloFin's own endpoints
+│   │   ├── panel_hyperliquid.py # and from Hyperliquid, which funds hourly
+│   │   ├── factor_panel.py    # cross-sectional factors scored as money, not IC
+│   │   ├── funding_dispersion.py # the same coin's funding on two venues
 │   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (795 tests)
+│   └── tests/                 # pytest suite (878 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -489,7 +494,7 @@ cd backend
 python -m pytest
 ```
 
-496 tests covering the order book's gap handling, the OFI recursion, the
+878 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and

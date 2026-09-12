@@ -38,6 +38,9 @@ python backend\record_hyperliquid.py --coins BTC,ETH,SOL,HYPE  # Hyperliquid + l
 python backend\live-chart.py                                   # chart + one instrument's recorder
 python backend\analysis\check_features.py --horizon 900 --data-dir data\BTC-USDT
 python backend\plan_carry.py --instrument SUI-USDT --notional 2000 --leverage 3   # sends nothing
+python backend\analysis\panel_daily.py                                            # build the daily panel
+python backend\analysis\factor_panel.py --vol-scale --hold-days 7 --top-frac 0.3   # score the factors
+python backend\plan_carry_xs.py --notional 4000 --min-volume 2000000               # sends nothing
 ```
 
 `.env` at the repo root holds `API_KEY`/`SECRET`/`PASSPHRASE` and overrides such
@@ -104,6 +107,26 @@ told otherwise and owns leg ordering and unwinds. `monitor.py` is read-only and
 verifies against the exchange rather than the plan. The lifecycle is Protocols
 in `strategies/__init__.py`, satisfied structurally; there is intentionally no
 `Strategy` base class. `tests/test_strategy_contract.py` pins this.
+
+**The panels are one schema, three venues.** `analysis/panel_daily.py`
+(Binance, from the 1m archive), `panel_blofin.py` and `panel_hyperliquid.py`
+all emit the same daily CSV columns, so `factor_panel.py` and
+`funding_dispersion.py` read any of them unchanged. Two rules hold across all
+three or the comparisons are meaningless: a row closes at 00:00 UTC, and
+funding for day D is what ACCRUED during day D - the settlement stamped 00:00
+on D+1, rounded to its nominal minute first because settlements print
+milliseconds late. Venues name coins differently (`1000BONKUSDT`, `kBONK`,
+`BONK`); `funding_dispersion.canonical()` owns that matching. A daily funding
+TOTAL is the comparable unit, never a per-settlement rate - Hyperliquid funds
+hourly and the others three times a day.
+
+**Cross-sectional results are scored as money, with non-overlapping holds.**
+`factor_panel.py` never overlaps holding periods, so the rebalance count IS the
+effective N; it charges cost on turnover rather than per position; it splits
+gross into its price and funding legs, which for a carry factor is the whole
+result; and its control is the MEAN of many shuffles plus the percentile the
+real book beat, never the best draw. The control mean should land near minus
+the cost - if it does not, the cost model and the turnover disagree.
 
 **Fees decide every verdict.** `config.VIP_TIERS` / `SPOT_VIP_TIERS` are hand
 transcribed; unconfirmed tiers are absent, not interpolated; an import-time
