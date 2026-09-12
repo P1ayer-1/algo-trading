@@ -8,7 +8,7 @@ reads the positions already on the account, prints every order it would send
 and in what sequence, and sends nothing. With `--confirm` it sends them.
 
 Demo by default and demo on purpose. `--production` exists so the flag has to
-be typed, and `--production --confirm` together is refused outright — this
+be typed, and `--production --confirm` together is refused outright - this
 strategy has never been traded, and the first time it is should be a decision
 somebody makes twice.
 
@@ -18,7 +18,7 @@ There is no open and no close, because this book is rebalanced weekly and both
 are special cases of the same operation: `reconcile` moves the exchange from
 whatever it is holding to whatever the plan wants. From flat it opens; against
 an existing book it rebalances; with a refused plan it does nothing. It is
-idempotent, so an interrupted run is finished by running it again — and with
+idempotent, so an interrupted run is finished by running it again - and with
 twelve legs, being interrupted is the normal case rather than the exceptional
 one.
 
@@ -26,7 +26,7 @@ Read in this order
 ------------------
 **REFUSALS** first: the plan's gates are the executor's gates, and a refused
 plan is never sent. Then the **sequence**, which is not the order the legs are
-listed in — orders are interleaved so the partly-filled book stays close to
+listed in - orders are interleaved so the partly-filled book stays close to
 neutral, and `worst intermediate net` is the measured bound on how directional
 this gets between the first fill and the last. Then, after a live run, the
 **verification**, which reads the positions back from the exchange rather than
@@ -60,12 +60,13 @@ def log(message: str = "") -> None:
 def report(result) -> None:
     log()
     log("=" * 78)
-    log(("REHEARSAL — nothing sent" if result.dry_run
+    log(("REHEARSAL - nothing sent" if result.dry_run
          else "EXECUTION").center(78))
     log("=" * 78)
 
     if result.already_correct:
-        log("The book already matches the plan. Nothing to do.")
+        log(result.summary or "The book already matches the plan.")
+        log("Nothing to do.")
         return
     if not result.orders:
         log("No orders.")

@@ -57,7 +57,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from .plan import BookPlan
@@ -122,6 +122,11 @@ class ExecutionResult:
 
     reconciled: bool = False
     already_correct: bool = False
+    # Why there was nothing to do. "Nothing to do" has several causes and they
+    # are not interchangeable: an empty account, a book already inside
+    # tolerance, and a book that already matches the plan all end here, and a
+    # report that calls all three "matches the plan" is lying about two.
+    summary: str = ""
     max_net_usd: Decimal = ZERO           # worst directional exposure en route
     gross_before_usd: Decimal = ZERO
     gross_after_usd: Decimal = ZERO
@@ -209,6 +214,90 @@ def round_to_lot(contracts: Decimal, lot: Decimal) -> Decimal:
     if lot <= 0:
         return contracts
     return (contracts / lot).to_integral_value(rounding=ROUND_DOWN) * lot
+
+
+def repair_trims(book: Dict[str, Decimal], unit_usd: Dict[str, Decimal],
+                 rules: Optional[Dict[str, Any]], signed: Decimal,
+                 stop_usd: Decimal = ZERO) -> List[Order]:
+    """The `reduce_only` trims that take a lopsided book back to NEUTRAL.
+
+    The target is ZERO net, not the edge of the tolerance, and the second live
+    run is why. Aiming at the edge cannot work, because three things compound
+    in the same direction:
+
+    - it aimed at the boundary, leaving the book as directional as the alarm
+      would just barely allow;
+    - it rounded the trim DOWN, so it did not even reach that;
+    - and trimming shrinks GROSS, which moves the boundary toward the book by
+      `tolerance x trim` while the trim moves the book toward the boundary.
+
+    Measured 2026-09-12 on the demo book: $139.91 net on $3,377.27 gross, 4.14%
+    against a 2% tolerance. It sized one trim of $71.28, landed at $68.62 net
+    on $3,305.98 gross - 2.08% - and reported "STILL directional". It was
+    arithmetically incapable of succeeding, and a second run would have sized
+    the same losing trim again.
+
+    Zero is also the honest target: the strategy wants a dollar-neutral book,
+    not one parked exactly where the monitor stops complaining. The tolerance
+    decides WHETHER to repair; it has no business deciding how much.
+
+    Each trim is the whole number of lots closest to what is left to take off,
+    capped at the position. Nearest rather than down, because down cannot
+    remove an imbalance smaller than one lot and those are the only ones that
+    survive to be a problem; overshoot is bounded by half a lot's notional and
+    leaves the book nearer neutral than the alternative of doing nothing.
+
+    `stop_usd` is where the trimming stops, and it is NOT the target. The
+    distinction is the whole bug above, so it is worth keeping straight: the
+    tolerance decides whether to act and when to stop chasing rounding dust,
+    and it never decides how much to take off. Without a floor this walks down
+    the whole heavy side paying a taker fee per leg to remove the last dollar -
+    the first run of the fixed version sized a second order of $0.74, which is
+    0.02% of gross and costs money to send.
+
+    Largest position first, so the fewest orders do it. That can close a leg
+    outright when a whole leg's worth of imbalance is what went wrong, and that
+    is correct: if the short side lost a leg, the neutral book is the one with
+    its long counterpart gone. Trimming every leg proportionally would preserve
+    the cross-section better at the same fee (cost is proportional to notional
+    either way), but it multiplies the orders and each one can fall under the
+    exchange's minimum. Not worth it until a rebalance shows otherwise.
+    """
+    heavy_long = signed > 0
+    remaining = abs(signed)
+    candidates = sorted(
+        ((name, size) for name, size in book.items()
+         if size != 0 and (size > 0) == heavy_long),
+        key=lambda item: abs(item[1]) * unit_usd.get(item[0], ZERO),
+        reverse=True)
+
+    trims: List[Order] = []
+    for name, size in candidates:
+        if remaining <= stop_usd:
+            break
+        unit = unit_usd.get(name, ZERO)
+        if unit <= 0:
+            continue
+        rule = (rules or {}).get(name)
+        lot = getattr(rule, "lot_size", ZERO) if rule is not None else ZERO
+        if lot > 0:
+            step_usd = lot * unit
+            steps = (remaining / step_usd).to_integral_value(
+                rounding=ROUND_HALF_UP)
+            cap = (abs(size) / lot).to_integral_value(rounding=ROUND_DOWN)
+            trim = max(ZERO, min(steps, cap)) * lot
+            if trim < rule.min_size:
+                continue
+        else:
+            trim = min(abs(size), remaining / unit)
+        if trim <= 0:
+            continue
+        trims.append(Order(
+            inst_id=name, side="sell" if size > 0 else "buy",
+            contracts=trim, reduce_only=True, reason="repair",
+            notional_usd=trim * unit))
+        remaining -= trim * unit
+    return trims
 
 
 def unit_values(plan: BookPlan, contract_values: Dict[str, Decimal],
@@ -432,7 +521,8 @@ class BookExecutor:
         if not orders:
             result.already_correct = True
             result.reconciled = True
-            self.log("The book already matches the plan. Nothing to send.")
+            result.summary = "The book already matches the plan."
+            self.log(result.summary + " Nothing to send.")
             return result
 
         for index, order in enumerate(orders):
@@ -511,7 +601,9 @@ class BookExecutor:
         if gross <= 0:
             result.already_correct = True
             result.reconciled = True
-            self.log("Nothing open.")
+            result.summary = ("No open positions on this account, so there is "
+                              "nothing to repair.")
+            self.log(result.summary)
             return result
 
         drift = abs(signed) / gross
@@ -520,49 +612,28 @@ class BookExecutor:
         if drift <= Decimal(str(self.net_tolerance_frac)):
             result.already_correct = True
             result.reconciled = True
-            result.net_after_usd, result.gross_after_usd = signed, gross
-            self.log("Inside tolerance. Nothing to do.")
+            result.summary = (
+                "Book is ${:,.2f} net on ${:,.2f} gross ({:.2%}), inside the "
+                "{:.2%} tolerance. Nothing to repair.".format(
+                    signed, gross, drift, self.net_tolerance_frac))
+            self.log(result.summary)
             return result
 
         if self.dry_run:
-            # Price the trims without sending them, so a rehearsal shows the
-            # same orders a live run would place.
-            self._plan_repair(unit_usd, rules, book, signed, gross, result)
+            # Price the trims without sending them, through the SAME sizing the
+            # live path uses, so a rehearsal cannot show different orders from
+            # the run it is rehearsing.
+            floor = Decimal(str(self.net_tolerance_frac)) * gross / 4
+            for order in repair_trims(book, unit_usd, rules, signed, floor):
+                result.add(order)
+                self.log("  WOULD REPAIR  {}: {} {} contracts (${:,.2f})".format(
+                    order.inst_id, order.side, order.contracts,
+                    order.notional_usd))
             self.log("Dry run: nothing was sent.")
             return result
 
         self._verify_and_repair(unit_usd, rules, result, uuid.uuid4().hex[:8])
         return result
-
-    def _plan_repair(self, unit_usd, rules, book, signed, gross,
-                     result: ExecutionResult) -> None:
-        """The trims a repair would send. Shared shape with the live path."""
-        heavy_long = signed > 0
-        excess = abs(signed) - Decimal(str(self.net_tolerance_frac)) * gross
-        candidates = sorted(
-            ((name, size) for name, size in book.items()
-             if (size > 0) == heavy_long and size != 0),
-            key=lambda item: abs(item[1]) * unit_usd.get(item[0], ZERO),
-            reverse=True)
-        for name, size in candidates:
-            if excess <= 0:
-                break
-            unit = unit_usd.get(name, ZERO)
-            if unit <= 0:
-                continue
-            trim = min(abs(size), excess / unit)
-            rule = rules.get(name)
-            if rule is not None:
-                trim = round_to_lot(trim, rule.lot_size)
-                if trim < rule.min_size:
-                    continue
-            if trim <= 0:
-                continue
-            result.add(Order(
-                inst_id=name, side="sell" if size > 0 else "buy",
-                contracts=trim, reduce_only=True, reason="repair",
-                notional_usd=trim * unit))
-            excess -= trim * unit
 
     # -- after ------------------------------------------------------------
 
@@ -611,56 +682,33 @@ class BookExecutor:
             "heavy side".format(signed, gross, drift))
         self.log(result.warnings[-1])
 
-        # Trim the heaviest positions on the over-weighted side until the net is
-        # inside tolerance. Largest first, so the fewest orders do it.
-        heavy_side_is_long = signed > 0
-        excess = abs(signed) - Decimal(str(self.net_tolerance_frac)) * gross
-        candidates = sorted(
-            ((inst_id, size) for inst_id, size in book.items()
-             if (size > 0) == heavy_side_is_long and size != 0),
-            key=lambda item: abs(item[1]) * unit_usd.get(item[0], ZERO),
-            reverse=True)
-
-        for position, (inst_id, size) in enumerate(candidates):
-            if excess <= 0:
-                break
-            unit = unit_usd.get(inst_id, ZERO)
-            if unit <= 0:
-                continue
-            rule = rules.get(inst_id)
-            trim = min(abs(size), excess / unit)
-            if rule is not None:
-                trim = round_to_lot(trim, rule.lot_size)
-                # A trim below the minimum cannot be sent. Skipping it and
-                # moving to the next position is right: the repair is a
-                # best-effort shrink, and the final check below reports
-                # whatever it could not fix rather than pretending it did.
-                if trim < rule.min_size:
-                    continue
-            if trim <= 0:
-                continue
-            order = result.add(Order(
-                inst_id=inst_id, side="sell" if size > 0 else "buy",
-                contracts=trim, reduce_only=True, reason="repair",
-                notional_usd=trim * unit,
-                client_order_id="xr{}{:02d}".format(tag, position)))
-            self.log("  REPAIR      {}: {} {} contracts".format(
-                inst_id, order.side, trim))
+        # Trim the heaviest positions on the over-weighted side back toward
+        # NEUTRAL - not toward the edge of the tolerance, which is a target the
+        # trimming itself moves. `repair_trims` carries that argument.
+        floor = Decimal(str(self.net_tolerance_frac)) * gross / 4
+        for position, order in enumerate(
+                repair_trims(book, unit_usd, rules, signed, floor)):
+            order.client_order_id = "xr{}{:02d}".format(tag, position)
+            result.add(order)
+            self.log("  REPAIR      {}: {} {} contracts (${:,.2f})".format(
+                order.inst_id, order.side, order.contracts, order.notional_usd))
             try:
                 order.response = self.broker.place_perp(
-                    inst_id=inst_id, side=order.side, size=trim,
+                    inst_id=order.inst_id, side=order.side,
+                    size=order.contracts,
                     client_order_id=order.client_order_id, reduce_only=True)
             except Exception as exc:               # noqa: BLE001
                 order.error = str(exc)
-                result.problems.append("repair of " + inst_id + ": " + str(exc))
+                result.problems.append(
+                    "repair of " + order.inst_id + ": " + str(exc))
                 continue
             if not _filled(order.response):
                 order.error = "rejected: " + str(order.response)
-                result.problems.append("repair of " + inst_id + " was rejected")
+                result.problems.append(
+                    "repair of " + order.inst_id + " was rejected")
                 continue
             order.sent = True
             result.repaired = True
-            excess -= trim * unit
 
         book = current_book(self.broker)
         signed = sum((size * unit_usd.get(inst_id, ZERO)

@@ -116,7 +116,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (966 tests)
+│   └── tests/                 # pytest suite (972 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -495,7 +495,7 @@ cd backend
 python -m pytest
 ```
 
-966 tests covering the order book's gap handling, the OFI recursion, the
+972 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -2343,6 +2343,67 @@ ecord.py` runs N instruments headless in one process.
    monitor raised `not-neutral` as critical, exited 2, and `--repair-only`
    priced the fix as a single trim: sell 0.21 TRX contracts, $71.30,
    `reduce_only`.
+
+   ### The repair could not reach neutral, and the arithmetic says why
+
+   The second live run found the first one: the repair sized a trim, sent it,
+   and then reported that the book was STILL directional. It was not a fluke
+   and a retry would not have helped - it was arithmetically incapable of
+   succeeding. Measured 2026-09-12 on demo, $139.91 net on $3,377.27 gross
+   (4.14%) against a 2% tolerance:
+
+   ```
+   sized     sell 0.21 TRX-USDT   $71.28
+   landed    $68.62 net on $3,305.98 gross   2.08%   -> "STILL directional"
+   ```
+
+   Three things compounded, all in the same direction:
+
+   - it aimed at the tolerance BOUNDARY rather than at zero, so success was
+     defined as being as directional as the alarm would just barely allow;
+   - it rounded the trim DOWN, so it did not even reach that boundary;
+   - and trimming shrinks GROSS, so the boundary moves toward the book by
+     `tolerance x trim` while the trim moves the book toward the boundary. The
+     target was running away at 2% of the speed of the cure.
+
+   The fix is one sentence: the tolerance decides WHETHER to repair, and it has
+   no business deciding how much. The target is zero. The same book now:
+
+   ```
+   sized     sell 0.41 TRX-USDT   $139.17
+   landed    $0.74 net on $3,238.10 gross    0.02%
+   ```
+
+   Two smaller corrections came with it. Trims round to the NEAREST lot rather
+   than down, because rounding down cannot remove an imbalance smaller than one
+   lot and those are precisely the ones that survive to be a problem; the
+   overshoot is bounded by half a lot. And the trimming stops at a quarter of
+   the tolerance band, because aiming at zero without a floor walks down the
+   whole heavy side paying a taker fee per leg - the first run of the fixed
+   version sized a second order for the remaining $0.74.
+
+   That floor is a stopping rule and NOT a target, which is worth writing down
+   in the same place as the bug, because the two are one careless edit apart.
+
+   The dry run and the live run had also been sizing the trims in two separate
+   copies of the same loop, so the rehearsal was a rehearsal of something else.
+   They are one `repair_trims` now.
+
+   ### Nothing to do, and which nothing
+
+   Running the repair again against the account reported "The book already
+   matches the plan", which was the opposite of the truth: the positions had
+   been closed by hand in the BloFin UI between the two runs. The order history
+   is unambiguous about it - eight `reduce_only` closes at 14:25:59, 23 seconds
+   after the repair, carrying NO `clientOrderId`, where every order this repo
+   sends has one (`xsd03c047d00`, `xre966825900`). Being able to tell one's own
+   orders from a human's, after the fact, is worth the eleven characters.
+
+   Three situations end in `already_correct` - an empty account, a book inside
+   tolerance, and a book that matches the plan - and reporting all three with
+   the same sentence tells the operator the opposite of the truth in the first
+   case. A repair that finds no positions is not a book in good order, it is an
+   account that may have been closed out from under it. Each says which now.
 
    Still missing: nothing writes a baseline at execution time, so the monitor
    reconstructs and freezes one on first sight (like step 9i's, and for the

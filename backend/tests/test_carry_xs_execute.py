@@ -323,9 +323,23 @@ def test_a_failed_leg_does_not_unwind_the_other_eleven():
     plan = a_plan()
     legs = [leg.inst_id for leg in plan.legs if leg.ok]
     broker.reject = {legs[0]}
-    BookExecutor(broker, dry_run=False, settle_seconds=0).reconcile(plan)
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).reconcile(plan)
     held = current_book(broker)
-    assert len(held) >= len(legs) - 1
+
+    # The invariant is about MONEY, not about the number of rows. When a whole
+    # leg is rejected the imbalance IS a whole leg, and the neutral book is
+    # then the one with its counterpart gone - so a repair that restores
+    # neutrality legitimately closes one position. What it must never do is
+    # take off more than the imbalance, which is what unwinding means.
+    removed = result.gross_before_usd + sum(
+        order.notional_usd for order in result.orders
+        if order.reason in ("open", "increase") and order.sent
+    ) - result.gross_after_usd
+    imbalance = sum(order.notional_usd for order in result.orders
+                    if order.reason == "repair")
+    assert removed <= imbalance + Decimal("1")
+    assert len(held) >= 4, "the book was unwound rather than repaired"
+    assert result.gross_after_usd > result.gross_before_usd
 
 
 def test_an_exception_mid_batch_does_not_abandon_the_rest():
@@ -594,3 +608,177 @@ def test_an_instrument_the_account_cannot_trade_is_dropped_and_reported():
     assert unlisted not in [order["instId"] for order in broker.sent]
     assert any("not listed on this account's host" in problem
                for problem in result.problems)
+
+
+# ---------------------------------------------------------------------------
+# The repair aims at neutral, which the second live run proved it had not been
+# ---------------------------------------------------------------------------
+
+
+def test_the_repair_targets_zero_net_and_not_the_edge_of_the_tolerance():
+    """The exact book the second live run failed on, to the cent.
+
+    Measured 2026-09-12 on demo: $139.91 net long on $3,377.27 gross, 4.14%
+    against a 2% tolerance. Aiming at the tolerance EDGE sized one $71.28 trim,
+    which landed at $68.62 net on $3,305.98 gross - 2.08% - and reported "STILL
+    directional". It could not have succeeded: trimming shrinks gross, so the
+    boundary being aimed at moves toward the book by `tolerance x trim`, while
+    rounding the trim down stops it reaching even that.
+    """
+    from trading.strategies.carry_xs.execute import repair_trims
+
+    # TRX is the heaviest long, so it is the one the repair reaches for - as it
+    # did live. The rest are priced at $1 a contract so the book reads in
+    # dollars: longs $1,758.59, shorts $1,618.68, which is the measured
+    # $139.91 net on $3,377.27 gross.
+    unit = Decimal("339.428571428571")          # TRX: $ per contract
+    book = {"TRX-USDT": Decimal("1.25"),
+            "L2": Decimal("400"), "L3": Decimal("400"),
+            "L4": Decimal("400"), "L5": Decimal("134.30"),
+            "S1": Decimal("-600"), "S2": Decimal("-600"),
+            "S3": Decimal("-418.68")}
+    unit_usd = {name: Decimal("1") for name in book}
+    unit_usd["TRX-USDT"] = unit
+    lot = Rules(contract_value=Decimal("1"), lot_size=Decimal("0.01"),
+                min_size=Decimal("0.01"))
+    rules = {name: lot for name in book}
+    signed = sum(size * unit_usd[name] for name, size in book.items())
+    gross = sum(abs(size) * unit_usd[name] for name, size in book.items())
+    assert round(signed, 2) == Decimal("139.91")
+    assert round(gross, 2) == Decimal("3377.27")
+
+    # The floor the executor passes: a quarter of the tolerance band, below
+    # which further trims are chasing rounding dust at a taker fee each.
+    floor = Decimal("0.02") * gross / 4
+    trims = repair_trims(book, unit_usd, rules, signed, floor)
+    assert len(trims) == 1
+    trim = trims[0]
+    assert trim.inst_id == "TRX-USDT" and trim.side == "sell"
+    assert trim.reduce_only
+
+    # The old code sized 0.21 contracts, worth $71.28 against a $139.91
+    # imbalance - it aimed at the edge and then rounded away from it.
+    assert trim.contracts == Decimal("0.41")
+    assert Decimal("139") < trim.notional_usd < Decimal("140")
+
+    left = abs(signed - trim.notional_usd)
+    assert left / (gross - trim.notional_usd) < Decimal("0.005"), \
+        "the repair left the book outside a quarter of the tolerance"
+
+
+def test_a_repair_trims_the_nearest_lot_rather_than_giving_up_below_one():
+    """Rounding a trim DOWN cannot remove an imbalance smaller than one lot.
+
+    Those are exactly the imbalances that survive to be a problem - a big one
+    gets trimmed on the first pass. Nearest overshoots by at most half a lot's
+    notional and leaves the book closer to neutral than doing nothing, which is
+    what rounding down does here.
+    """
+    from trading.strategies.carry_xs.execute import repair_trims
+
+    # $60 of imbalance on an instrument whose lot is worth $50.
+    book = {"A": Decimal("10"), "B": Decimal("-9.4")}
+    unit_usd = {"A": Decimal("100"), "B": Decimal("100")}
+    rules = {"A": Rules(contract_value=Decimal("1"), lot_size=Decimal("0.5"),
+                        min_size=Decimal("0.5")),
+             "B": Rules(contract_value=Decimal("1"), lot_size=Decimal("0.5"),
+                        min_size=Decimal("0.5"))}
+    signed = Decimal("60")
+    trims = repair_trims(book, unit_usd, rules, signed)
+    assert len(trims) == 1
+    # 60 / 50 = 1.2 steps -> nearest is 1 step = 0.5 contracts = $50.
+    assert trims[0].contracts == Decimal("0.5")
+    assert abs(signed - trims[0].notional_usd) < signed
+
+
+def test_a_repair_never_trims_more_than_the_position_it_is_trimming():
+    """`reduce_only` would reject the excess anyway, but a size the exchange
+    refuses is a repair that silently does nothing at all."""
+    from trading.strategies.carry_xs.execute import repair_trims
+
+    book = {"A": Decimal("0.3")}
+    unit_usd = {"A": Decimal("100")}
+    rules = {"A": Rules(contract_value=Decimal("1"), lot_size=Decimal("0.1"),
+                        min_size=Decimal("0.1"))}
+    trims = repair_trims(book, unit_usd, rules, Decimal("5000"))
+    assert len(trims) == 1
+    assert trims[0].contracts == Decimal("0.3")
+
+
+def test_the_rehearsal_and_the_live_repair_size_the_same_trims():
+    """A dry run that priced trims differently from the run it rehearses is
+    worse than no dry run: it is a rehearsal of something else.
+
+    They shared a shape but not an implementation until the two copies of the
+    sizing were collapsed onto `repair_trims`.
+    """
+    import trading.strategies.carry_xs.execute as ex
+
+    lopsided = {"A-USDT": Decimal("40"), "B-USDT": Decimal("-10")}
+    broker = FakeBroker(positions=dict(lopsided))
+
+    dry = BookExecutor(broker, dry_run=True, settle_seconds=0).repair_only()
+    sizes = [(o.inst_id, o.side, o.contracts) for o in dry.orders]
+    assert sizes, "the rehearsal priced no trims on a lopsided book"
+
+    seen = []
+    original = ex.repair_trims
+
+    def spy(book, unit_usd, rules, signed, stop_usd=Decimal("0")):
+        trims = original(book, unit_usd, rules, signed, stop_usd)
+        seen.append([(o.inst_id, o.side, o.contracts) for o in trims])
+        return trims
+
+    ex.repair_trims = spy
+    try:
+        live = FakeBroker(positions=dict(lopsided))
+        BookExecutor(live, dry_run=False, settle_seconds=0).repair_only()
+    finally:
+        ex.repair_trims = original
+    assert seen and seen[0] == sizes
+
+
+def test_nothing_to_do_says_which_nothing():
+    """Three different situations used to print the same sentence.
+
+    An empty account, a book already inside tolerance, and a book that matches
+    the plan all end in `already_correct`, and reporting all three as "the book
+    already matches the plan" tells the operator the opposite of the truth in
+    the first case - a repair that found no positions is not a book in good
+    order, it is an account that may have been closed out from under it.
+    """
+    empty = BookExecutor(FakeBroker(), dry_run=False,
+                         settle_seconds=0).repair_only()
+    assert empty.already_correct
+    assert "no open positions" in empty.summary.lower()
+
+    balanced = BookExecutor(
+        FakeBroker(positions={"A-USDT": Decimal("10"), "B-USDT": Decimal("-10")}),
+        dry_run=False, settle_seconds=0).repair_only()
+    assert balanced.already_correct
+    assert "tolerance" in balanced.summary.lower()
+    assert "no open positions" not in balanced.summary.lower()
+
+
+def test_a_repair_stops_once_the_book_is_neutral_enough_to_stop_paying_fees():
+    """Aiming at zero without a floor walks the whole heavy side.
+
+    The first run of the fixed sizing took $139.17 off with one trim and then
+    sized a SECOND order for the remaining $0.74 - 0.02% of gross, at a taker
+    fee. The floor is a stopping rule and never a target; that distinction is
+    the bug this whole section exists for.
+    """
+    from trading.strategies.carry_xs.execute import repair_trims
+
+    book = {"A": Decimal("100"), "B": Decimal("60"), "C": Decimal("-159")}
+    unit_usd = {name: Decimal("1") for name in book}
+    rule = Rules(contract_value=Decimal("1"), lot_size=Decimal("1"),
+                 min_size=Decimal("1"))
+    rules = {name: rule for name in book}
+
+    without = repair_trims(book, unit_usd, rules, Decimal("1"), Decimal("0"))
+    assert [order.inst_id for order in without] == ["A"]
+
+    # A $1 imbalance on $319 of gross is 0.3%, well inside a 2% tolerance.
+    floor = Decimal("0.02") * Decimal("319") / 4
+    assert repair_trims(book, unit_usd, rules, Decimal("1"), floor) == []
