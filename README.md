@@ -99,6 +99,8 @@ first. Recording is therefore step one, not step four.
 │   │   ├── range_backtest.py  # fade the range: bracketed 1m fills vs a shuffled-day control
 │   │   ├── range_information.py  # what a forecast range is worth: centre vs width
 │   │   ├── range_harness.py   # the bar every range model is scored on
+│   │   ├── range_gated.py     # trade the fade only when a model says the range holds
+│   │   ├── reversion_scale.py # is the reversion real, or is it the spread?
 │   │   ├── fetch_klines.py    # bulk 1m klines, with the listing dates made visible
 │   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
@@ -106,7 +108,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (758 tests)
+│   └── tests/                 # pytest suite (772 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -1413,6 +1415,70 @@ ecord.py` runs N instruments headless in one process.
    `simulate` gained an optional entry gate for this. Exits are deliberately
    never gated: a gate that could strand an open position is a far worse
    instrument than one that declines to open another.
+
+9n. ~~**Stocks, commodities, and synthetic data**~~ —
+   `backend\analysis\reversion_scale.py`. Three proposals with three different
+   answers, and the third one found the mechanism the whole branch had been
+   missing.
+
+   ```
+   python backend\analysis\reversion_scale.py --sweep
+   ```
+
+   **Tokenised equities and commodities: shorter history, worse results.**
+   Binance lists 191 `TRADIFI_PERPETUAL` contracts, but the longest is XAUUSDT
+   at 275 days (listed 2025-12-11) and most single stocks are 60–160 days old,
+   so as a *sample* they are smaller than the crypto majors already give. Run
+   the same fade on gold, silver, crude, Brent and four stocks over 270 days:
+   **−17.6 bps per trade [−29.4, −6.5]** out of sample, 0 of 8 symbols
+   positive, against −7.7 for crypto. Newer, thinner contracts with wider
+   spreads, and equities carry session gaps on top.
+
+   **Synthetic data cannot supply an edge.** A generator returns the
+   assumptions put into it, and a mean-reverting generator makes any fade look
+   brilliant. What it can do is calibrate a yardstick — Ornstein-Uhlenbeck
+   paths at the majors' volatility, the identical fade, VIP 1 fees:
+
+   | reversion half-life | variance ratio | net bps per trade |
+   |---|---|---|
+   | 1h | 0.055 | +56.0 |
+   | 6h | 0.322 | +41.1 |
+   | 24h | 0.709 | +16.6 |
+   | 48h | 0.824 | +10.8 |
+   | none (random walk) | 0.986 | **−0.1** |
+
+   The random-walk row is also a check on the simulator: gross +2.6 bps
+   against a standard error of ~4, fees 2.7, so it pays its costs and invents
+   nothing.
+
+   **Then the yardstick explained the last four steps.** The variance ratio
+   over 24h sits below 1 for the majors — BTC 0.90, DOGE 0.61 on a 1-minute
+   base — which reads as mean reversion and is precisely what a range fade
+   bets on. Those figures sit in the band where the table above pays +10 to
+   +25 bps. Measure the same ratio against longer base intervals:
+
+   | | 1m base | 5m | 15m | 60m | |
+   |---|---|---|---|---|---|
+   | BTCUSDT | 0.904 | 0.953 | 0.985 | **1.044** | artifact |
+   | SOLUSDT | 0.824 | 0.797 | 0.922 | **1.025** | artifact |
+   | DOGEUSDT | 0.613 | 0.371 | 0.949 | **1.015** | artifact |
+   | ADAUSDT | 0.658 | 0.401 | 0.795 | **1.041** | artifact |
+   | synthetic OU, 24h half-life | 0.796 | 0.799 | 0.793 | **0.794** | scale-invariant |
+   | synthetic random walk | 1.074 | 1.076 | 1.066 | 1.056 | none |
+
+   **Genuine reversion is scale-invariant** — the OU path holds 0.79 whether
+   sampled every minute or every hour. What decays as the base lengthens is
+   **bid-ask bounce**: price alternating between touching bid and ask inflates
+   the shortest interval's variance and nothing else. That is the Roll (1984)
+   effect, it is indistinguishable from mean reversion in the statistic, and
+   it is untradeable — the bounce *is* the spread, which a fade pays on the
+   way in rather than harvests.
+
+   Four of five majors show reversion at the shortest base that is gone by the
+   hourly one. That is why step 9m's fade loses 7.7 bps while its headline
+   variance ratio looks like a strategy that should earn +16. The statistic was
+   never measuring what it appeared to measure, and this is the check to run
+   **before** writing the next reversion strategy rather than after.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
