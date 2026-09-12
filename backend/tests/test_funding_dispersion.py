@@ -199,3 +199,49 @@ def test_align_intersects_dates_and_symbols():
     assert data.dates == ["2026-01-02", "2026-01-03"]
     assert data.symbols == ["Y"]
     assert np.allclose(data.difference, 3.0)
+
+
+# ---------------------------------------------------------------------------
+# Symbol matching across venues that name coins differently
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_strips_quote_and_contract_multiplier():
+    """`1000BONKUSDT` and `kBONK` are the same underlying.
+
+    A multiplier changes the size of a contract, not the percentage of funding
+    paid, so the two quote comparable rates. Matching on the raw ticker would
+    silently drop every multiplied contract - which is most of the meme perps,
+    and exactly where the dispersion is largest, so the loss would not be
+    random.
+    """
+    from analysis.funding_dispersion import canonical
+
+    assert canonical("BTCUSDT") == "BTC"
+    assert canonical("BTC") == "BTC"
+    assert canonical("1000BONKUSDT") == "BONK"
+    assert canonical("kBONK") == "BONK"
+    assert canonical("1000PEPEUSDT") == canonical("kPEPE") == "PEPE"
+    assert canonical("ETHUSDC") == "ETH"
+
+
+def test_canonical_does_not_eat_a_whole_symbol():
+    """A ticker that IS its quote or multiplier must survive intact."""
+    from analysis.funding_dispersion import canonical
+
+    assert canonical("USDT") == "USDT"
+    assert canonical("K") == "K"
+
+
+def test_a_base_listed_twice_on_one_venue_is_dropped_not_guessed():
+    """Two tickers mapping to one base means that venue lists the coin twice.
+
+    Picking one silently would be a choice nobody made, and the two contracts
+    can have genuinely different funding.
+    """
+    dates = ["2026-01-01", "2026-01-02"]
+    a = panel(np.ones((2, 3)) * 10.0, np.ones((2, 3)) * 5.0,
+              ["BTCUSDT", "BTCUSDC", "ETHUSDT"], dates)
+    b = panel(np.ones((2, 2)) * 10.0, np.ones((2, 2)) * 2.0, ["BTC", "ETH"], dates)
+    data = align(a, b, name_a="A", name_b="B")
+    assert data.symbols == ["ETH"]

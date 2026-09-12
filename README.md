@@ -1916,6 +1916,85 @@ ecord.py` runs N instruments headless in one process.
    unmeasured. And the Hyperliquid decay is a live question that only more time
    answers.
 
+9t. **A funding ladder across three venues** —
+   `backend\analysis\funding_dispersion.py`, now matching coins across venues
+   that name them differently.
+
+   ```
+   python backend\analysis\funding_dispersion.py --panel-a data\panel\blofin-daily.csv --name-a BloFin --panel-b data\panel\hyperliquid-daily.csv --name-b Hyperliquid --hold-days 30
+   ```
+
+   Step 9r found BloFin's alts charging more funding than Binance's and priced
+   the pair, with one disqualifying caveat: it needs a Binance futures account
+   this project does not have. Hyperliquid needs none — an address is an
+   account — so with a third panel the question becomes whether the same
+   dispersion exists in a form this account could actually trade.
+
+   Matching the coins is the part that had to be got right first. The three
+   panels spell the same asset three ways (`1000BONKUSDT`, `kBONK`, `BONK`) and
+   pick their own contract multipliers. A multiplier changes the size of a
+   contract, not the percentage of funding paid, so those are the same
+   underlying — but matching on the raw ticker silently drops every multiplied
+   contract, which is most of the meme perps, and those are exactly where the
+   dispersion is largest. `canonical()` strips quote and multiplier; a base that
+   two tickers on one venue map to is dropped rather than guessed at.
+
+   **There is a ladder, and it is the same ladder on every pair.** On the
+   27,591 coin-days where all three venues quote the same 33 coins:
+
+   | venue | mean funding, bps accrued per day | annualised cost of being long |
+   |---|---|---|
+   | BloFin | **+5.70** | ~20.8% |
+   | Hyperliquid | +3.11 | ~11.3% |
+   | Binance | +1.40 | ~5.1% |
+
+   The smaller and more leverage-oriented the venue, the more its longs pay.
+   The pairwise gaps are also stable across *different* coin subsets, which is
+   the check worth making: measured on each pair's own overlap the gaps are
+   +3.79 / +2.60 / +1.55, against +4.30 / +2.59 / +1.70 on the common cells.
+   (The three gaps summing exactly on common cells is arithmetic, not evidence
+   — it is the stability across subsets that says the ladder is a property of
+   the venues rather than of which coins each one happens to list.)
+
+   All three pairs clear four taker legs at 30-day holds, 6 pairs at a time,
+   10 bps a leg:
+
+   | pair | funding | divergence | net | 95% | Sharpe | worst | control |
+   |---|---|---|---|---|---|---|---|
+   | BloFin / Binance | +74.5 | −0.4 | **+54.5** | [+32.3, +82.8] | 3.99 | −34 | +35.3 |
+   | BloFin / Hyperliquid | +57.5 | +0.0 | **+37.5** | [+21.6, +56.3] | 3.79 | −19 | +19.8 |
+   | Hyperliquid / Binance | +51.8 | +3.8 | +31.8 | [+12.6, +45.0] | 2.11 | −54 | +15.0 |
+
+   **BloFin / Hyperliquid is the one this account could trade**, and it is the
+   best-behaved of the three on the measures that are not the headline: the
+   divergence leg is +0.0 bps, the worst 30-day period in 34 is −19 bps, the hit
+   rate is 88%, and selection carries nearly half the return (+37.5 against a
+   random-pair control of +19.8) where on the Binance pair it carried a third.
+
+   **And the ladder is not static, which cuts both ways.** By year, against
+   Binance:
+
+   | | 2023 | 2024 | 2025 | 2026 |
+   |---|---|---|---|---|
+   | BloFin − Binance | +0.58 | +4.77 | +6.03 | +3.46 |
+   | Hyperliquid − Binance | +0.16 | +3.25 | +1.62 | **+1.05** |
+
+   Hyperliquid's premium peaked in 2024 and has shrunk by two thirds. That is
+   the same decay its own carry factor shows in step 9s, and the two readings
+   agree on a story: a venue that launched into this period is converging on
+   the most arbitraged one. BloFin's premium has not converged. Whether that is
+   because it is structurally harder to arbitrage or because nobody has yet is
+   the question, and it decides whether this trade has years left or months.
+
+   **What would have to be true to trade it.** Capital on two venues that
+   cannot net margin; a leveraged short held for a month on the smaller of
+   them, which is venue risk no backtest prices; legs that liquidate
+   independently, so a move leaving the pair flat can still take one side out;
+   and 4.6% a year on gross notional, which is a Sharpe story that only pays
+   levered — where the venue and liquidation risks live. Nothing here is built:
+   there is no planner for the pair, and there should not be one until the
+   decay question has another six months of data on it.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

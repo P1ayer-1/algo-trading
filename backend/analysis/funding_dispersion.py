@@ -87,6 +87,36 @@ class Aligned:
         return self.funding_a - self.funding_b
 
 
+QUOTES = ("USDT", "USDC", "USD")
+# Contract multipliers. A perp on 1000 SHIB and one on 1 SHIB are the same
+# underlying and quote the same funding RATE - the multiplier changes the size
+# of a contract, not the percentage paid - so matching across them is correct.
+# Venues spell the multiplier differently, hence both forms.
+MULTIPLIERS = ("1000000", "1000", "100", "10", "k", "K", "M")
+
+
+def canonical(symbol: str) -> str:
+    """`1000BONKUSDT` and `kBONK` both become `BONK`.
+
+    The three panels name the same coin three ways: Binance and BloFin use
+    `<BASE><QUOTE>`, Hyperliquid uses the bare base, and each venue picks its
+    own contract multiplier. Matching on the raw string silently drops every
+    multiplied contract - which is most of the meme perps, and those are where
+    the funding dispersion is largest, so the loss would not be random.
+    """
+    name = symbol.upper()
+    for quote in QUOTES:
+        if name.endswith(quote) and len(name) > len(quote):
+            name = name[:-len(quote)]
+            break
+    for multiplier in MULTIPLIERS:
+        prefix = multiplier.upper()
+        if name.startswith(prefix) and len(name) > len(prefix):
+            name = name[len(prefix):]
+            break
+    return name
+
+
 def align(panel_a: Panel, panel_b: Panel, *, name_a: str, name_b: str) -> Aligned:
     """Intersect two panels on date and symbol.
 
@@ -97,11 +127,27 @@ def align(panel_a: Panel, panel_b: Panel, *, name_a: str, name_b: str) -> Aligne
     schema instead of being compared loosely.
     """
     dates = sorted(set(panel_a.dates) & set(panel_b.dates))
-    symbols = sorted(set(panel_a.symbols) & set(panel_b.symbols))
     index_a = {d: i for i, d in enumerate(panel_a.dates)}
     index_b = {d: i for i, d in enumerate(panel_b.dates)}
-    col_a = {s: i for i, s in enumerate(panel_a.symbols)}
-    col_b = {s: i for i, s in enumerate(panel_b.symbols)}
+
+    # Match on the canonical base asset, not the raw ticker. A base that maps
+    # from two tickers on one venue is dropped rather than guessed at: it means
+    # that venue lists the coin twice (a USDT and a USDC contract, say) and
+    # picking one silently would be a choice nobody made.
+    def columns(panel: Panel) -> Dict[str, int]:
+        seen: Dict[str, int] = {}
+        clashes = set()
+        for index, symbol in enumerate(panel.symbols):
+            base = canonical(symbol)
+            if base in seen:
+                clashes.add(base)
+            seen[base] = index
+        for base in clashes:
+            seen.pop(base, None)
+        return seen
+
+    col_a, col_b = columns(panel_a), columns(panel_b)
+    symbols = sorted(set(col_a) & set(col_b))
 
     shape = (len(dates), len(symbols))
     funding_a, funding_b = np.full(shape, np.nan), np.full(shape, np.nan)
