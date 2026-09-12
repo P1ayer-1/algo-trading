@@ -883,6 +883,64 @@ def universe_split(panel: Panel, features: Dict[str, np.ndarray], name: str, *,
     print("  both halves positive in {} of {} splits".format(both_positive, seeds))
 
 
+def capacity(panel: Panel, result: "Result", *, participation: float,
+             hold_days: int) -> None:
+    """How large the book can be before it is trading against itself.
+
+    Every number in this file is a RATE - bps per unit of gross notional - and
+    a rate says nothing about how many units there are. A strategy that earns
+    20% a year on $5,000 and cannot hold $500,000 is a hobby, and the panel
+    already carries what is needed to tell the difference.
+
+    The binding constraint is the smallest position, not the average one. A
+    book is sized by its gross, each name takes a fixed share of that gross, and
+    the name with the least volume relative to its weight is the one that caps
+    the whole book: at gross G a name with weight w must trade `G * w` against
+    its own daily volume. So the book's ceiling in a period is
+    `min_i(participation * volume_i / w_i)`.
+
+    `participation` is an assumption, not a measurement, and the honest way to
+    use it is as a dial. A weekly rebalance can be worked over hours rather than
+    sent at once, which is the one genuine advantage a multi-day strategy has
+    over the HFT branches this repo abandoned - patience is free here. 2% of a
+    day's volume is conservative for that; 10% is not.
+    """
+    ceilings = []
+    for period in result.periods:
+        held = np.flatnonzero(period.weights != 0)
+        volume = panel.volume[period.entry]
+        limits = []
+        for index in held:
+            weight = abs(period.weights[index]) / 2.0     # share of GROSS
+            if weight > 0 and np.isfinite(volume[index]) and volume[index] > 0:
+                limits.append(participation * volume[index] / weight)
+        if limits:
+            ceilings.append(min(limits))
+    if not ceilings:
+        print("\nCapacity: no periods with usable volume.")
+        return
+
+    ceilings = np.array(ceilings)
+    print()
+    print("Capacity at {:.0%} of a day's volume per name, {} names a side"
+          .format(participation,
+                  int(np.median([p.n_long for p in result.periods]))))
+    for label, value in (("worst period", ceilings.min()),
+                         ("10th percentile", np.percentile(ceilings, 10)),
+                         ("median", np.median(ceilings)),
+                         ("most recent", ceilings[-1])):
+        print("  {:<18} ${:>14,.0f} gross".format(label, value))
+    net_per_period = float(result.net.mean())
+    dollars = np.percentile(ceilings, 10) * net_per_period / 10_000.0
+    print("  At the 10th-percentile size, {:+.1f} bps a period is "
+          "${:+,.0f} per {} days, ${:+,.0f} a year.".format(
+              net_per_period, dollars, hold_days,
+              dollars * 365.0 / hold_days))
+    print("  The binding name is the smallest position, so raising --top-frac "
+          "spreads\n  the same gross over more names and RAISES capacity, "
+          "while raising the\n  liquidity floor removes the names that cap it.")
+
+
 def print_detail(result: "Result", *, periods_per_year: float) -> None:
     """One factor, year by year, with the price and funding legs separated."""
     print()
@@ -969,6 +1027,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="shuffles per factor; the report gives their "
                              "mean and the percentile the real book beat")
     parser.add_argument("--detail", help="comma-separated factors to break down by year")
+    parser.add_argument("--capacity", type=float, default=None,
+                        metavar="PARTICIPATION",
+                        help="report the book's size ceiling at this share of a "
+                             "name's daily volume, e.g. 0.02")
     parser.add_argument("--spreads", type=Path, default=None,
                         help="CSV of measured per-symbol spreads; charges each "
                              "instrument its own fee + half spread instead of --cost-bps")
@@ -1066,6 +1128,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print_report(rows, hold_days=args.hold_days, cost_bps=cost_bps,
                  top_frac=args.top_frac, universe=universe)
     print_years(rows, results)
+    if args.capacity:
+        for name in (args.detail.split(",") if args.detail else names[:1]):
+            if name.strip() in results:
+                capacity(panel, results[name.strip()],
+                         participation=args.capacity, hold_days=args.hold_days)
     if args.detail:
         for name in args.detail.split(","):
             if name.strip() in results:

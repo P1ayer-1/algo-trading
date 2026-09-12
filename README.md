@@ -1842,6 +1842,11 @@ ecord.py` runs N instruments headless in one process.
    | BloFin | 174 | +44.2 | −13.3 | 21.4 | **99.0%** |
    | Hyperliquid | 138 | +31.2 | −15.8 | 25.0 | **95.0%** |
 
+   **Step 9u supersedes the Hyperliquid row.** A pre-listing-candle bug moved it
+   to +20.7 on 137 periods, and — the substantive point — the result does not
+   survive varying the liquidity floor, which the other two do. Hyperliquid is
+   not a replication of the total; only of the funding leg.
+
    The control means land near minus the cost, which is the check that the cost
    model and the turnover agree: a shuffled book pays the same turnover and
    earns nothing. The three venues are not independent — they quote funding on
@@ -1994,6 +1999,78 @@ ecord.py` runs N instruments headless in one process.
    levered — where the venue and liquidation risks live. Nothing here is built:
    there is no planner for the pair, and there should not be one until the
    decay question has another six months of data on it.
+
+9u. **Sweep the liquidity floor, and the result splits in two** —
+   `backend\analysis\factor_panel.py --min-volume`, `--capacity`.
+
+   Step 9s called Hyperliquid a replication on the strength of one cut of the
+   universe. Varying the liquidity floor — the same sweep Binance and BloFin
+   pass comfortably — says it is not, and separates the claim into a robust
+   half and a fragile one. **This supersedes 9s's reading of that venue.**
+
+   A data bug had to be fixed first. `candleSnapshot` returns candles for days
+   BEFORE a coin listed on Hyperliquid, carrying an OHLC from somewhere with
+   `v` and `n` both zero: ZEC and XMR had 999 such rows each, and 13.3% of the
+   whole panel was one, concentrated in 2023 when the venue was young. Those
+   are not thin days, they are days the venue did not trade the coin, and a
+   return across one is a move that could not have been captured. They now set
+   `minutes = 0` and route through the same guard the Binance panel uses for an
+   exchange outage. It changed the numbers and did not change the conclusion.
+
+   **The funding leg is positive in all fifteen cells. The price leg is not.**
+
+   | volume floor | Binance net / price / fund | BloFin net / price / fund | Hyperliquid net / price / fund |
+   |---|---|---|---|
+   | $1M | +33.9 / +32.9 / **+15.1** | +48.4 / +36.1 / **+19.9** | −5.9 / −17.9 / **+20.9** |
+   | $2M | +34.6 / +33.5 / **+15.1** | +43.7 / +32.2 / **+19.5** | −32.2 / −40.6 / **+17.8** |
+   | $5M | +40.5 / +39.9 / **+14.8** | +44.2 / +34.4 / **+18.2** | +20.7 / +15.3 / **+15.1** |
+   | $10M | +40.4 / +40.2 / **+14.5** | +68.0 / +57.6 / **+18.7** | −18.6 / −21.2 / **+12.9** |
+   | $25M | +35.9 / +35.9 / **+14.4** | +89.1 / +78.6 / **+17.9** | −69.0 / −71.0 / **+12.1** |
+   | beat N of 200 shuffles | **100%** | **99%** | 95% at $5M, 5–62% elsewhere |
+
+   Read the bold column first. **The funding a carry book collects is between
+   +12.1 and +20.9 bps a week in every one of fifteen venue-by-floor
+   combinations**, across three venues, two funding cadences and five liquidity
+   cuts. That is the cash flow, and it is as stable as anything this project has
+   measured.
+
+   The price leg — "the coins whose longs pay most go on to underperform" — is
+   the forecast half, and it splits by venue. On Binance it is +32.9 to +40.2 at
+   every cut; on BloFin +32.2 to +78.6; on Hyperliquid it is **negative at four
+   of five cuts**, and it drags the total with it. Hyperliquid's single positive
+   cut is the $5M one, which is the floor the specification was frozen at, so
+   9s reported the one cut in five that worked and called it a replication.
+   That was the wrong call and this is the correction.
+
+   No explanation for the venue difference is offered, because none has been
+   tested. It would be easy to write a story about a more arbitraged user base
+   and it would be a story.
+
+   **What this leaves standing, precisely.** A cross-sectional carry book
+   replicates on **two** venues out of three, and the cash-flow component of it
+   replicates on all three. The two that work are the two the strategy would be
+   traded on. The one that does not is the one whose funding premium is also
+   decaying year on year (step 9t), and those two failures are consistent with
+   each other rather than independent.
+
+   ### Capacity, because a rate is not a size
+
+   Every number in this branch is bps per unit of gross notional, and a rate
+   says nothing about how many units there are. The binding constraint is the
+   SMALLEST position: a name with weight `w` must trade `G * w` against its own
+   daily volume, so the book's ceiling is `min(participation * volume / w)`.
+
+   | venue | worst period | 10th percentile | median | at the 10th percentile |
+   |---|---|---|---|---|
+   | Binance, $5M floor, 17 a side | $1.5M | $2.3M | $4.3M | +$492k a year |
+   | BloFin, $2M floor, 7 a side | $20k | $235k | $527k | +$54k a year |
+
+   At 2% of a day's volume, which is conservative for a weekly rebalance that
+   can be worked over hours — patience being the one genuine advantage a
+   multi-day strategy has over the HFT branches this repo abandoned. **BloFin
+   holds a few hundred thousand dollars of gross, not millions.** That is the
+   honest size of the opportunity on the venue with the keys, and it is set by
+   the venue's own 29-name cross-section rather than by the edge.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.

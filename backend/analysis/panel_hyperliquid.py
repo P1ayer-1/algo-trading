@@ -272,6 +272,22 @@ def coin_rows(coin: str, candles: Sequence[Tuple[int, float, float, float, float
         bps, periods = funding.get(date, (float("nan"), 0))
         if periods < min_settlements:
             bps, periods = float("nan"), 0
+
+        # `candleSnapshot` returns candles for days BEFORE a coin listed here,
+        # carrying an OHLC from somewhere else with `v` and `n` both zero.
+        # Measured 2026-09-12: ZEC and XMR have 999 such candles each and 13%
+        # of the whole panel is one, concentrated in 2023 when the venue was
+        # young. They are not thin days, they are days this venue did not trade
+        # the coin at all - a return computed across one is a price move that
+        # could not have been captured, and a universe filter reading their
+        # volume as zero behaves erratically rather than excluding them.
+        #
+        # `minutes` is the field the shared loader already uses to mark a day
+        # incomplete, and setting it to zero routes these through the same guard
+        # the Binance panel uses for an exchange outage: excluded from the
+        # universe, and the history run-length counter resets so a coin cannot
+        # appear to have years of history it did not have.
+        traded = quote > 0 or trades > 0
         rows.append({
             "date": date,
             "symbol": coin,
@@ -279,7 +295,7 @@ def coin_rows(coin: str, candles: Sequence[Tuple[int, float, float, float, float
             "quote_volume": quote,
             "trades": trades,
             "taker_buy_frac": float("nan"),
-            "minutes": 1440,
+            "minutes": 1440 if traded else 0,
             "rv_bps": math.log(high / low) * PARKINSON * 10_000.0,
             "funding_bps": bps,
             "funding_periods": periods,
@@ -316,6 +332,7 @@ def report(rows: Sequence[Dict[str, object]]) -> None:
     dates = sorted({str(row["date"]) for row in rows})
     symbols = sorted({str(row["symbol"]) for row in rows})
     with_funding = [row for row in rows if float(row["funding_periods"]) > 0]
+    untraded = [row for row in rows if float(row["minutes"]) == 0]
     breadth: Dict[str, int] = {}
     for row in with_funding:
         breadth[str(row["date"])] = breadth.get(str(row["date"]), 0) + 1
@@ -326,6 +343,9 @@ def report(rows: Sequence[Dict[str, object]]) -> None:
     print("dates               {}  ({} .. {})".format(len(dates), dates[0], dates[-1]))
     print("days with funding   {:,}  ({:.1f}%)".format(
         len(with_funding), 100.0 * len(with_funding) / len(rows)))
+    print("pre-listing days     {:,}  ({:.1f}%)  marked minutes=0 and excluded "
+          "from the universe".format(
+              len(untraded), 100.0 * len(untraded) / len(rows)))
     print("coins per day       min {}  median {}  max {}".format(
         counts[0], counts[len(counts) // 2], counts[-1]))
     if with_funding:
