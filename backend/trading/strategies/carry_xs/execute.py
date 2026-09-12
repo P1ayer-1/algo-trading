@@ -569,6 +569,138 @@ class BookExecutor:
         self._verify_and_repair(unit_usd, rules, result, tag)
         return result
 
+    def flatten(self) -> ExecutionResult:
+        """Close everything. Needs no plan, and that is the entire point.
+
+        `reconcile` needs a plan, and a plan needs the market: a universe read,
+        funding history for eighty instruments, a volatility estimate per name.
+        That is a minute of API calls and a dozen ways to fail, and it is
+        exactly the wrong dependency to have between an operator and the exit.
+        Until this existed the only way out of the book was the exchange's own
+        web UI - which is how the demo book was actually closed on 2026-09-12,
+        eight `reduce_only` orders carrying no clientOrderId because no part of
+        this repo could send them.
+
+        So this reads positions and closes them, and touches nothing else. It
+        needs no prices to DECIDE (the decision is "all of it"), only to order
+        the sends sensibly.
+
+        It is `reconcile` against an empty target, deliberately rather than
+        incidentally: `plan_orders` already makes every close `reduce_only`,
+        already exempts a close from the exchange's minimum size - which is what
+        stops a small leftover leg being stranded forever - and already
+        interleaves. Re-deriving any of that here would be a second
+        implementation of the rules that matter most, in the code path used
+        when something has already gone wrong.
+
+        Interleaving matters as much on the way out as on the way in, and it is
+        the part that is easy to get wrong. A neutral book closed longs-first is
+        naked short by half its gross in the middle. The running total starts
+        from the book's CURRENT net, so the first order comes off whichever
+        side is heavy.
+        """
+        result = ExecutionResult(dry_run=self.dry_run)
+        rules = self.broker.instrument_rules()
+        marks = {}
+        for row in self.broker.positions():
+            mark = _decimal(row.get("markPrice"))
+            if mark > 0:
+                marks[str(row.get("instId") or "")] = mark
+        unit_usd = unit_values(
+            BookPlan(), {name: rule.contract_value for name, rule in rules.items()},
+            marks)
+
+        book = current_book(self.broker)
+        result.gross_before_usd = sum(
+            (abs(size) * unit_usd.get(name, ZERO) for name, size in book.items()),
+            ZERO)
+        if not book:
+            result.already_correct = True
+            result.reconciled = True
+            result.summary = ("No open positions on this account, so there is "
+                              "nothing to close.")
+            self.log(result.summary)
+            return result
+
+        # An unpriced position still gets closed. Pricing decides the ORDER of
+        # the sends and nothing else, so a missing mark is a reason to send it
+        # last, never a reason to leave a position on the account.
+        unpriced = sorted(name for name in book if unit_usd.get(name, ZERO) <= 0)
+        for name in unpriced:
+            result.warnings.append(
+                name + " could not be priced, so it is closed without a place "
+                "in the interleaving rather than left open")
+
+        orders = plan_orders(book, {}, unit_usd, rules)
+        if not orders:
+            result.problems.append(
+                "{} position(s) are open but none could be turned into a "
+                "closing order: {}. Close them by hand.".format(
+                    len(book), ", ".join(sorted(book))))
+            return result
+
+        tag = uuid.uuid4().hex[:8]
+        for index, order in enumerate(orders):
+            order.client_order_id = "xf{}{:02d}".format(tag, index)
+        result.orders = list(orders)
+        result.max_net_usd = max((abs(order.net_after) for order in orders),
+                                 default=ZERO)
+        self.log("Closing {} position(s), ${:,.2f} gross. Worst intermediate "
+                 "net exposure ${:,.2f}.".format(
+                     len(book), result.gross_before_usd, result.max_net_usd))
+
+        if self.dry_run:
+            for order in orders:
+                self.log("  WOULD CLOSE  {}: {} {} contracts (${:,.2f})".format(
+                    order.inst_id, order.side, order.contracts,
+                    order.notional_usd))
+            self.log("Dry run: nothing was sent.")
+            return result
+
+        for order in orders:
+            self.log("  CLOSING     {}: {} {} contracts (${:,.2f})".format(
+                order.inst_id, order.side, order.contracts, order.notional_usd))
+            try:
+                order.response = self.broker.place_perp(
+                    inst_id=order.inst_id, side=order.side,
+                    size=order.contracts,
+                    client_order_id=order.client_order_id, reduce_only=True)
+            except Exception as exc:               # noqa: BLE001
+                order.error = str(exc)
+                result.problems.append(order.inst_id + ": " + str(exc))
+                continue
+            if not _filled(order.response):
+                order.error = "rejected: " + str(order.response)
+                result.problems.append(
+                    order.inst_id + " was rejected by the exchange")
+                continue
+            order.sent = True
+
+        if self.settle_seconds:
+            self.sleep(self.settle_seconds)
+
+        # Verified against the EXCHANGE. "Flat" is the one claim here that must
+        # never be taken from what this process believes it sent, because an
+        # operator who is told the book is closed will stop looking at it.
+        left = current_book(self.broker)
+        result.gross_after_usd = sum(
+            (abs(size) * unit_usd.get(name, ZERO) for name, size in left.items()),
+            ZERO)
+        result.net_after_usd = sum(
+            (size * unit_usd.get(name, ZERO) for name, size in left.items()), ZERO)
+        if left:
+            result.problems.append(
+                "{} position(s) are STILL open after the close: {}. The account "
+                "is not flat.".format(
+                    len(left), ", ".join("{} {}".format(name, size)
+                                         for name, size in sorted(left.items()))))
+        result.reconciled = not result.problems
+        if result.reconciled:
+            result.summary = (
+                "The account is flat. {} position(s) worth ${:,.2f} were "
+                "closed.".format(len(orders), result.gross_before_usd))
+        return result
+
     def repair_only(self) -> ExecutionResult:
         """Bring the book back to neutral and change nothing else.
 

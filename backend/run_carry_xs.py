@@ -117,7 +117,8 @@ def report(result) -> None:
         log("Nothing was sent. Re-run with --confirm to place these orders on "
             "the demo\naccount.")
     elif result.ok:
-        log("Reconciled. The book on the exchange now matches the plan.")
+        log(result.summary
+            or "Reconciled. The book on the exchange now matches the plan.")
     else:
         log("PROBLEMS, all of them:")
         for problem in result.problems:
@@ -138,6 +139,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-spread-bps", type=float, default=30.0,
                         help="skip an opening leg whose spread is wider than "
                              "this when it is about to be sent")
+    parser.add_argument("--flatten", action="store_true",
+                        help="close every position on the account, reduce_only, "
+                             "and stop. Needs no plan and no market data, so it "
+                             "works when the thing that built the book does not.")
     parser.add_argument("--repair-only", action="store_true",
                         help="do not rebalance: just bring the book back to "
                              "neutral with reduce_only trims. This is what the "
@@ -150,6 +155,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "not use this until the book has run end to end "
                              "on demo.")
     args = parser.parse_args(argv)
+
+    if args.flatten and args.repair_only:
+        raise SystemExit(
+            "--flatten closes the book and --repair-only trims it back to "
+            "neutral. Those are different intentions, and one of them is not "
+            "reversible by re-running it. Pick one.")
 
     if args.production and args.confirm:
         raise SystemExit(
@@ -190,6 +201,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     executor_kwargs = dict(dry_run=not args.confirm, on_log=log,
                            max_spread_bps=args.max_spread_bps,
                            net_tolerance_frac=config.delta_tolerance_frac)
+
+    if args.flatten:
+        # Said plainly, because unlike every other verb here this one is not
+        # undone by running it again: re-opening means a new plan, new spreads
+        # and a fresh round trip of taker fees.
+        if args.confirm:
+            log("--confirm given: EVERY position on the " + environment
+                + " account will be closed.")
+            log("This is not a rebalance and re-running does not undo it.")
+        executor = BookExecutor(
+            BlofinPerpBroker(client, TradingAPI(client), account_market),
+            **executor_kwargs)
+        result = executor.flatten()
+        report(result)
+        return 0 if result.ok else 1
 
     if args.repair_only:
         if args.confirm:

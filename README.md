@@ -116,7 +116,7 @@ first. Recording is therefore step one, not step four.
 │   │   ├── replay.py          # rebuild features from raw events
 │   │   ├── compact.py         # CSV -> Parquet, storage report
 │   │   └── stats.py           # IC, AUC, logistic regression, purged split
-│   └── tests/                 # pytest suite (972 tests)
+│   └── tests/                 # pytest suite (981 tests)
 ├── data/                      # recorded data (gitignored)
 │   ├── <INST-ID>/             #   ONE DIRECTORY PER INSTRUMENT (BloFin)
 │   │   ├── features-*.csv     #     labelled features — regenerable
@@ -495,7 +495,7 @@ cd backend
 python -m pytest
 ```
 
-972 tests covering the order book's gap handling, the OFI recursion, the
+981 tests covering the order book's gap handling, the OFI recursion, the
 recorder's lookahead guard, the liquidation math (against hand-computed
 values), the unrealized-drawdown breakers, the reduce-only close path, the
 raw-archive round trip, the passive simulator's aggressor convention and
@@ -2404,6 +2404,54 @@ ecord.py` runs N instruments headless in one process.
    the same sentence tells the operator the opposite of the truth in the first
    case. A repair that finds no positions is not a book in good order, it is an
    account that may have been closed out from under it. Each says which now.
+
+   ### A way out that is not the exchange's website
+
+   ```
+   python backend
+un_carry_xs.py --flatten
+   python backend
+un_carry_xs.py --flatten --confirm
+   ```
+
+   There was no close. `reconcile` moves the book to a plan and `--repair-only`
+   trims it toward neutral; neither can get you out. So the only exit was
+   BloFin's own web UI, and that is not a hypothetical - it is how the demo
+   book was actually closed on 2026-09-12, eight `reduce_only` orders carrying
+   no `clientOrderId` because no part of this repo could send them.
+
+   The dependency is what makes it worth a verb. `reconcile` needs a plan, and
+   a plan needs a universe read, funding history for eighty instruments and a
+   volatility estimate per name: a minute of API calls and a dozen ways to
+   fail, sitting between an operator and the exit. `--flatten` reads positions
+   and closes them. It needs prices only to ORDER the sends, so a position it
+   cannot price is closed last rather than left open.
+
+   It is `reconcile` against an empty target, deliberately and not
+   incidentally: `plan_orders` already makes every close `reduce_only`, already
+   exempts a close from the exchange's minimum size - which is what stops a
+   small leftover leg being stranded forever - and already interleaves.
+   Re-deriving any of that in the code path used when something has already
+   gone wrong would be a second implementation of the rules that matter most.
+
+   Interleaving matters as much on the way out as on the way in, and it is the
+   easy part to get wrong: a neutral book closed longs-first is naked short by
+   half its gross in the middle, at exactly the moment an unintended
+   directional position is least affordable. Measured on the live demo book, 10
+   legs and $9,656.50 gross:
+
+   ```
+   worst intermediate net exposure   $1,130.38   (11.7% of gross, one leg)
+   net after the last order              $0.00
+   ```
+
+   Closing longs first would have passed through $4,113.
+
+   Flat is read back from the exchange and never inferred from what was sent,
+   because an operator told the book is closed stops looking at it. A rejected
+   close is reported as "STILL open" by name, and `--flatten --repair-only`
+   together is refused: those are different intentions and only one of them is
+   undone by re-running it.
 
    Still missing: nothing writes a baseline at execution time, so the monitor
    reconstructs and freezes one on first sight (like step 9i's, and for the

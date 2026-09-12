@@ -782,3 +782,128 @@ def test_a_repair_stops_once_the_book_is_neutral_enough_to_stop_paying_fees():
     # A $1 imbalance on $319 of gross is 0.3%, well inside a 2% tolerance.
     floor = Decimal("0.02") * Decimal("319") / 4
     assert repair_trims(book, unit_usd, rules, Decimal("1"), floor) == []
+
+
+# ---------------------------------------------------------------------------
+# Flatten: the exit, which for a long time did not exist
+# ---------------------------------------------------------------------------
+
+
+def a_book(n=6, size="10"):
+    """n legs, alternating sign, equal notional. Neutral to start."""
+    return {"F{:02d}-USDT".format(i):
+            Decimal(size) * (1 if i % 2 == 0 else -1) for i in range(n)}
+
+
+def test_flatten_closes_every_position_and_the_account_is_flat():
+    broker = FakeBroker(positions=a_book())
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).flatten()
+    assert result.ok, result.problems
+    assert current_book(broker) == {}
+    assert result.gross_after_usd == Decimal("0")
+
+
+def test_flatten_is_reduce_only_throughout():
+    """The exit must never be able to open a position.
+
+    A close sent without `reduce_only` against a size that moved between the
+    read and the send does not close the position, it reverses it - and it does
+    that at the moment an operator has decided to stop watching.
+    """
+    broker = FakeBroker(positions=a_book())
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).flatten()
+    assert result.orders
+    assert all(order.reduce_only for order in result.orders)
+    assert all(sent["reduceOnly"] for sent in broker.sent)
+
+
+def test_flatten_needs_no_plan():
+    """The whole reason this exists.
+
+    `reconcile` needs a plan, and a plan needs a universe read, funding history
+    for eighty instruments and a volatility estimate per name - a minute of API
+    calls and a dozen ways to fail, sitting between an operator and the exit.
+    Until this existed the only way out was the exchange's web UI, which is how
+    the demo book was actually closed on 2026-09-12.
+    """
+    import inspect
+
+    parameters = inspect.signature(BookExecutor.flatten).parameters
+    assert list(parameters) == ["self"]
+
+
+def test_flatten_interleaves_so_the_closing_book_never_goes_directional():
+    """A neutral book closed longs-first is naked short by half its gross.
+
+    Getting out is exactly when an unintended directional position is least
+    affordable, so the ordering matters as much on the way out as on the way
+    in.
+    """
+    broker = FakeBroker(positions=a_book(n=6))
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).flatten()
+
+    gross = result.gross_before_usd
+    one_leg = gross / 6
+    assert result.max_net_usd <= one_leg * Decimal("1.2")
+    # What the naive ordering would have cost: three legs of exposure.
+    assert result.max_net_usd < gross / 3
+
+
+def test_flatten_does_not_claim_flat_when_a_close_was_rejected():
+    """An operator told the book is closed stops looking at it.
+
+    So "flat" is the one claim here that is never taken from what this process
+    believes it sent - it is read back from the exchange.
+    """
+    book = a_book()
+    stuck = sorted(book)[0]
+    broker = FakeBroker(positions=book, reject={stuck})
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).flatten()
+
+    assert not result.ok
+    assert any("STILL open" in problem for problem in result.problems)
+    assert any(stuck in problem for problem in result.problems)
+    assert current_book(broker) == {stuck: book[stuck]}
+
+
+def test_flatten_sends_nothing_on_a_dry_run():
+    broker = FakeBroker(positions=a_book())
+    result = BookExecutor(broker, dry_run=True, settle_seconds=0).flatten()
+    assert broker.sent == []
+    assert result.orders, "a rehearsal that prices no closes is not a rehearsal"
+    assert current_book(broker) == a_book()
+
+
+def test_flatten_closes_a_position_it_cannot_price():
+    """Pricing decides the ORDER of the sends and nothing else.
+
+    A missing mark is a reason to send a position last, never a reason to leave
+    it open - and a leftover from an earlier strategy is exactly the position
+    whose contract value nothing here knows.
+    """
+    broker = FakeBroker(positions={"A-USDT": Decimal("5")},
+                        marks={"A-USDT": Decimal("0")})
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).flatten()
+    assert current_book(broker) == {}
+    assert any("could not be priced" in warning for warning in result.warnings)
+
+
+def test_flatten_closes_a_leg_smaller_than_the_exchange_minimum():
+    """Small leftovers are exactly what a partially failed rebalance leaves.
+
+    Applying the OPENING minimum to a close would strand them forever, which is
+    the state the account was actually found in.
+    """
+    broker = FakeBroker(positions={"A-USDT": Decimal("0.03")},
+                        lot="0.01", min_size="5")
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).flatten()
+    assert result.ok, result.problems
+    assert current_book(broker) == {}
+
+
+def test_flatten_on_an_empty_account_says_so_rather_than_claiming_success():
+    broker = FakeBroker()
+    result = BookExecutor(broker, dry_run=False, settle_seconds=0).flatten()
+    assert result.already_correct
+    assert "no open positions" in result.summary.lower()
+    assert broker.sent == []
