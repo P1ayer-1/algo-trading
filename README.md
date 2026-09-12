@@ -1981,6 +1981,12 @@ ecord.py` runs N instruments headless in one process.
    rate is 88%, and selection carries nearly half the return (+37.5 against a
    random-pair control of +19.8) where on the Binance pair it carried a third.
 
+   **Step 9x supersedes the ranking in this table.** Eight more venues were
+   measured, BloFin turns out to be the dearest of eleven rather than of three,
+   and at a common specification Hyperliquid returns +56.3 against Binance's
+   +57.7 — so the Binance pair's apparent advantage here was an artifact of
+   comparing only three venues at two different cuts.
+
    **And the ladder is not static, which cuts both ways.** By year, against
    Binance:
 
@@ -2177,6 +2183,72 @@ ecord.py` runs N instruments headless in one process.
    the argument against the idea rather than a detail of it: subtracting
    another venue's funding removes most of the level a carry book is paid FOR.
    The residual is a crowding forecast wearing a carry factor's name.
+
+9x. **Eleven venues, and Binance turns out not to be needed** —
+   `backend\analysis\panel_venue.py`.
+
+   ```
+   python backend\analysis\panel_venue.py --list
+   python backend\analysis\panel_venue.py --venue bybit --top 70
+   ```
+
+   Step 9r's pair had one partner venue and it was Binance, which is not
+   available in much of the world. A result that depends on one exchange is a
+   bad shape for a result to have, so this makes substituting one cheap: an
+   adapter is four functions — the universe with its volume, daily candles,
+   funding history, and how the venue spells a coin — and everything else,
+   including both alignment rules, is shared.
+
+   **Every venue tried answers publicly with no API key.** Mean funding in bps
+   per day, ~50 settlements on ten majors, measured 2026-09-12:
+
+   | venue | bps/day | | venue | bps/day |
+   |---|---|---|---|---|
+   | **BloFin** | **+3.78** | | OKX | +1.47 |
+   | Aster | +2.18 | | dYdX | +1.38 |
+   | Bitget | +2.09 | | MEXC | +1.33 |
+   | Hyperliquid | +1.60 | | Bybit | +1.07 |
+   | KuCoin | +1.56 | | Gate | +1.02 |
+   | | | | **Kraken** | **−0.51** |
+
+   **BloFin is the dearest of eleven**, which is the finding that matters more
+   than any single pair: it is the short leg whichever venue ends up opposite,
+   and step 9r's result was never about Binance. Kraken is cheapest by a
+   distance and is actually NEGATIVE on DOGE, XRP, SUI, LINK and AVAX — its
+   longs are paid to hold those.
+
+   Then the historical pair, every partner at one identical specification —
+   30-day non-overlapping holds, 6 pairs at a time, 10 bps a leg, $2M/day floor:
+
+   | partner | coins | diff bps/day | **periods** | net/30d | 95% block | Sharpe | hit | worst | control |
+   |---|---|---|---|---|---|---|---|---|---|
+   | Binance | 43 | +3.79 | **44** | +57.7 | [+29.6, +91.6] | 3.40 | 77% | −58 | +30.2 |
+   | Bybit | 40 | +2.94 | **44** | +34.0 | [+16.1, +52.6] | 3.17 | 73% | −39 | +19.9 |
+   | **Hyperliquid** | 33 | +2.60 | **35** | **+56.3** | [+39.9, +72.1] | 5.48 | 91% | −22 | +29.1 |
+   | MEXC | 32 | +4.69 | 17 | +82.0 | [+53.0, +115.7] | 6.94 | 94% | −17 | +55.3 |
+   | Kraken | 24 | +4.24 | 11 | +54.9 | [+46.3, +61.0] | 8.15 | 100% | +16 | +35.9 |
+
+   **Read the `periods` column before the Sharpe.** MEXC publishes about 18
+   months of funding and Kraken about 12, so their intervals and their Sharpes
+   of 6.94 and 8.15 rest on 17 and 11 independent observations. Kraken not
+   having lost in eleven tries is not the same evidence as Hyperliquid winning
+   32 of 35.
+
+   **The answer to "is Binance needed": no.** Hyperliquid returns +56.3 against
+   Binance's +57.7 on a comparable number of periods, and needs no account at
+   all — an address is an account. That supersedes the earlier reading of step
+   9t, which ranked BloFin/Binance top when Binance was the only alternative
+   measured.
+
+   Three things the table does not say. Bybit has the cheapest funding on a
+   live snapshot (+1.07) and the WEAKEST historical spread against BloFin
+   (+2.94) — a reminder that today's reading is not the average. Kraken's perps
+   are USD-margined, so a pair against a USDT venue carries the USDT/USD basis
+   on top of the funding difference, and its p99 absolute daily gap is 63.8 bps
+   against Hyperliquid's 23.8. And Gate is excluded as a panel source entirely:
+   it returns ~90 settlements however large a limit it is given, which is 30
+   days, so `--list` says so rather than producing a short panel that looks
+   like the others.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
