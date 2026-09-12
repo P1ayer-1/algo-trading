@@ -19,8 +19,15 @@ buys with that is a price exposure the other does not have: the legs are
 different coins, so nothing cancels, and the book's weekly standard deviation
 is about 240 bps. The worst week measured was −1,991 bps, in February 2024,
 when the book was short SHIB, PEPE and BONK because they had the highest
-funding and all three roughly doubled. That is the trade rather than a flaw in
-it, and the sizing here exists to make its scale explicit before it is on.
+funding and the three returned +256%, +288% and +180% in seven days. That is
+the trade rather than a flaw in it, and the sizing here exists to make its
+scale explicit before it is on.
+
+Step 9v is why `max_weight_frac` is the risk control here and no covariance
+model is: in the 90 days before that week those three names had residual
+correlations of +0.12, −0.13 and +0.21 and fell into three different clusters.
+The correlation that did the damage did not exist in the data beforehand, so a
+cap that does not try to estimate it is worth more than one that does.
 
 What this module will not do
 ----------------------------

@@ -1661,7 +1661,7 @@ ecord.py` runs N instruments headless in one process.
      reading and the one that implies low turnover.
 
    **What it costs when it is wrong.** The worst week was 2024-02-26 at
-   **−1,991 bps** on gross notional: SHIB +127%, PEPE +136% and BONK +103% in
+   **−1,991 bps** on gross notional: SHIB +256%, PEPE +288% and BONK +180% in
    seven days, and the book was short all three because they had the highest
    funding. That is not a bug in the backtest, it is the trade — a carry book
    is short whatever is crowded, and occasionally the crowd is right and
@@ -2071,6 +2071,60 @@ ecord.py` runs N instruments headless in one process.
    holds a few hundred thousand dollars of gross, not millions.** That is the
    honest size of the opportunity on the venue with the keys, and it is set by
    the venue's own 29-name cross-section rather than by the edge.
+
+9v. **Try to hedge the tail, and find out it was not visible** —
+   `backend\analysis\factor_panel.py --cluster-lookback`.
+
+   The carry book's worst week was not three bad positions, it was one position
+   held three times: short SHIB, PEPE and BONK in February 2024, when all three
+   went up together. Inverse-volatility sizing made it worse rather than
+   better, because it sizes on trailing volatility and those three were quiet
+   right up until they were not. The obvious fix is to group names that move
+   together and give each group one group's worth of money.
+
+   **The first attempt made things worse, and the reason is worth keeping.**
+   Single linkage on raw returns at a 0.75 threshold put **61 of 64 names in
+   ONE cluster** (measured 2024-12-25) and left three singletons, because every
+   crypto correlates through its beta to the market and single linkage chains
+   A-B-C through that beta. Dividing by cluster size then handed almost the
+   whole book to whichever three names happened not to chain, and it cost 0.74
+   of a Sharpe point on Binance: 1.60 down to 0.86, with the worst drawdown
+   rising from 2,740 bps to 4,445.
+
+   Demeaning the cross-section first fixes the clustering — what is left is
+   names moving together BEYOND their beta, and the groups become
+   recognisable: `SHIB+DOGE`, `BNB+BTC+ETH+XRP`, `ARB+OP`, `AVAX+LINK`.
+
+   **And with the clustering working, it does almost nothing.**
+
+   | | Binance net / Sharpe / worst drawdown | BloFin net / Sharpe / worst drawdown |
+   |---|---|---|
+   | no clustering | +40.5 / 1.60 / 2,740 | +43.7 / 1.23 / 2,271 |
+   | residual clusters, 90d | +40.5 / **1.66** / 2,711 | +44.9 / 1.28 / 2,271 |
+   | residual clusters, 180d | +40.5 / 1.66 / 2,711 | +44.6 / 1.27 / 2,271 |
+   | raw-return clusters, 180d | +34.1 / **0.84** / 4,445 | +53.6 / 1.20 / 1,759 |
+
+   **Why it does nothing is the actual finding.** In the 90 and 180 days before
+   2024-02-26, the residual correlations among the three memecoins were
+   **+0.12, −0.13 and +0.21** — no relationship at all beyond their beta — and
+   the clustering put them in three different groups. In the week that
+   followed they returned **+256%, +288% and +180%**.
+
+   The correlation that destroyed the book did not exist in the data
+   beforehand. It arrived with the event. No risk control estimated from
+   trailing correlation could have seen it, which is exactly why a correct
+   clustering changes the drawdown by 1%.
+
+   What follows for how this should be risk-managed: the only control that
+   works against a correlation which does not yet exist is one that does not
+   try to estimate it. A hard cap on any single position — `max_weight_frac`,
+   25% of a side in the planner — is that control, and it is worth more here
+   than any covariance model. This is also the honest reason the strategy's
+   headline Sharpe of 1.6 should not be levered into a Sharpe-1.6-shaped
+   position size.
+
+   (The earlier write-up of that week quoted +127%, +136% and +103%. Those were
+   log returns read as percentages; the simple returns are the ones above.)
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.

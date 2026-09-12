@@ -365,3 +365,57 @@ def test_block_bootstrap_interval_covers_the_mean_and_widens_with_noise():
     noisy_lo, noisy_hi = block_bootstrap(noisy)
     assert quiet_lo < 5.0 < quiet_hi
     assert (noisy_hi - noisy_lo) > (quiet_hi - quiet_lo) * 10
+
+
+# ---------------------------------------------------------------------------
+# Clustering
+# ---------------------------------------------------------------------------
+
+
+def test_clustering_demeans_before_correlating():
+    """Without demeaning, single linkage chains every crypto into one cluster.
+
+    Measured on the real panel at 2024-12-25: a 0.75 threshold on raw returns
+    put 61 of 64 names in ONE cluster and left three singletons, because
+    everything correlates through its beta to the market and single linkage
+    chains A-B-C through it. Weighting on that hands almost the whole book to
+    whichever three names happened not to chain.
+
+    Here every name is beta 1 to a common factor plus its own noise, so on raw
+    returns they all chain and on residuals none of them should.
+    """
+    from analysis.factor_panel import correlation_clusters
+
+    rng = np.random.default_rng(0)
+    days, names = 400, 8
+    market = rng.normal(0, 0.03, (days, 1))
+    returns = market + rng.normal(0, 0.005, (days, names))
+    assert len(set(correlation_clusters(returns, threshold=0.75))) == names
+
+
+def test_names_that_move_together_beyond_their_beta_share_a_cluster():
+    from analysis.factor_panel import correlation_clusters
+
+    rng = np.random.default_rng(1)
+    days, names = 400, 8
+    market = rng.normal(0, 0.03, (days, 1))
+    returns = market + rng.normal(0, 0.01, (days, names))
+    shared = rng.normal(0, 0.05, (days, 1))          # a second, narrower factor
+    returns[:, :3] += shared
+    labels = correlation_clusters(returns, threshold=0.75)
+    assert labels[0] == labels[1] == labels[2]
+    assert len({labels[i] for i in range(3, names)} & {labels[0]}) == 0
+
+
+def test_cluster_weighting_gives_a_cluster_one_clusters_worth_of_money():
+    """Three names that move as one should carry the risk of one position."""
+    from analysis.factor_panel import _weights
+
+    scores = np.arange(8, dtype=float)
+    clusters = np.array([0, 0, 0, 1, 2, 3, 4, 5])
+    weights, _, _ = _weights(scores, np.ones(8, dtype=bool), 0.5, None, clusters)
+    shorts = weights[:4]
+    # Names 0,1,2 share a cluster and name 3 is alone, so the cluster and the
+    # singleton each get half of the short side.
+    assert abs(shorts[:3].sum()) == pytest.approx(abs(shorts[3]))
+    assert np.abs(weights).sum() == pytest.approx(2.0)

@@ -531,8 +531,80 @@ class Result:
                 for year, values in sorted(buckets.items())}
 
 
+def correlation_clusters(returns: np.ndarray, *, threshold: float = 0.75,
+                         ) -> np.ndarray:
+    """Group columns whose trailing returns move together. Point in time.
+
+    The worst week this strategy had was not three bad positions, it was ONE
+    bad position held three times: short SHIB, PEPE and BONK in February 2024,
+    when all three roughly doubled together. Inverse-volatility sizing made it
+    worse rather than better, because it sizes on trailing volatility and those
+    three were quiet right up until they were not.
+
+    Clustering is the control that does not depend on having estimated the risk
+    correctly. This is deliberately the crudest version that works - a
+    single-linkage pass at a correlation threshold, no hierarchy, no fitted
+    number of clusters - because anything with parameters to tune would need
+    its own out-of-sample evidence before it could be used to produce any.
+
+    **Returns are demeaned across the cross-section first, and without that
+    step this function does nothing useful.** Measured on 2024-12-25: on raw
+    returns a 0.75 threshold put 61 of 64 names in ONE cluster and left three
+    singletons, because every crypto correlates through its beta to the market
+    and single linkage chains A-B-C through it. Weighting on that hands almost
+    the whole book to whichever three names happened not to chain, and it cost
+    0.7 of a Sharpe point when it was tried. Demeaning removes the common
+    factor, so what is left is names that move together BEYOND their beta -
+    which is what the memecoins in February 2024 actually were.
+
+    `returns` is `(days, symbols)` of trailing daily returns. Columns with too
+    little data are left in clusters of their own, which is the conservative
+    reading: unknown correlation is treated as zero rather than as one.
+    """
+    with np.errstate(invalid="ignore"):
+        market = np.nanmean(returns, axis=1, keepdims=True)
+    returns = returns - market
+    n_symbols = returns.shape[1]
+    labels = np.arange(n_symbols)
+    usable = np.isfinite(returns).sum(axis=0) >= 20
+    index = np.flatnonzero(usable)
+    if len(index) < 2:
+        return labels
+
+    block = returns[:, index]
+    valid = np.all(np.isfinite(block), axis=1)
+    if valid.sum() < 20:
+        return labels
+    with np.errstate(invalid="ignore"):
+        matrix = np.corrcoef(block[valid].T)
+    matrix = np.nan_to_num(matrix, nan=0.0)
+
+    # Single linkage by union-find: i and j share a cluster if they correlate
+    # above the threshold, transitively.
+    parent = list(range(len(index)))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for i in range(len(index)):
+        for j in range(i + 1, len(index)):
+            if matrix[i, j] >= threshold:
+                root_i, root_j = find(i), find(j)
+                if root_i != root_j:
+                    parent[root_j] = root_i
+
+    for position, symbol in enumerate(index):
+        labels[symbol] = n_symbols + find(position)
+    return labels
+
+
 def _weights(scores: np.ndarray, eligible: np.ndarray, top_frac: float,
-             risk: Optional[np.ndarray] = None) -> Tuple[np.ndarray, int, int]:
+             risk: Optional[np.ndarray] = None,
+             clusters: Optional[np.ndarray] = None,
+             ) -> Tuple[np.ndarray, int, int]:
     """Dollar-neutral weights: long the top, short the bottom, `sum|w| == 2`.
 
     With `risk` given, each position is sized by `1/risk` and each side is then
@@ -562,6 +634,15 @@ def _weights(scores: np.ndarray, eligible: np.ndarray, top_frac: float,
 
     for side, sign in ((longs, 1.0), (shorts, -1.0)):
         raw = (1.0 / risk[side]) if risk is not None else np.ones(len(side))
+        if clusters is not None:
+            # Divide each name's weight by how many of its cluster-mates are on
+            # the same side, so a cluster gets one cluster's worth of money
+            # however many of its members the ranking happened to pick. Three
+            # memecoins that move as one then carry the risk of one position
+            # rather than three.
+            counts = np.array([float(np.sum(clusters[side] == clusters[member]))
+                               for member in side])
+            raw = raw / np.maximum(counts, 1.0)
         weights[side] = sign * raw / raw.sum()
     return weights, len(longs), len(shorts)
 
@@ -613,7 +694,9 @@ def run_factor(panel: Panel, scores: np.ndarray, eligible: np.ndarray, *,
                hold_days: int, top_frac: float, cost_bps: float,
                start: int, shuffle_seed: Optional[int] = None,
                risk: Optional[np.ndarray] = None,
-               cost_per_symbol: Optional[np.ndarray] = None) -> Result:
+               cost_per_symbol: Optional[np.ndarray] = None,
+               cluster_lookback: int = 0,
+               cluster_threshold: float = 0.75) -> Result:
     """Hold a dollar-neutral book on non-overlapping `hold_days` periods.
 
     `shuffle_seed` permutes each date's scores across the eligible symbols,
@@ -635,9 +718,19 @@ def run_factor(panel: Panel, scores: np.ndarray, eligible: np.ndarray, *,
             rng.shuffle(values)
             row[index] = values
 
+        clusters = None
+        if cluster_lookback:
+            # Correlations are measured on the days BEFORE entry only, so the
+            # clustering cannot see the week it is sizing for.
+            window = panel.close[max(0, entry - cluster_lookback):entry + 1]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = window[1:] / window[:-1]
+                daily = np.log(np.where(ratio > 0, ratio, np.nan))
+            clusters = correlation_clusters(daily, threshold=cluster_threshold)
+
         weights, n_long, n_short = _weights(
             row, eligible[entry], top_frac,
-            risk[entry] if risk is not None else None)
+            risk[entry] if risk is not None else None, clusters)
         if n_long == 0:
             previous = np.zeros(panel.shape[1])
             continue
@@ -1027,6 +1120,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="shuffles per factor; the report gives their "
                              "mean and the percentile the real book beat")
     parser.add_argument("--detail", help="comma-separated factors to break down by year")
+    parser.add_argument("--cluster-lookback", type=int, default=0,
+                        metavar="DAYS",
+                        help="group names by trailing return correlation over "
+                             "this many days and give each group one group's "
+                             "worth of money; 0 disables")
+    parser.add_argument("--cluster-threshold", type=float, default=0.75)
     parser.add_argument("--capacity", type=float, default=None,
                         metavar="PARTICIPATION",
                         help="report the book's size ceiling at this share of a "
@@ -1099,14 +1198,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         real = run_factor(panel, features[name], eligible, hold_days=args.hold_days,
                           top_frac=args.top_frac, cost_bps=cost_bps,
                           start=args.start, risk=risk,
-                          cost_per_symbol=cost_per_symbol)
+                          cost_per_symbol=cost_per_symbol,
+                       cluster_lookback=args.cluster_lookback,
+                       cluster_threshold=args.cluster_threshold)
         real.name = name
         results[name] = real
         controls = [
             run_factor(panel, features[name], eligible, hold_days=args.hold_days,
                        top_frac=args.top_frac, cost_bps=cost_bps, start=args.start,
                        shuffle_seed=seed, risk=risk,
-                       cost_per_symbol=cost_per_symbol)
+                       cost_per_symbol=cost_per_symbol,
+                       cluster_lookback=args.cluster_lookback,
+                       cluster_threshold=args.cluster_threshold)
             for seed in range(args.control_seeds)
         ]
         summaries = [c.summary(periods_per_year) for c in controls]
