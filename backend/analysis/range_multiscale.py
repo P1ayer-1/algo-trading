@@ -66,6 +66,7 @@ from analysis.range_harness import (  # noqa: E402
     print_report,
     split_timestamp,
 )
+from analysis.attention_model import ScaleAttention  # noqa: E402
 from analysis.range_information import (  # noqa: E402
     breakeven_centre_skill,
     load_cached,
@@ -254,6 +255,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--baseline-hours", type=float, default=24.0,
                         help="The single scale the multi-scale set is compared with.")
     parser.add_argument("--l2", type=float, default=1.0)
+    parser.add_argument("--model", default="ridge", choices=("ridge", "attention"),
+                        help="attention puts one token per scale and lets them "
+                             "read each other before predicting.")
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--d-model", type=int, default=16)
     parser.add_argument("--train-fraction", type=float, default=0.7)
     parser.add_argument("--control-seeds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=7)
@@ -296,8 +302,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not datasets:
         raise SystemExit("No symbol produced rows.")
 
+    def make_model():
+        if args.model == "attention":
+            return ScaleAttention(n_scales=len(scales), d_model=args.d_model,
+                                  d_hidden=args.d_model, epochs=args.epochs,
+                                  seed=args.seed)
+        return Ridge(l2=args.l2)
+
     def score(sets: Sequence[Dataset], target: str):
-        return evaluate(sets, lambda: Ridge(l2=args.l2), target,
+        # The single-scale view has one token, so attention has nothing to
+        # attend across and ridge is the honest comparison there.
+        factory = (make_model if len(sets[0].feature_names) > len(FEATURES)
+                   else (lambda: Ridge(l2=args.l2)))
+        return evaluate(sets, factory, target,
                         train_fraction=args.train_fraction,
                         control_seeds=args.control_seeds, seed=args.seed)
 
