@@ -110,6 +110,14 @@ first. Recording is therefore step one, not step four.
 │   │   ├── factor_panel.py    # cross-sectional factors scored as money, not IC
 │   │   ├── funding_dispersion.py # the same coin's funding on two venues
 │   │   ├── panel_venue.py     # any venue behind one adapter: bybit, mexc, kraken...
+│   │   ├── panel_intraday.py  # 1m archive -> 15m bars per symbol (npz), once
+│   │   ├── intraday.py        # a (period, symbol) grid at any bar, funding aligned
+│   │   ├── intraday_factors.py # factor_panel's harness at 8h/1h bars
+│   │   ├── settlement_event.py # price around a funding settlement, by rate
+│   │   ├── settlement_short.py # the negative-funding settlement trade, priced
+│   │   ├── extreme_move.py    # do extreme short-window moves revert? (per coin)
+│   │   ├── cascade_rebound.py # the basket version: buy the market after a cascade
+│   │   ├── seasonality.py     # hour-of-day and weekday, by year
 │   │   ├── validate_liquidation.py  # our liq math vs the exchange's own
 │   │   ├── blofin_spread_survey.py  # the same, live, on BloFin itself
 │   │   ├── layout.py          # where recorded data lives; one owner
@@ -2596,6 +2604,355 @@ un_carry_xs.py --flatten --confirm
    past the 2% tolerance before the rebalance, and how likely the account
    margin ratio reaches the 300 warning level. Both are worth having and
    neither is where the money is.
+
+9aa. **The same book, held for three days instead of seven** —
+   `backend\analysis\factor_panel.py --hold-days 3 --lag 1`, and
+   `backend\analysis\intraday_factors.py` for the same harness at 8-hour bars.
+
+   ```
+   python backend\analysis\factor_panel.py --vol-scale --hold-days 3 --top-frac 0.3 --cost-bps 10 --lag 1
+   python backend\analysis\panel_intraday.py
+   python backend\analysis\intraday_factors.py --bar 480 --hold 3 --vol-scale
+   ```
+
+   The brief on 2026-09-12 was to beat step 9q's weekly book, preferably on a
+   shorter horizon. Step 9q's specification grid swept holds of 3, 7, 14 and
+   30 days and never looked below three, because every horizon under a day
+   in this repo had died on cost. The cheapest test was therefore the one
+   nobody had run: the frozen `carry_mom` blend (60/40 rank blend of
+   `carry_7` and `mom_14`, top/bottom 30%, inverse-vol) at holds of one to
+   three days, same cost, same controls. **Read this table against the README
+   headline at `--cost-bps 10` - the harness default is `config.TAKER_FEE_BPS`
+   (5.0), which flatters a daily hold by about a quarter of its result.**
+
+   Binance, 108 perpetuals, 10 bps per unit traded, `carry_mom`:
+
+   | hold | net bps/period | 95% block | ~per week | Sharpe | ann% | worst drawdown | shuffles beaten |
+   |---|---|---|---|---|---|---|---|
+   | 1 day | +7.5 | [+4.1, +10.7] | 52 | 1.91 | 27.3 | 1,426 | 100% |
+   | 2 days | +17.5 | [+10.9, +24.2] | 61 | 2.29 | 31.9 | 1,111 | 100% |
+   | **3 days** | **+25.8** | [+15.5, +34.8] | **60** | **2.25** | **31.3** | **759** | 100% |
+   | 7 days (9q) | +44.5 | [+18.0, +68.5] | 44.5 | 1.57 | 23.2 | 1,567 | 100% |
+
+   Same signal, a third of the hold, half the worst drawdown, and about 40%
+   more per week at a Sharpe of 2.2 against 1.6. The by-year row at three
+   days reads +23.2, +11.4, +26.0, +40.2, +29.1 - positive in every year
+   including 2023, which the weekly book only just survived (+15.0).
+
+   **Where the extra return comes from, and why that is the caveat.** It is
+   not the carry. `carry_7` alone at a 3-day hold makes +17.7 (Sharpe 1.74)
+   against +40.5 a week at seven days - the same money per week at a slightly
+   better Sharpe, because the funding leg is a cash flow and does not care how
+   often the book is re-ranked. What changes is the momentum half: `mom_14`
+   alone goes from Sharpe 0.36 at a 7-day hold to 0.82 at three days. A
+   14-day momentum rank is stale by the end of a week, and re-ranking every
+   three days keeps it fresh. So the gain sits in the price leg (26.3 of a
+   31.7 bps gross at three days, against a funding leg of 5.9), which is the
+   half this project has learned to trust less. It is a forecast that
+   replicated, not a cash flow.
+
+   **The honest version, lagged.** A 3-day hold rebalanced from bars that
+   closed one day earlier - `--lag 1`, so nobody has to act at the instant of
+   the close - makes +22.4 (Sharpe 1.97) on Binance. The signal is not about
+   the last few hours. A 3-day hold also has three possible rebalance
+   phases, and the harness only sees one; the other two (`--start 121`,
+   `--start 122`) give +17.6 (1.50) and +23.0 (1.99), with `carry_7` alone
+   at +17.4 / +16.9 / +16.3 across the three.
+
+   **It replicates where it should and is weaker where it should be.** At the
+   venues' own floors (BloFin $2M with measured per-instrument spreads, the
+   others at 5 bps flat, so these are not directly comparable to the Binance
+   table):
+
+   | venue, `carry_mom` | 1 day | 2 days | 3 days | 3 days, lag 1 | 7 days |
+   |---|---|---|---|---|---|
+   | BloFin, spreads | +8.1 (1.51) | +19.3 (1.83) | **+28.0 (1.80)** | +21.5 (1.37) | +55.9 (1.48) |
+   | Hyperliquid, $5M | +6.9 (1.18) | +16.3 (1.41) | **+24.0 (1.31)** | +20.2 (1.13) | +53.5 (1.32) |
+   | Bybit, $2M | +4.3 (0.94) | +9.8 (1.06) | +12.5 (0.90) | - | +41.6 (1.29) |
+
+   (net bps per period, Sharpe in brackets.) BloFin's three-day book is
+   positive in every year (+16.0, +32.6, +35.8, +20.9), and Hyperliquid - the
+   venue whose weekly carry book step 9u showed does NOT survive a change of
+   liquidity floor - is positive in all three of its years at a 3-day hold.
+   Bybit is the weakest everywhere, as it was in step 9x: it has the cheapest
+   funding of the eleven venues and so the least carry to rank on.
+
+   Two more checks in the 9q style: six random halves of the Binance universe
+   at a 2-day hold are positive on both sides in 6 of 6 splits (Sharpe 0.90
+   to 2.42); and all twelve cells of holds 1/2/3 x top 20%/30% x floors
+   $2M/$5M/$20M are positive, +6.4 to +30.3, with the 3-day column the best in
+   every floor.
+
+   **And it does not keep improving as the hold shrinks.** Every 8-hour bar,
+   scored with the identical harness on the same 108 names: `carry_mom`
+   rebalanced at every settlement earns +2.8 bps per 8 hours at 5 bps cost
+   with a turnover of 0.42 per period - which at 10 bps is about +1.8, or
+   roughly the weekly book's return for three times the trading. Held for
+   three bars (a day) it is +9.8 (Sharpe 2.48 at 5 bps), the same as the
+   daily-panel number. The sweet spot is one to three days. What is
+   established is a hold, not a new signal.
+
+   **What this does not settle, in order.** The planner (`carry_xs/plan.py`)
+   ranks on carry alone; the blend needs a momentum term and a 3-day epoch,
+   and neither has been built or run live. Turnover per week rises from 1.8
+   to 2.8 units of gross, so the BloFin capacity in 9u shrinks in proportion
+   and the round trip is paid 2.3x as often - the measured-spread column
+   above already charges that, and it is why BloFin's lagged 3-day Sharpe is
+   1.37 rather than 1.97. And after this sweep the specification has now been
+   looked at on four venues and 96 + 12 grid cells; the 3-day hold was chosen
+   from a table of three, not pre-registered, and the next out-of-sample
+   evidence is the live book.
+
+9ab. **Everything shorter than a day, measured, and all of it dead** —
+   `backend\analysis\panel_intraday.py` folds the 5.7 GB 1-minute archive
+   into 15-minute bars once (175,200 bars a symbol, 8 MB as `.npz`), and
+   `backend\analysis\intraday.py` turns those into a `(period, symbol)` grid
+   at any bar from 15 minutes up with funding placed in the bar whose
+   interval it paid for. Five hypotheses were run on it on 2026-09-12; each
+   has a tool, a placebo and a year table, and each is negative. Written up
+   so they are not run again.
+
+   ```
+   python backend\analysis\intraday_factors.py --bar 480 --hold 1 --vol-scale
+   python backend\analysis\settlement_event.py
+   python backend\analysis\settlement_short.py --signal settle --hold-hours 2
+   python backend\analysis\extreme_move.py --window-min 60 --z 6
+   python backend\analysis\cascade_rebound.py --z 5 --delay-min 15
+   python backend\analysis\seasonality.py
+   ```
+
+   **Intraday cross-sectional reversal and flow, on a hundred names.** Step 8
+   found reversal at 15-240 minutes on ten majors worth 0.9 bps against a
+   2.4 bps round trip, and the hope was that a cross-section ten times wider
+   would make the dispersion pay for it. At 8-hour bars, one-bar holds, cost
+   5 bps, every intraday factor is negative and the break-even cost is under
+   one basis point:
+
+   | factor | net bps / 8h | gross | turnover | break-even cost |
+   |---|---|---|---|---|
+   | `rev_1b` (fade the last 8h) | −6.4 | +0.9 | 2.91 | 0.6 |
+   | `rev_1d` (fade the last day) | −4.8 | −0.5 | 1.72 | −0.6 |
+   | `taker_1b` (last bar's taker-buy share) | −6.5 | +0.1 | 2.62 | 0.1 |
+   | `carry_last` (the single latest settlement) | −1.1 | +2.8 | 1.55 | 3.6 |
+   | `carry_7d` | +2.2 | +2.8 | 0.25 | 22.8 |
+
+   Reversal at these horizons is real and worth less than a basis point,
+   exactly as step 8 measured it, and the single latest settlement is a
+   noisier version of the 7-day mean, not a faster one.
+
+   **Price around a funding settlement.** 376,485 (symbol, settlement) events,
+   the 15-minute path from four hours before to four after, bucketed by the
+   rate paid, in excess of the cross-section. Positive-rate buckets show
+   price continuing UP after the settlement (+14 bps in the next hour for
+   rates of 5-10 bps, +67 above 10), which reads as the paying side
+   re-entering - and shows the identical continuation at placebo instants
+   two and four hours earlier. Those are pumps continuing, not settlements.
+   The one bucket locked to the instant was rates below −5 bps: those coins
+   rise in the two hours before the settlement and fall +33 ± 6.5 bps in the
+   two after, and the placebos point the other way. Priced as a trade -
+   short every eligible coin whose rate is below −5 at the settlement close,
+   cover two hours later, 5 bps a leg - it is +23.7 bps per settlement on
+   7,130 trades, t 3.64. **Then the year table:**
+
+   | | 2021 | 2022 | 2023 | 2024 | 2025 | 2026 |
+   |---|---|---|---|---|---|---|
+   | bps per settlement | +45 | −1.0 | −12.1 | −0.9 | +2.0 | **+59.7** |
+   | settlements | 83 | 444 | 412 | 659 | 1,267 | 1,884 |
+
+   Two symbols (RIVER and LAB, both listed this year) carry 53% of the
+   total. Using the previous settlement's rate instead, a −10 threshold, a
+   one- or four-hour hold, or a 15-minute entry delay all give the same
+   shape: one year, a couple of names. Not a strategy.
+
+   **Extreme moves and liquidation cascades.** A coin that has just fallen
+   more than six of its own hourly standard deviations rebounds +73 bps net
+   in the next hour, positive in all six years - and its excess over the
+   cross-section is −6. The rebound is the market's, because these events
+   are cascades hitting dozens of names in the same minutes. So the trade is
+   the basket after an index-level event, and the honest entry is a bar
+   after the print nobody could buy at. Index down more than 4 sd in an
+   hour, long the equal-weight basket: +14.7 bps (t 1.17) entered at the
+   bar's own close, **+2.4 (t 0.19) entered fifteen minutes later**, −7.3 held
+   two hours, −6.6 in BTC instead. At 5 sd, 200 trades, +14.1 (t 0.74). The
+   rebound is real and it is over within the bar that printed it.
+
+   **Seasonality.** Equal-weight index return by UTC hour and weekday, by
+   year. The most consistent hour (05:00, positive in 6 of 6 years) is worth
+   +2.1 bps; nothing exceeds 3 bps an hour against a 10 bps round trip.
+
+   **The cross-venue funding pair, held for days instead of a month.** Step
+   9r/9t's BloFin-versus-partner pair at 3-day holds collects 8.0 bps of
+   funding against four taker legs of 10, and loses; at 7 days it clears by
+   +7.5 (3.9% a year); it only becomes the Sharpe-4 trade of 9x at 14-30 day
+   holds. It is a long-hold trade by construction and does not shorten.
+
+   What survives of the day, then, is 9aa: the working strategy, held for
+   three days, on a lagged ranking. Everything genuinely intraday on this
+   venue's data is either a spread being paid or one year's memecoins.
+
+9ac. **Trying to improve the 3-day book, and what the planner now does** —
+   `backend\analysis\factor_panel.py` (six new factors and four blends),
+   `backend\analysis\tranche_book.py`, and `--momentum-weight` on
+   `plan_carry_xs.py` / `run_carry_xs.py`.
+
+   ```
+   python backend\analysis\factor_panel.py --vol-scale --hold-days 3 --cost-bps 10 --lag 1
+   python backend\analysis\tranche_book.py --hold-days 3 --factor carry_mom --cost-bps 10 --lag 1
+   python backend\plan_carry_xs.py --notional 10000 --min-volume 2000000 --hold-days 3 --momentum-weight 0.4
+   ```
+
+   **Every existing factor at a 3-day hold**, 10 bps, lagged a day: the carry
+   family clears (`carry_7` +17.4, `carry_14` +17.4, `carry_30` +19.0 at a
+   turnover of only 0.47), the two blends clear (+22.4 / +22.9), momentum and
+   low-vol are positive but weak (Sharpe 0.6-0.9), and everything that
+   forecasts a reversal loses hard: `rev_3` −23.5, `rvshock_7` −21.6,
+   `rangepos_30` −20.6, all beaten by 0% of their shuffles. At a 1-day hold
+   the picture is the same, smaller.
+
+   **Six new factors, signs stated before the run**: the lottery effect
+   (`max_7`, short the biggest single-day jump), skewness, betting against
+   beta, an abnormal-volume shock, and carry and momentum each divided by
+   volatility. In sample, at three days: −1.8, −11.7, +7.9, −19.0, +6.3 and
+   +12.7. None beats the plain versions; the volume shock is the wrong sign
+   with conviction (10% of shuffles), which is a reversal signal again.
+
+   **Four three-way blends, and this is the part worth reading.** Handing a
+   fifth of the rank to low volatility raises Binance from +22.4 to +26.8
+   (Sharpe 2.12); to the max-jump factor, +23.3. Both would have been adopted
+   on the in-sample table. Out of sample at the same specification:
+
+   | 3-day hold, lag 1 | Binance | BloFin, spreads | Hyperliquid | Bybit |
+   |---|---|---|---|---|
+   | `carry_mom` (frozen 60/40) | +22.4 | +21.5 | **+20.2** | +9.4 |
+   | `carry_mom_lowvol` | **+26.8** | +21.3 | +15.3 | +9.1 |
+   | `carry_mom_max` | +23.3 | +23.2 | +7.1 | +7.7 |
+   | `carry_mom_flow` (taker share) | +18.5 | - | - | - |
+
+   The extra components are Binance noise: nothing on BloFin or Bybit, and a
+   third of the return gone on Hyperliquid. The frozen blend stands and the
+   new factors stay in the file as the record of having been tried.
+
+   **Staggered tranches.** A 3-day book has three rebalance phases; a live
+   book can run all three at a third of the notional, rebalancing one a day.
+   The phases' weekly returns correlate +0.70 to +0.74, so the gain is real
+   but modest:
+
+   | Binance, bps per week | mean | Sharpe | weekly sd | worst week | drawdown |
+   |---|---|---|---|---|---|
+   | best single phase | +53.6 | 2.07 | 187 | −562 | 1,119 |
+   | worst single phase | +41.1 | 1.63 | 182 | −416 | 1,045 |
+   | three tranches | +48.7 | **2.08** | **169** | **−357** | **809** |
+
+   The same trades, spread over three days instead of one, and a third less
+   damage in the worst week. That is also how the book should be put on for
+   capacity reasons: a third of the gross crosses the spread each day.
+
+   **No regime to filter on.** Split by the cross-section's trailing 30-day
+   return at entry the book makes +14.0 / +27.3 / +26.0 across terciles; by
+   trailing vol, +20.9 / +23.3 / +23.0. Flat, all positive. The only split
+   that moves it is the market's move DURING the hold - +58.5 when the market
+   falls, −8.8 when it rallies hard - which is not knowable at entry and is
+   the signature of a book that is short the crowded names that squeeze in a
+   rally. A vol or trend filter would be fitting noise.
+
+   **The planner.** `BookConfig.momentum_weight` (default 0, the 9q book)
+   rank-blends the carry score with 14-day momentum, computed from the same
+   daily closes the volatility already uses; a name without 14 days of closes
+   is excluded and named rather than scored flat. The funding-covers-round-trip
+   gate becomes a WARNING for a blended book, because at a 3-day hold funding
+   alone is not expected to cover it - the measured return is in the price
+   leg, and the warning says so in those words. Run dry against BloFin on
+   2026-09-12 at a $2M floor: 16 of 21 instruments eligible, five a side,
+   long BTC/TRX/ETH/INJ/ZEC and short LTC/XMR/SOL/DOGE/SUI, expected funding
+   +8.8 bps against a 12.4 bps round trip, and PLAN OK with the gate as a
+   warning. Sixteen names is the honest width of this book on this venue.
+
+   **A rebalance band, because turnover is a fifth of the gross.**
+   `factor_panel.py --band` keeps a name the book already holds while it
+   still ranks inside the top `top_frac + band` for its side, and opens only
+   names inside `top_frac`. It is a cost mechanism rather than a signal, and
+   it does what a cost mechanism should:
+
+   | 3-day hold, lag 1, `carry_mom` | band 0 | band 0.1 | band 0.2 |
+   |---|---|---|---|
+   | Binance: net / Sharpe / turnover | +22.4 / 1.97 / 1.21 | **+23.7 / 2.10 / 0.78** | +22.9 / 2.07 / 0.57 |
+   | BloFin $2M, spreads | +21.5 / 1.37 / 1.19 | +23.4 / 1.52 / 0.85 | +22.6 / 1.47 / 0.65 |
+   | BloFin $1M, top 40% | +24.6 / 1.96 / 1.01 | +22.3 / 1.78 / 0.71 | +24.9 / 1.92 / 0.52 |
+   | Hyperliquid $5M | +20.2 / 1.13 / 1.48 | **+23.5 / 1.31 / 1.09** | +10.7 / 0.60 / 0.83 |
+   | Bybit $2M | +9.4 / 0.68 / 1.25 | +11.1 / 0.80 / 0.87 | - |
+
+   Half the trading for the same return at 0.1, on four venues; at 0.2 the
+   18-name Hyperliquid book starts holding stale positions and gives a third
+   back. The three-tranche Binance book with a 0.2 band scores Sharpe 2.16 at
+   +50.6 a week. **The width was chosen from this table**, so treat 0.1 as
+   the pre-registered value for anything that follows and the rest as the
+   sweep it came from. BloFin at a $1M floor and top 40% (24 names a
+   rebalance rather than 15) is also the better BloFin book on every cut,
+   which is the 9u finding again: this venue's binding constraint is width.
+
+   **Two venues this account can reach, run as one book** —
+   `backend\analysis\venue_stack.py`. BloFin and Hyperliquid rank
+   overlapping coins on different funding, universes and marks, and their
+   3-day books correlate at only **+0.29** (each about +0.4 with Binance).
+   On the 322 common periods from 2024-01 to 2026-09, lagged a day, each
+   venue at its own cost:
+
+   | 3-day hold | net/period | Sharpe | sd | worst period | drawdown |
+   |---|---|---|---|---|---|
+   | BloFin alone (measured spreads) | +26.8 | 1.65 | 179 | −842 | 1,758 |
+   | Hyperliquid alone | +20.9 | 1.27 | 182 | −634 | 2,092 |
+   | **both, half the gross each** | +23.9 | **1.82** | **145** | −703 | **1,097** |
+   | Binance, for reference | +25.6 | 2.07 | 136 | −546 | 731 |
+
+   The stack gives up a tenth of BloFin's return for a fifth less variance
+   and a drawdown 40% smaller, which is the diversification a 16-name
+   cross-section cannot provide on its own. Hyperliquid needs only an
+   address, so this is the most profitable *deployable* shape found so far:
+   the same 3-day tranche book on both venues, each sized to its own capacity.
+
+   **The weight is not on a cliff.** Momentum at 0.2 / 0.4 / 0.6 of the rank,
+   3-day hold, lag 1, band 0.1: Binance +20.7 / +23.7 / +24.8, BloFin +20.7 /
+   +22.3 / +23.7, Hyperliquid +3.5 / +23.5 / +19.0, Bybit +6.5 / +11.1 / +12.6.
+   Flat on the two wide venues, a peak at 0.4 on the 18-name one, rising on
+   the venue whose funding is least informative. 0.4 stays frozen.
+
+   **Widening Hyperliquid did not widen it.** `panel_hyperliquid.py --top 120`
+   returned 39 coins against the 53 in the panel every number above was
+   measured on, so the wider panel is kept beside it as
+   `hyperliquid-daily.top120.csv` and the 53-coin panel stays the reference.
+   The venue's tradeable cross-section at $5M a day is about 18 names, and
+   that - not the signal - is why its 3-day book is fragile to the floor.
+
+   **Maker execution is not a free improvement on BloFin.** The round trip
+   is 40% of the gross per 3-day period on this venue, and a 3-day hold has
+   the patience to quote passively, so `passive_sim.py --source raw` was run
+   on 12 hours of the recorder's own BloFin archive (2026-09-11), quoting at
+   the touch every second with a 60s timeout:
+
+   | BloFin | pessimistic net markout, 60s | fill rate |
+   |---|---|---|
+   | ADA-USDT | −6.4 bps (optimistic bound +0.3) | 11.0% |
+   | DOGE-USDT | −7.2 | 3.2% |
+   | SUI-USDT | −10.1 | 5.6% |
+   | PEPE-USDT | −16.2 | 2.4% |
+
+   A touch quote on this venue fills a few percent of the time and, when it
+   does, is run over: even ADA's front-of-queue bound is a rounding error. So
+   the plan keeps charging taker plus half the spread, and the honest way to
+   cut the round trip is the band above, not the order type. Step 9's verdict
+   on passive quoting stands on the venue it matters on.
+
+   **What "most profitable" means here, and what it costs.** On gross
+   notional the 3-day tranche book is about +49 bps a week, 25% a year
+   un-compounded, at a weekly standard deviation of 169 bps. On CAPITAL at
+   leverage L that is 25% x L a year against a measured worst week of
+   3.6% x L and a worst drawdown of 8.1% x L - and step 9z showed the book's
+   tail is seven times fatter than Gaussian at 4 sigma, so the worst observed
+   is not a bound. At 3x that is ~75% a year against an observed drawdown of
+   24% and a week that has already cost 11%; the February 2024 week, which a
+   3-day hold shortened to −454 bps, would have cost 14% of capital. That is
+   the trade, and the cap on any single name is still the only control that
+   does not depend on estimating a correlation that has not happened yet.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.

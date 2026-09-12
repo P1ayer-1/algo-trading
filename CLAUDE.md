@@ -40,6 +40,12 @@ python backend\analysis\check_features.py --horizon 900 --data-dir data\BTC-USDT
 python backend\plan_carry.py --instrument SUI-USDT --notional 2000 --leverage 3   # sends nothing
 python backend\analysis\panel_daily.py                                            # build the daily panel
 python backend\analysis\factor_panel.py --vol-scale --hold-days 7 --top-frac 0.3   # score the factors
+python backend\analysis\factor_panel.py --vol-scale --hold-days 3 --top-frac 0.3 --cost-bps 10 --lag 1  # the 3-day book, honestly lagged
+python backend\analysis\panel_intraday.py                                         # 1m archive -> 15m npz per symbol, once
+python backend\analysis\intraday_factors.py --bar 480 --hold 3 --vol-scale        # the same harness at 8h bars
+python backend\analysis\tranche_book.py --hold-days 3 --band 0.1 --lag 1              # three staggered tranches + regime table
+python backend\analysis\venue_stack.py --hold-days 3 --band 0.1 --lag 1               # BloFin + Hyperliquid as one book
+python backend\plan_carry_xs.py --hold-days 3 --momentum-weight 0.4 --min-volume 2000000  # the 9aa book, dry
 python backend\plan_carry_xs.py --notional 4000 --min-volume 2000000               # sends nothing
 ```
 

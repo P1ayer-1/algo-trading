@@ -386,6 +386,43 @@ def build_features(panel: Panel) -> Dict[str, np.ndarray]:
             features["carry_rel_" + str(window)] = (
                 -_trailing_sum_nan(difference, window) / window)
 
+    # Added 2026-09-12 for the short-hold search (step 9ac). Signs stated
+    # before any result was seen, as above:
+    #   max_7      the lottery effect - the coin with the biggest single-day
+    #              jump in the last week underperforms, so NEGATIVE max.
+    #   skew_30    same story on the distribution: negative skewness.
+    #   beta_30    betting against beta: negative beta to the cross-section.
+    #   volshock_1 an attention spike reverses: negative abnormal volume.
+    #   carry_vol  carry per unit of risk, HIGH is good (the ranking analogue
+    #              of the inverse-vol sizing the book already uses).
+    #   mom_vol    risk-adjusted momentum, likewise.
+    with np.errstate(invalid="ignore"):
+        market = np.nanmean(daily_return, axis=1, keepdims=True)
+    max_7 = np.full(close.shape, np.nan)
+    skew_30 = np.full(close.shape, np.nan)
+    beta_30 = np.full(close.shape, np.nan)
+    for d in range(30, close.shape[0]):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            max_7[d] = np.nanmax(daily_return[d - 6:d + 1], axis=0)
+            block = daily_return[d - 29:d + 1]
+            mean = np.nanmean(block, axis=0)
+            sd = np.nanstd(block, axis=0)
+            skew_30[d] = np.nanmean((block - mean) ** 3, axis=0) / np.where(sd > 0, sd ** 3, np.nan)
+            m = market[d - 29:d + 1]
+            m_dev = m - np.nanmean(m)
+            cov = np.nanmean((block - mean) * m_dev, axis=0)
+            beta_30[d] = cov / np.nanmean(m_dev * m_dev)
+    features["max_7"] = -max_7
+    features["skew_30"] = -skew_30
+    features["beta_30"] = -beta_30
+    with np.errstate(divide="ignore", invalid="ignore"):
+        volume_30 = _trailing_mean(np.where(panel.volume > 0, panel.volume, np.nan), 30)
+        features["volshock_1"] = -np.log(np.where(panel.volume > 0, panel.volume, np.nan) / volume_30)
+        features["carry_vol"] = features["carry_7"] / np.where(vol_30 > 0, vol_30, np.nan)
+        features["mom_vol"] = features["mom_14"] / np.where(vol_30 > 0, vol_30, np.nan)
+    for window in (14, 60):
+        features["carry_" + str(window)] = -_trailing_sum(panel.funding, window) / window
+
     # One book rather than two. Blending the RETURNS of two books assumes both
     # are run and both are paid for; rank-averaging the scores runs a single
     # book, which nets the positions a symbol would hold in both and pays the
@@ -395,6 +432,21 @@ def build_features(panel: Panel) -> Dict[str, np.ndarray]:
         (features["carry_7"], 0.6), (features["mom_14"], 0.4))
     features["carry_mom_even"] = _rank_blend(
         (features["carry_7"], 0.5), (features["mom_14"], 0.5))
+    # The weight either side of the frozen 0.4, so a cliff would show.
+    features["carry_mom_w2"] = _rank_blend(
+        (features["carry_7"], 0.8), (features["mom_14"], 0.2))
+    features["carry_mom_w6"] = _rank_blend(
+        (features["carry_7"], 0.4), (features["mom_14"], 0.6))
+    # Three-way blends for the short-hold search (2026-09-12): the frozen
+    # 60/40 with a fifth of the rank handed to one more signal.
+    features["carry_mom_flow"] = _rank_blend(
+        (features["carry_7"], 0.5), (features["mom_14"], 0.3), (features["taker_7"], 0.2))
+    features["carry_mom_max"] = _rank_blend(
+        (features["carry_7"], 0.5), (features["mom_14"], 0.3), (features["max_7"], 0.2))
+    features["carry_mom_vol"] = _rank_blend(
+        (features["carry_vol"], 0.6), (features["mom_vol"], 0.4))
+    features["carry_mom_lowvol"] = _rank_blend(
+        (features["carry_7"], 0.5), (features["mom_14"], 0.3), (features["lowvol_30"], 0.2))
 
     return features
 
@@ -681,8 +733,17 @@ def correlation_clusters(returns: np.ndarray, *, threshold: float = 0.75,
 def _weights(scores: np.ndarray, eligible: np.ndarray, top_frac: float,
              risk: Optional[np.ndarray] = None,
              clusters: Optional[np.ndarray] = None,
+             previous: Optional[np.ndarray] = None,
+             band: float = 0.0,
              ) -> Tuple[np.ndarray, int, int]:
     """Dollar-neutral weights: long the top, short the bottom, `sum|w| == 2`.
+
+    `band` is a rebalance buffer: a name the book already holds on a side is
+    KEPT as long as it still ranks inside the top `top_frac + band` for that
+    side, and only names inside the top `top_frac` are newly opened. Each side
+    still holds `n_side` names. A name that drifts from rank 28% to 34% and
+    back is otherwise sold and re-bought for nothing, and at a 3-day hold
+    that churn is a fifth of the gross return (turnover 1.21 x 10 bps / 2).
 
     With `risk` given, each position is sized by `1/risk` and each side is then
     renormalised to one dollar. Equal weight lets the most volatile name in the
@@ -708,6 +769,18 @@ def _weights(scores: np.ndarray, eligible: np.ndarray, top_frac: float,
     if 2 * n_side > len(order):
         n_side = len(order) // 2
     shorts, longs = order[:n_side], order[-n_side:]
+    if band > 0 and previous is not None:
+        n_band = min(len(order) - n_side, max(n_side, int(round(len(order) * (top_frac + band)))))
+        # Longs: keep held names still inside the wider band (best first),
+        # then fill from the top of the ranking with names not yet held.
+        band_longs = order[-n_band:][::-1]
+        kept = [i for i in band_longs if previous[i] > 0][:n_side]
+        fill = [i for i in order[::-1] if i not in kept and previous[i] <= 0]
+        longs = np.array(kept + fill[:n_side - len(kept)])
+        band_shorts = order[:n_band]
+        kept_s = [i for i in band_shorts if previous[i] < 0 and i not in longs][:n_side]
+        fill_s = [i for i in order if i not in kept_s and i not in longs and previous[i] >= 0]
+        shorts = np.array(kept_s + fill_s[:n_side - len(kept_s)])
 
     for side, sign in ((longs, 1.0), (shorts, -1.0)):
         raw = (1.0 / risk[side]) if risk is not None else np.ones(len(side))
@@ -773,8 +846,16 @@ def run_factor(panel: Panel, scores: np.ndarray, eligible: np.ndarray, *,
                risk: Optional[np.ndarray] = None,
                cost_per_symbol: Optional[np.ndarray] = None,
                cluster_lookback: int = 0,
-               cluster_threshold: float = 0.75) -> Result:
+               cluster_threshold: float = 0.75,
+               lag: int = 0,
+               band: float = 0.0) -> Result:
     """Hold a dollar-neutral book on non-overlapping `hold_days` periods.
+
+    `lag` scores each rebalance with the factor as it stood `lag` rows EARLIER
+    than the entry close, which is the honest version of a book that cannot
+    act at the instant a bar closes: a one-day hold rebalanced from
+    yesterday's ranking has to still pay, or the result is a claim about a
+    trade nobody can place.
 
     `shuffle_seed` permutes each date's scores across the eligible symbols,
     which is the control: same universe, same position count, same turnover
@@ -787,7 +868,7 @@ def run_factor(panel: Panel, scores: np.ndarray, eligible: np.ndarray, *,
 
     for entry in range(start, n_dates - hold_days, hold_days):
         exit_index = entry + hold_days
-        row = scores[entry].copy()
+        row = scores[max(entry - lag, 0)].copy()
         usable = eligible[entry] & np.isfinite(row)
         if rng is not None:
             index = np.flatnonzero(usable)
@@ -807,7 +888,8 @@ def run_factor(panel: Panel, scores: np.ndarray, eligible: np.ndarray, *,
 
         weights, n_long, n_short = _weights(
             row, eligible[entry], top_frac,
-            risk[entry] if risk is not None else None, clusters)
+            risk[entry] if risk is not None else None, clusters,
+            previous=previous, band=band)
         if n_long == 0:
             previous = np.zeros(panel.shape[1])
             continue
@@ -1220,6 +1302,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--split", help="one factor over random halves of the universe")
     parser.add_argument("--vol-scale", action="store_true",
                         help="size positions by 1/vol_30 instead of equally")
+    parser.add_argument("--band", type=float, default=0.0,
+                        help="rebalance buffer: keep a held name while it ranks inside "
+                             "top_frac + band; open only inside top_frac")
+    parser.add_argument("--lag", type=int, default=0,
+                        help="score each rebalance with the factor from this many days earlier")
     parser.add_argument("--start", type=int, default=120,
                         help="skip this many leading days so features are warm")
     args = parser.parse_args(argv)
@@ -1285,7 +1372,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                           start=args.start, risk=risk,
                           cost_per_symbol=cost_per_symbol,
                        cluster_lookback=args.cluster_lookback,
-                       cluster_threshold=args.cluster_threshold)
+                       cluster_threshold=args.cluster_threshold, lag=args.lag,
+                       band=args.band)
         real.name = name
         results[name] = real
         controls = [
@@ -1294,7 +1382,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                        shuffle_seed=seed, risk=risk,
                        cost_per_symbol=cost_per_symbol,
                        cluster_lookback=args.cluster_lookback,
-                       cluster_threshold=args.cluster_threshold)
+                       cluster_threshold=args.cluster_threshold, lag=args.lag,
+                       band=args.band)
             for seed in range(args.control_seeds)
         ]
         summaries = [c.summary(periods_per_year) for c in controls]

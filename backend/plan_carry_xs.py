@@ -41,7 +41,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -105,17 +105,11 @@ def daily_funding(api, inst_id: str) -> Dict[str, float]:
     return {day: value for day, value in ordered if day != today}
 
 
-def daily_vol_bps(api, inst_id: str, *, days: int = 31) -> float:
-    """Standard deviation of daily log returns over `days`, in bps.
-
-    This is the risk measure the research sized on, computed the same way from
-    closes, so the live book and the backtested one weight positions alike.
-    """
-    import math
-
+def daily_closes(api, inst_id: str, *, days: int = 31) -> List[float]:
+    """Completed daily closes, oldest first. The day in progress is excluded."""
     payload = api.getCandlesticks(inst_id, bar="1D",
                                   limit=str(days + 2)).get("data") or []
-    closes: List[float] = []
+    closes: List[Tuple[int, float]] = []
     for row in payload:
         try:
             if str(row[8]) == "0":              # the day still in progress
@@ -124,7 +118,17 @@ def daily_vol_bps(api, inst_id: str, *, days: int = 31) -> float:
         except (IndexError, TypeError, ValueError):
             continue
     closes.sort()
-    values = [close for _, close in closes]
+    return [close for _, close in closes]
+
+
+def vol_bps_from_closes(values: Sequence[float]) -> float:
+    """Standard deviation of daily log returns, in bps.
+
+    This is the risk measure the research sized on, computed the same way from
+    closes, so the live book and the backtested one weight positions alike.
+    """
+    import math
+
     steps = [math.log(b / a) for a, b in zip(values, values[1:])
              if a > 0 and b > 0]
     if len(steps) < 10:
@@ -132,6 +136,24 @@ def daily_vol_bps(api, inst_id: str, *, days: int = 31) -> float:
     mean = sum(steps) / len(steps)
     variance = sum((s - mean) ** 2 for s in steps) / (len(steps) - 1)
     return math.sqrt(variance) * 10_000.0
+
+
+def momentum_bps_from_closes(values: Sequence[float], *, days: int = 14) -> Optional[float]:
+    """`log(close_today / close_{days} ago)` in bps - `factor_panel`'s `mom_14`.
+
+    None when there are not enough closes: a coin listed ten days ago has no
+    14-day momentum, and scoring it as zero would place it in the middle of
+    the ranking on the strength of nothing.
+    """
+    import math
+
+    if len(values) < days + 1 or values[-1] <= 0 or values[-1 - days] <= 0:
+        return None
+    return math.log(values[-1] / values[-1 - days]) * 10_000.0
+
+
+def daily_vol_bps(api, inst_id: str, *, days: int = 31) -> float:
+    return vol_bps_from_closes(daily_closes(api, inst_id, days=days))
 
 
 def gather(api, *, min_volume: float, carry_days: int, min_funding_days: int,
@@ -179,7 +201,9 @@ def gather(api, *, min_volume: float, carry_days: int, min_funding_days: int,
         meta = instruments[inst_id]
         try:
             funding = daily_funding(api, inst_id)
-            vol = daily_vol_bps(api, inst_id)
+            closes = daily_closes(api, inst_id)
+            vol = vol_bps_from_closes(closes)
+            momentum = momentum_bps_from_closes(closes)
         except Exception as exc:                 # noqa: BLE001
             print("\n  " + inst_id + ": skipped (" + str(exc) + ")")
             continue
@@ -198,7 +222,8 @@ def gather(api, *, min_volume: float, carry_days: int, min_funding_days: int,
             lot_size=to_decimal(meta.get("lotSize"), "1"),
             min_size=to_decimal(meta.get("minSize"), "1"),
             max_leverage=to_decimal(meta.get("maxLeverage"), "10"),
-            funding_days=len(funding)))
+            funding_days=len(funding),
+            mom_bps=momentum))
         print("\r  {}/{}  {:<18}".format(index, len(shortlist), inst_id),
               end="", flush=True)
     print()
@@ -296,12 +321,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-volume", type=float, default=5e6)
     parser.add_argument("--min-funding-days", type=int, default=30)
     parser.add_argument("--max-instruments", type=int, default=80)
+    parser.add_argument("--momentum-weight", type=float, default=0.0,
+                        help="rank weight of 14-day momentum; 0.4 with --hold-days 3 "
+                             "is step 9aa's book, 0 is step 9q's pure carry")
     args = parser.parse_args(argv)
 
     config = BookConfig(
         top_frac=args.top_frac, hold_days=args.hold_days,
         min_volume_usd=args.min_volume, min_funding_days=args.min_funding_days,
-        gross_notional_usd=args.notional, leverage=args.leverage)
+        gross_notional_usd=args.notional, leverage=args.leverage,
+        momentum_weight=args.momentum_weight)
 
     started = time.time()
     candidates = gather(market_api(), min_volume=args.min_volume,

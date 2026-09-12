@@ -136,6 +136,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-volume", type=float, default=2e6)
     parser.add_argument("--min-funding-days", type=int, default=30)
     parser.add_argument("--max-instruments", type=int, default=80)
+    parser.add_argument("--momentum-weight", type=float, default=0.0,
+                        help="rank weight of 14-day momentum; 0.4 with --hold-days 3 "
+                             "is step 9aa's book, 0 is step 9q's pure carry")
     parser.add_argument("--max-spread-bps", type=float, default=30.0,
                         help="skip an opening leg whose spread is wider than "
                              "this when it is about to be sent")
@@ -196,7 +199,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         top_frac=args.top_frac, hold_days=args.hold_days,
         min_volume_usd=args.min_volume,
         min_funding_days=args.min_funding_days,
-        gross_notional_usd=args.notional, leverage=args.leverage)
+        gross_notional_usd=args.notional, leverage=args.leverage,
+        momentum_weight=args.momentum_weight)
 
     executor_kwargs = dict(dry_run=not args.confirm, on_log=log,
                            max_spread_bps=args.max_spread_bps,

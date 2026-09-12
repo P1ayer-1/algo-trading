@@ -84,6 +84,11 @@ class Candidate:
     min_size: Decimal = Decimal("1")
     max_leverage: Decimal = Decimal("10")
     funding_days: int = 0
+    # Trailing 14-day log return in bps, the momentum half of step 9aa's
+    # blend. None means "not measured", which excludes the name from a blended
+    # book rather than scoring it as flat - a coin with no price history is
+    # not a coin with no momentum.
+    mom_bps: Optional[float] = None
 
     @property
     def mid(self) -> Decimal:
@@ -190,6 +195,13 @@ class BookConfig:
     vol_scale: bool = True
     max_weight_frac: float = 0.25
     delta_tolerance_frac: float = 0.02
+    # Step 9aa: rank-blend the carry score with 14-day momentum and hold for
+    # three days. 0.0 is the pure carry book above; 0.4 with hold_days=3 is
+    # the specification measured at +22.4 bps per period, Sharpe 1.97, on a
+    # one-day-lagged ranking. Ranks rather than z-scores, as in the research,
+    # because funding has a fat right tail and one extreme name would
+    # otherwise set the whole combination.
+    momentum_weight: float = 0.0
 
 
 def eligible_candidates(candidates: Sequence[Candidate], config: BookConfig,
@@ -216,6 +228,8 @@ def eligible_candidates(candidates: Sequence[Candidate], config: BookConfig,
             problems.append("crossed or locked quote")
         if not (candidate.vol_30d_bps > 0):
             problems.append("no volatility estimate")
+        if config.momentum_weight > 0 and candidate.mom_bps is None:
+            problems.append("no momentum estimate for a blended book")
         if problems:
             notes.append(candidate.inst_id + ": " + "; ".join(problems))
         else:
@@ -284,6 +298,42 @@ def _side_weights(side: Sequence[Candidate], config: BookConfig,
     return weights, warnings
 
 
+def _ranks(values: Sequence[float]) -> List[float]:
+    """Average ranks scaled to [0, 1], ties sharing a rank."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2.0
+        i = j + 1
+    scale = max(len(values) - 1, 1)
+    return [r / scale for r in ranks]
+
+
+def blended_score(candidate: Candidate, universe: Sequence[Candidate],
+                  config: BookConfig) -> float:
+    """The ranking key: carry alone, or its rank blended with momentum's.
+
+    With `momentum_weight` at zero this is `carry_bps_per_day` itself, so the
+    pure carry book ranks exactly as it always has. Otherwise both signals are
+    ranked across `universe` and combined `(1 - w) * carry + w * momentum`,
+    the same rank blend `factor_panel._rank_blend` scores, so the live book
+    and the backtested one agree on who is long and who is short.
+    """
+    w = config.momentum_weight
+    if w <= 0:
+        return candidate.carry_bps_per_day
+    members = list(universe)
+    carry_rank = _ranks([c.carry_bps_per_day for c in members])
+    mom_rank = _ranks([c.mom_bps if c.mom_bps is not None else 0.0 for c in members])
+    i = members.index(candidate)
+    return (1.0 - w) * carry_rank[i] + w * mom_rank[i]
+
+
 def _round_to_lot(contracts: Decimal, lot: Decimal) -> Decimal:
     if lot <= 0:
         return contracts
@@ -322,7 +372,7 @@ def plan_book(candidates: Sequence[Candidate], config: Optional[BookConfig] = No
     if 2 * n_side > len(kept):
         n_side = len(kept) // 2
 
-    ranked = sorted(kept, key=lambda c: c.carry_bps_per_day)
+    ranked = sorted(kept, key=lambda c: blended_score(c, kept, config))
     shorts, longs = ranked[:n_side], ranked[-n_side:]
     sides = (("buy", longs, Side.LONG), ("sell", shorts, Side.SHORT))
 
@@ -517,10 +567,23 @@ def plan_book(candidates: Sequence[Candidate], config: Optional[BookConfig] = No
         plan.reasons.append("leverage {} over the {} limit".format(
             config.leverage, limits.max_leverage))
     if plan.expected_net_bps <= 0:
-        plan.reasons.append(
+        message = (
             "expected funding {:+.1f} bps over {} days does not cover the "
             "{:.1f} bps round trip".format(
                 plan.expected_funding_bps, config.hold_days, plan.round_trip_bps))
+        if config.momentum_weight > 0:
+            # A blended book is measured to earn most of its return from the
+            # PRICE leg (step 9aa: 26 of 32 bps gross at a 3-day hold), which
+            # no plan can price in advance. Funding alone not covering the
+            # round trip is therefore the expected state of this book, not a
+            # defect of it, and is reported as a warning rather than a refusal
+            # - with the words that say the difference is a forecast.
+            plan.warnings.append(
+                message + ". This is a carry/momentum blend: the backtest's "
+                "return beyond funding is a price forecast (step 9aa), and the "
+                "gate above is what a pure carry book would have refused on.")
+        else:
+            plan.reasons.append(message)
 
     plan.warnings.append(
         "This book has PRICE exposure: the legs are different coins and "

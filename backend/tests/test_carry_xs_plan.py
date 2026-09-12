@@ -315,3 +315,72 @@ def test_the_price_exposure_warning_is_always_present():
                      RiskLimits(max_notional=Decimal("100000")))
     assert any("PRICE exposure" in warning for warning in plan.warnings)
     assert any("Leg ordering" in warning for warning in plan.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Step 9aa: the carry/momentum blend
+# ---------------------------------------------------------------------------
+
+
+def test_momentum_weight_zero_ranks_on_carry_exactly_as_before():
+    """The pure carry book must not move when the blend is switched off.
+
+    A default that quietly changed the ranking of the book already on would
+    be a strategy change nobody asked for; with `momentum_weight=0` the score
+    IS `carry_bps_per_day` whatever momentum says.
+    """
+    names = universe(20)
+    for i, c in enumerate(names):
+        c.mom_bps = -c.carry_bps_per_day * 1000.0      # momentum says the opposite
+    plan = plan_book(names, BookConfig(gross_notional_usd=Decimal("20000")),
+                     RiskLimits(max_notional=Decimal("100000")))
+    longs = {leg.inst_id for leg in plan.long_legs if leg.ok}
+    assert "C19-USDT" in longs and "C00-USDT" not in longs
+
+
+def test_the_blend_is_a_rank_blend_and_momentum_can_flip_a_name():
+    """Hand-computed: 4 names, carry ranks 0,1/3,2/3,1; momentum ranks the
+    reverse. At w=0.4 the score is 0.6*carry + 0.4*mom, so the carry order
+    survives (0.6 > 0.4) - and at w=0.8 momentum wins and the order flips.
+    Ranks, not raw values: a 1,000x momentum outlier changes nothing."""
+    from trading.strategies.carry_xs.plan import blended_score
+    names = [candidate("A-USDT", -3.0), candidate("B-USDT", -1.0),
+             candidate("C-USDT", 1.0), candidate("D-USDT", 3.0)]
+    for c, mom in zip(names, (4000.0, 300.0, 200.0, -100000.0)):
+        c.mom_bps = mom
+    at_04 = [blended_score(c, names, BookConfig(momentum_weight=0.4)) for c in names]
+    assert [round(s, 6) for s in at_04] == [0.4, pytest.approx(0.6 * 1 / 3 + 0.4 * 2 / 3, abs=1e-6),
+                                            pytest.approx(0.6 * 2 / 3 + 0.4 * 1 / 3, abs=1e-6), 0.6]
+    assert at_04 == sorted(at_04)
+    at_08 = [blended_score(c, names, BookConfig(momentum_weight=0.8)) for c in names]
+    assert at_08 == sorted(at_08, reverse=True)
+
+
+def test_a_blended_book_excludes_names_without_momentum_rather_than_scoring_them_flat():
+    """A coin listed last week has no 14-day return. Scoring it as zero would
+    park it mid-ranking on the strength of nothing; it is excluded and named."""
+    names = universe(20)
+    for c in names:
+        c.mom_bps = 0.0
+    names[5].mom_bps = None
+    plan = plan_book(names, BookConfig(gross_notional_usd=Decimal("20000"),
+                                       momentum_weight=0.4, hold_days=3),
+                     RiskLimits(max_notional=Decimal("100000")))
+    assert plan.eligible == 19
+    assert any("C05-USDT" in w and "momentum" in w for w in plan.warnings)
+
+
+def test_a_blended_book_reports_uncovered_funding_as_a_warning_not_a_refusal():
+    """Step 9aa's return is mostly the price leg, which a plan cannot price.
+    Funding alone failing to cover the round trip is that book's normal state
+    and must not refuse it - but the pure carry book keeps its refusal."""
+    names = universe(20, spread="2.0")       # 200 bps spreads: funding cannot cover
+    for c in names:
+        c.mom_bps = 0.0
+    limits = RiskLimits(max_notional=Decimal("100000"))
+    pure = plan_book(names, BookConfig(gross_notional_usd=Decimal("20000"), hold_days=3), limits)
+    assert any("does not cover" in r for r in pure.reasons)
+    blended = plan_book(names, BookConfig(gross_notional_usd=Decimal("20000"), hold_days=3,
+                                          momentum_weight=0.4), limits)
+    assert not any("does not cover" in r for r in blended.reasons)
+    assert any("does not cover" in w and "price forecast" in w for w in blended.warnings)
