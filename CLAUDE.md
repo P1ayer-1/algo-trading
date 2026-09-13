@@ -64,6 +64,8 @@ python backend\run_lead_quote.py --instruments SUI-USDT --measure-only          
 python backend\run_lead_quote.py --instruments SUI-USDT --minutes 60                 # paper quote from production feeds, sends nothing
 python backend\run_lead_quote.py --instruments SUI-USDT --minutes 60 --confirm       # ...and mirror intents to DEMO as post_only orders
 python backend\run_lead_quote.py --summary data\SUI-USDT\lead_quote\<run>.jsonl      # read a run back
+python backend\lead_quote_board.py --watch 60                                      # every run: newest per pair, then pooled fills
+python backend\lead_quote_board.py --follow                                        # print each paper fill and exit as it lands
 python backend\analysis\lead_quote_universe.py --top 12                           # which pairs pass the 9ae gate, by BloFin volume; sends nothing
 ```
 
