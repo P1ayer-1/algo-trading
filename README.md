@@ -3572,8 +3572,33 @@ un_carry_xs.py --flatten --confirm
    arrival are not comparable with the other pairs'. A test walks a
    FIL-shaped bid, its exit and an ask by hand; it fails on the old code,
    on nearest-rounding to the demo tick, and on rounding the exit the wrong
-   way. The FIL process was left running on the old code; it picks this up
-   only when restarted, and the other eight need nothing.
+   way. FIL was stopped at 21:45 UTC (clean shutdown: its 9 accepted demo
+   posts all ended cancelled, no demo fills, nothing to close) and
+   relaunched at 21:52 on the fix: `demo_tick` "0.001" in the start row,
+   and 10 of 10 demo posts and 10 of 10 cancels accepted in its first four
+   minutes. The other eight needed nothing.
+
+   **Two signed requests in one millisecond (2026-09-13).** At 21:39 UTC a
+   SUI demo post came back 152407 "Repeated nonce" — the only such
+   rejection in any lead-quote log, against ~9,700 signed requests since
+   13:31. The vendored SDK made its REST nonce from the millisecond clock
+   and used the timestamp itself as the websocket login nonce, while nine
+   `--confirm` processes sign with one API key; BloFin's docs ask for a
+   generator that never repeats within the server's window, "such as UUID".
+   Re-sending one fixed nonce on the demo host reproduces it on both a POST
+   (a cancel of a non-existent order id) and a GET. Which request the SUI
+   post collided with is not in the logs — none of the logged requests
+   started within 5 ms of it; the unlogged ones are websocket logins and
+   anything else on the same key. The post was refused before the book (no
+   demo order row for its client id) and the paper side never noticed.
+
+   `blofin-sdk-python` now sends a UUID for both (a commit in the
+   submodule, with two tests that freeze the clock and require distinct
+   nonces; both fail on the old code). Checked on the demo host before
+   merging: signed GET and POST over `requests` and aiohttp, and the
+   private websocket login, all accept it. Running processes keep the SDK
+   they imported; each picks the fix up at its next start, and at one
+   rejection in ~9,700 none needs restarting for it.
 
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
