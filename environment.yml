@@ -11,6 +11,7 @@ dependencies:
   - lightgbm       # backend/analysis/train_model.py only
   - requests       # via the vendored blofin SDK, and REST polling (OI, mark-price, Bybit)
   - websockets     # via the vendored blofin SDK, and trading/hyperliquid.py
+  - aiohttp        # the SDK's AsyncClient: run_lead_quote.py demo orders (--http aiohttp)
   - python-dotenv  # config.py loads .env
   - pytest         # backend/pytest.ini
   # optional, only for backend/analysis/compact.py once the raw archive is large:

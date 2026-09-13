@@ -93,6 +93,26 @@ class BlofinQuoteBroker:
         payload = self.client.get("/api/v1/account/positions", params={}, sign=True)
         return [row for row in (payload.get("data") or []) if isinstance(row, dict)]
 
+    async def aclose(self) -> None:
+        pass
+
+
+class AsyncBlofinQuoteBroker(BlofinQuoteBroker):
+    """The same calls on the SDK's aiohttp `AsyncClient`: each returns a coroutine.
+
+    `LeadQuoteRunner` awaits these on the event loop instead of handing a
+    blocking `requests` call to a worker thread.
+    """
+
+    is_async = True
+
+    async def positions(self):
+        payload = await self.client.get("/api/v1/account/positions", params={}, sign=True)
+        return [row for row in (payload.get("data") or []) if isinstance(row, dict)]
+
+    async def aclose(self) -> None:
+        await self.client.close()
+
 
 class RunLog:
     """One JSON object per line, receive-time stamped. Flushed per row: a run
@@ -167,7 +187,12 @@ class LeadQuoteRunner:
                     self.on_log("leader feed connected: Binance " + symbol + "@bookTicker")
                     backoff = 1.0
                     while True:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=self.stall_timeout_s)
+                        # asyncio.timeout, not wait_for: on 3.11 wait_for can swallow a
+                        # cancel that lands as recv() completes. The leader feed ticks many
+                        # times a second, and on 2026-09-12 it kept running after cancel
+                        # and hung shutdown with seven probe orders left resting.
+                        async with asyncio.timeout(self.stall_timeout_s):
+                            raw = await ws.recv()
                         t = now_ms()
                         msg = json.loads(raw)
                         bid, ask = float(msg["b"]), float(msg["a"])
@@ -204,7 +229,8 @@ class LeadQuoteRunner:
                 backoff = 1.0
                 messages = client.listen().__aiter__()
                 while True:
-                    message = await asyncio.wait_for(messages.__anext__(), timeout=self.stall_timeout_s)
+                    async with asyncio.timeout(self.stall_timeout_s):    # see leader_feed
+                        message = await messages.__anext__()
                     t = now_ms()
                     if not isinstance(message, dict):
                         continue
@@ -370,7 +396,7 @@ class LeadQuoteRunner:
     async def _send(self, kind: str, order: DemoOrder, call: Callable[[], Dict[str, Any]]) -> None:
         started = now_ms()
         try:
-            response = await asyncio.to_thread(call)
+            response = await self._call(call)
         except Exception as exc:                            # noqa: BLE001
             self.log.write(event="demo_ack", kind=kind, cid=order.cid, ok=False, msg=str(exc),
                            rtt_ms=now_ms() - started)
@@ -381,10 +407,18 @@ class LeadQuoteRunner:
         row = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else {})
         code = str((row or {}).get("code", response.get("code", "0") if isinstance(response, dict) else "0"))
         ok = code in ("0", "")
-        if kind in ("post", "exit_post", "exit_cross") and ok:
+        # probe_post was missing here until 2026-09-12: a probe then cancelled only
+        # when the WS order stream beat the REST ack, so the probe mostly timed posts.
+        if kind in ("post", "probe_post", "exit_post", "exit_cross", "flatten") and ok:
             order.order_id = str((row or {}).get("orderId") or "")
         self.log.write(event="demo_ack", kind=kind, cid=order.cid, order_id=order.order_id,
                        ok=ok, msg=str((row or {}).get("msg", "")), rtt_ms=rtt)
+
+    async def _call(self, call: Callable[[], Any]) -> Any:
+        """An async broker's call is awaited on the loop; a blocking one runs in a thread."""
+        if getattr(self.broker, "is_async", False):
+            return await call()
+        return await asyncio.to_thread(call)
 
     def _fmt(self, price: Optional[float]) -> str:
         tick = Decimal(str(self.config.tick))
@@ -433,7 +467,12 @@ class LeadQuoteRunner:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             if self.broker is not None:
-                await self.shutdown_demo()
+                try:
+                    await self.shutdown_demo()
+                finally:
+                    aclose = getattr(self.broker, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
             self.log.write(event="stop", posts=self.quoter.posts, cancels=self.quoter.cancels,
                            paper_fills=len(self.quoter.fills), closed=len(self.quoter.closed_fills()))
         return self.plan
@@ -456,7 +495,7 @@ class LeadQuoteRunner:
                 await self._send("cancel", order, lambda o=order: self.broker.cancel(
                     inst_id=self.inst_id, order_id=o.order_id))
         try:
-            rows = await asyncio.to_thread(self.broker.positions)
+            rows = await self._call(self.broker.positions)
         except Exception as exc:                            # noqa: BLE001
             self.on_log("could not read demo positions at shutdown: {}".format(exc))
             rows = []

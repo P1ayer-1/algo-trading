@@ -300,6 +300,47 @@ def test_shutdown_with_nothing_filled_sends_nothing(tmp_path):
     assert broker.calls == []
 
 
+def test_a_probe_cancels_by_the_order_id_in_the_rest_ack(tmp_path):
+    """The probe once read the order id only from the WS order stream, so when the REST
+    ack came back first no cancel was sent and the order stayed resting. With no stream
+    at all, two cycles must send limit, cancel(o1), limit, cancel(o3)."""
+    import asyncio
+    broker = _Broker()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker)
+    runner._bid = 1.000
+    asyncio.run(runner.probe(2, pause_s=0))
+    log.close()
+    assert [c[0] for c in broker.calls] == ["limit", "cancel", "limit", "cancel"]
+    assert broker.calls[1][1]["order_id"] == "o1" and broker.calls[3][1]["order_id"] == "o3"
+    assert broker.calls[0][1]["price"] == "0.950"
+
+
+def test_an_async_broker_is_awaited_on_the_loop_not_sent_to_a_thread(tmp_path):
+    """The aiohttp broker's calls return coroutines. Handed to asyncio.to_thread they
+    would come back un-awaited: no order sent and a dict lookup on a coroutine."""
+    import asyncio
+
+    class _Async(_Broker):
+        is_async = True
+
+        async def place_limit(self, **kw):
+            return _Broker.place_limit(self, **kw)
+
+        async def cancel(self, **kw):
+            return _Broker.cancel(self, **kw)
+
+    broker = _Async()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker)
+    runner._bid = 1.000
+    asyncio.run(runner.probe(1, pause_s=0))
+    log.close()
+    assert [c[0] for c in broker.calls] == ["limit", "cancel"]
+    acks = [json.loads(l) for l in (tmp_path / "run.jsonl").read_text().splitlines()]
+    assert [(a["kind"], a["ok"]) for a in acks] == [("probe_post", True), ("probe_cancel", True)]
+
+
 def test_the_runner_without_a_broker_sends_nothing_and_is_a_dry_run(tmp_path):
     log = RunLog(tmp_path / "run.jsonl")
     runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK), log=log)

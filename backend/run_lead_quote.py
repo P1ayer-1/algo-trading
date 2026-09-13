@@ -19,6 +19,8 @@ data feed here, never an account.
   --probe N        with --confirm: N far-from-touch post_only orders, each
                    cancelled, to time the venue round trip from this host.
                    The number to compare a Germany box with a Tokyo one.
+  --http           aiohttp (default) or requests, for the demo order path.
+                   aiohttp measured 4-6 ms faster of ~185 (README 9ae).
   --confirm        additionally mirror every intent to the DEMO account as a
                    real `post_only` order, cancel, or reduce-only exit, timing
                    each acknowledgement and logging the demo order stream.
@@ -51,7 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config  # noqa: E402
 from trading.strategies.lead_quote import QuoteConfig, summarise  # noqa: E402
 from trading.strategies.lead_quote.execute import (  # noqa: E402
-    BlofinQuoteBroker, LeadQuoteRunner, RunLog)
+    AsyncBlofinQuoteBroker, BlofinQuoteBroker, LeadQuoteRunner, RunLog)
 
 DEMO_BASE_URL = "https://demo-trading-openapi.blofin.com"
 PRODUCTION_BASE_URL = "https://openapi.blofin.com"
@@ -83,6 +85,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--probe", type=int, default=0,
                         help="with --confirm: N post_only orders 5%% under the bid, each cancelled, "
                              "to time the venue round trip from this host; no fill possible")
+    parser.add_argument("--http", choices=("aiohttp", "requests"), default="aiohttp",
+                        help="REST transport for demo orders: the SDK's aiohttp AsyncClient awaited "
+                             "on the loop, or its requests Client in a worker thread")
     parser.add_argument("--confirm", action="store_true", help="mirror intents to the demo account")
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--summary", help="summarise this run log and exit")
@@ -132,11 +137,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         api_key, secret, passphrase = (os.environ.get(k) for k in ("API_KEY", "SECRET", "PASSPHRASE"))
         if not (api_key and secret and passphrase):
             raise SystemExit("API_KEY, SECRET and PASSPHRASE must be set in .env.")
-        client = Client(apiKey=api_key, apiSecret=secret, passphrase=passphrase, baseUrl=base_url)
-        broker = BlofinQuoteBroker(client, TradingAPI(client))
+        if args.http == "aiohttp":
+            from blofin.async_client import AsyncClient
+            client = AsyncClient(apiKey=api_key, apiSecret=secret, passphrase=passphrase, baseUrl=base_url)
+            broker = AsyncBlofinQuoteBroker(client, TradingAPI(client))
+        else:
+            client = Client(apiKey=api_key, apiSecret=secret, passphrase=passphrase, baseUrl=base_url)
+            broker = BlofinQuoteBroker(client, TradingAPI(client))
         private_feed = lambda: BlofinWsPrivateClient(api_key, secret, passphrase, isDemo=not args.production)  # noqa: E731
         print("--confirm given: intents WILL be mirrored to the {} account as post_only orders, "
-              "size {} contracts".format(environment, size))
+              "size {} contracts, over {}".format(environment, size, args.http))
     else:
         print("dry run: paper fills from the production tape, nothing sent. --confirm mirrors to demo.")
 

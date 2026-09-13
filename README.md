@@ -3277,6 +3277,35 @@ un_carry_xs.py --flatten --confirm
    fill), and whether a demo `post_only` at `ask - tick` is ever filled by
    the demo book at all. Run it for a day; read it back with `--summary`.
 
+   **requests vs aiohttp for the order path, 2026-09-12: 4–6 ms of ~185.**
+   The claim was that `requests` adds latency. The Binance side is a
+   websocket and no HTTP library touches it; what an HTTP client can affect is
+   the BloFin REST order round trip. The SDK now has `blofin.async_client.AsyncClient`
+   (same signing, `TradingAPI` unchanged, calls awaited on the loop) and the
+   runner takes `--http aiohttp|requests`, default aiohttp.
+
+   | same host, same hour | requests (in a thread) | aiohttp |
+   |---|---|---|
+   | `--probe 10`, 4 runs each, alternated: post + cancel acks (n 80 each) | p50 184 ms, p90 200, mean 187.9 | p50 180 ms, p90 193, mean 184.2 |
+   | signed GET, interleaved per request, 150 rounds | p50 207.2 ms, p90 215.8 | p50 200.0 ms, p90 208.2 |
+   | paired per round | | median **−6.5 ms**, faster in 120 / 150 |
+
+   Of that, `requests`' own Python work (total minus `response.elapsed`) is
+   p50 1.6 ms and the thread hop about 1 ms; the rest is on the wire side
+   of `response.elapsed` and was not decomposed. Real and consistent, and
+   about 3% of the round trip: the ~180 ms is distance to the venue, and
+   the host is still the lever.
+
+   The A/B turned up two older bugs. `--probe` never read the order id from
+   the REST ack (`probe_post` was missing from the kinds that capture it), so
+   a probe cancelled only when the WS order stream beat the ack, and the
+   "post+cancel" row above it was mostly posts. And on Python 3.11
+   `asyncio.wait_for` can swallow a cancel that lands as `recv()` completes:
+   the Binance feed kept running after shutdown was requested, the process
+   hung for nine minutes and left seven probe bids resting on demo
+   (cancelled by hand). Both feeds now use `asyncio.timeout`, and a test holds
+   the probe to cancel by the ack's order id.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
