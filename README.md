@@ -3380,6 +3380,48 @@ un_carry_xs.py --flatten --confirm
    handling, not the strategy; the running eight-hour log was left on the
    old code.
 
+   **Two eight-hour runs, Tokyo, 2026-09-13.** Both on SUI-USDT at edge 7 /
+   stop 3, paper fills from the production tape, demo orders mirrored. The
+   Lightsail box ran the old code (mirror awaited inline, cold connections)
+   from 00:2x UTC; the EC2 box ran the new code from 02:1x. About six of the
+   eight hours overlap.
+
+   | | Lightsail, old code | EC2 (uvloop, queued mirror, keep-warm) |
+   |---|---|---|
+   | posts | 53 | 67 |
+   | paper fills | 6 (11%) | 13 (19%) |
+   | net per paper fill | **+6.33 ±4.51 bps** | **+3.88 ±2.75 bps** |
+   | passive (maker) exits | 67% | 69% |
+   | fills / day, bps / day on one order | 18, ~114 | 39, ~151 |
+   | post ack p50 / max | 55 / 339 ms | 36 / 68 ms |
+   | cancel ack p50 / max | 24 / 48 ms | 29 / 51 ms |
+   | keep-warm GET | — | p50 33 ms (n 1917) |
+   | follower feed lag p50 / p99 | 12 / 80 ms | 12 / 99 ms |
+   | demo fills | 8 | 0 |
+
+   Pooled: 120 posts, 19 fills (16%), **+4.65 bps per fill**, roughly ±2.4,
+   19 fills. Against the backtest's 24–33% fill rate and +2 to +7 net per
+   fill: the net is inside the band, the fill rate is under it, and the
+   daily rate on one order's notional is 40–50% of the backtest's ~290 bps
+   — the ordinary paper haircut, and with a standard error that still
+   admits zero. The sign is right on both hosts and both exits; that is
+   what 19 fills can say.
+
+   The keep-warm did what it was for: the post ack's median fell from 55 ms
+   to 36 and its maximum from 339 to 68, while cancels (always sent onto a
+   warm connection) stayed at 24–29. The extra posts on EC2 (67 vs 53 over
+   overlapping hours) are consistent with the leader feed no longer
+   stalling during its own acks, though the hours differ. The 15 rejected
+   cancels on each host were all code 102068 on `post_only` bids the demo
+   book had cancelled on arrival — the demo ask often sits under
+   production's, so a bid at production's `ask - tick` would cross it.
+   The summary now counts those separately from rejections.
+
+   Next: more fills, not more hosts. SUI alone yields 20–40 fills a day;
+   the backtest's other survivors (DOGE, AVAX, BTC) run as separate
+   processes on the same box and triple the sample, and a week gives the
+   standard error a chance to close.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
