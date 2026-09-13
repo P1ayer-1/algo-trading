@@ -3664,6 +3664,17 @@ un_carry_xs.py --flatten --confirm
    hand. A two-minute paper run on FIL with the new code saw 7 edge
    episodes: 3 flickers filtered, 2 withheld by a print, 3 posted.
 
+   All 13 runs were restarted on it one at a time, 22:52–22:55 UTC, so the
+   rule-set split is at those log names (`2026-09-13T225*`). Every old run
+   ended on its `stop` row. Two things from the shutdowns: three final
+   cancels (FIL 2, SUI 1) came back 102068 because the demo order stream
+   had sent a stale `live` row after `canceled`, overwriting the runner's
+   state, so it cancelled orders already gone; and at 22:08 UNI's close of
+   a demo orphan was itself refused 429 and is not retried, so a 0.1 short
+   stayed open until something outside these runs closed it. The demo
+   account had no positions and no resting orders after the restart, where
+   at ~22:05 it held 7 positions.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
