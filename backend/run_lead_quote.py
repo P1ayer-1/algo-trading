@@ -92,6 +92,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--summary", help="summarise this run log and exit")
     args = parser.parse_args(argv)
+    # Runs are left going as `nohup ... > lq_<INST>.out`, and redirected stdout is
+    # block-buffered: on 2026-09-13 an 8-hour SUI run's .out held nothing past
+    # startup, its paper fill lines still in the buffer. One line, one write.
+    sys.stdout.reconfigure(line_buffering=True)
 
     if args.summary:
         for line in summarise(Path(args.summary)).lines():
