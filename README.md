@@ -3306,6 +3306,28 @@ un_carry_xs.py --flatten --confirm
    (cancelled by hand). Both feeds now use `asyncio.timeout`, and a test holds
    the probe to cancel by the ack's order id.
 
+   **From Tokyo, 2026-09-13 00:10 UTC: the venue is 30 ms away.** Noah ran
+   the probe on an AWS Lightsail box in ap-northeast-1 (`--confirm --probe 10`,
+   aiohttp), same code, same demo account:
+
+   | host | leader feed lag | follower feed lag | order ack, post_only + cancel |
+   |---|---|---|---|
+   | development machine (2026-09-12) | p50 81–98 ms | p50 78–90 ms | p50 186 ms, p90 199, p99 257 (n 20) |
+   | Tokyo (2026-09-13) | **p50 1 ms**, p90 2, p99 2 (n 29) | **p50 11 ms**, p90 24, p99 77 (n 27) | **p50 30 ms**, p90 35, p99 50 (n 20) |
+
+   Plan gate `OK` (tick 1.38 bps, spread 4.14 bps at the time); 20 orders
+   sent, none filled, no rejections, nothing foreign on the account. The
+   leader lag of 1 ms says Binance's futures matching engine and this box
+   share a region and a clock; the follower's 11 ms says BloFin's is close
+   too. Six times faster on the order path and eighty on the feeds: the
+   whole 9ae backtest was run at an assumed 150 ms of feed lag, so this host
+   sits well inside the study's assumptions rather than at their edge, where
+   the development machine was. The Germany box was not measured; at these
+   numbers there is no reason to. What remains is the run that measures the
+   edge rather than the plumbing: hours of paper fills from this host,
+   compared with the backtest's 24–33% fill rate and +2 to +7 bps net per
+   fill.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
