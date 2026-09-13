@@ -347,6 +347,34 @@ def test_a_rejected_ack_keeps_the_envelope_message(tmp_path):
     assert report.problems == ["1 demo orders rejected, first: cancel code 152404 Order has been filled"]
 
 
+def test_a_cancel_refused_because_the_venue_already_cancelled_the_post_only_is_not_a_rejection(tmp_path):
+    """Both eight-hour Tokyo runs reported 15 rejected cancels: each was a post_only
+    the demo book had cancelled on arrival because it would have crossed. Counted
+    as such, not as a problem; a cancel refused for any other order still is."""
+    path = tmp_path / "run.jsonl"
+    rows = [
+        {"t": 0, "event": "start", "inst_id": "SUI-USDT"},
+        {"t": 100, "event": "demo_ack", "kind": "post", "cid": "a", "ok": True, "rtt_ms": 30.0},
+        {"t": 130, "event": "demo_order", "cid": "a", "kind": "post", "state": "canceled", "filled_size": "0"},
+        {"t": 900, "event": "demo_ack", "kind": "cancel", "cid": "a", "ok": False, "code": "102068",
+         "msg": "Cancel failed as the order has been filled, triggered, canceled or does not exist.", "rtt_ms": 25.0},
+        {"t": 2000, "event": "demo_ack", "kind": "post", "cid": "b", "ok": True, "rtt_ms": 30.0},
+        {"t": 2900, "event": "demo_ack", "kind": "cancel", "cid": "b", "ok": True, "rtt_ms": 25.0},
+        {"t": 2950, "event": "demo_order", "cid": "b", "kind": "post", "state": "canceled", "filled_size": "0"},
+        {"t": 4000, "event": "demo_ack", "kind": "post", "cid": "c", "ok": True, "rtt_ms": 30.0},
+        {"t": 4900, "event": "demo_ack", "kind": "cancel", "cid": "c", "ok": False, "code": "102068",
+         "msg": "Cancel failed", "rtt_ms": 25.0},
+        {"t": 3_600_000, "event": "stop"},
+    ]
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    report = summarise(path)
+    assert report.demo_crossed == 1
+    assert report.problems == ["1 demo orders rejected, first: cancel code 102068 Cancel failed"]
+    assert any("1 post_only cancelled on arrival" in line for line in report.lines())
+
+
 def test_the_mirror_is_queued_so_a_feed_never_waits_on_the_venue(tmp_path):
     """handle() must return without touching the broker; the worker sends in order."""
     import asyncio
@@ -361,8 +389,10 @@ def test_the_mirror_is_queued_so_a_feed_never_waits_on_the_venue(tmp_path):
         await runner.handle(runner.quoter.on_leader(1400, 1.0015))       # cancel
         assert broker.calls == []                                        # nothing sent yet
         worker = asyncio.create_task(runner.mirror_worker())
-        for _ in range(20):
-            await asyncio.sleep(0)
+        async def sent():
+            while len(broker.calls) < 2:          # two thread hops: wall time, not yields
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(sent(), 5)
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
     asyncio.run(go())

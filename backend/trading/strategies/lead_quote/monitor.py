@@ -38,6 +38,7 @@ class MonitorReport:
     warm_ms: Dict[str, float] = field(default_factory=dict)
     demo_orders: int = 0
     demo_fills: int = 0
+    demo_crossed: int = 0          # post_only bids the demo book cancelled on arrival
     problems: List[str] = field(default_factory=list)
 
     @property
@@ -67,7 +68,9 @@ class MonitorReport:
                 "{} p50 {:.0f} max {:.0f} (n {})".format(kind, st["p50"], st["max"], int(st["n"]))
                 for kind, st in self.ack_by_kind.items()))
         if self.demo_orders:
-            out.append("  demo: {} orders sent, {} reported filled".format(self.demo_orders, self.demo_fills))
+            out.append("  demo: {} orders sent, {} reported filled, {} post_only cancelled on arrival "
+                       "(would have crossed the demo book)".format(
+                           self.demo_orders, self.demo_fills, self.demo_crossed))
         for problem in self.problems:
             out.append("  PROBLEM: " + problem)
         return out
@@ -125,7 +128,18 @@ def summarise(path: Path) -> MonitorReport:
             foreign[-1].get("contracts")))
     report.demo_orders = sum(1 for e in events if e.get("event") == "demo_ack")
     report.demo_fills = sum(1 for e in events if e.get("event") == "demo_order" and e.get("state") == "filled")
-    rejected = [e for e in events if e.get("event") == "demo_ack" and not e.get("ok", True)]
+    # A post_only that would cross is cancelled by the venue on arrival, and the
+    # demo book's ask often sits under production's (it is a different book), so
+    # our later cancel of it is refused with 102068. Both eight-hour Tokyo runs
+    # (2026-09-13) showed 15 such refusals; they are the demo book disagreeing
+    # with the production price, not a fault in the order path.
+    cancelled_ok = {e.get("cid") for e in events if e.get("event") == "demo_ack"
+                    and e.get("kind") == "cancel" and e.get("ok")}
+    crossed = {e.get("cid") for e in events if e.get("event") == "demo_order" and e.get("kind") == "post"
+               and e.get("state") == "canceled" and e.get("cid") not in cancelled_ok}
+    report.demo_crossed = len(crossed)
+    rejected = [e for e in events if e.get("event") == "demo_ack" and not e.get("ok", True)
+                and not (e.get("kind") == "cancel" and e.get("cid") in crossed)]
     if rejected:
         first = rejected[0]
         report.problems.append("{} demo orders rejected, first: {} code {} {}".format(
