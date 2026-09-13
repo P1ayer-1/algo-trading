@@ -64,6 +64,7 @@ python backend\run_lead_quote.py --instruments SUI-USDT --measure-only          
 python backend\run_lead_quote.py --instruments SUI-USDT --minutes 60                 # paper quote from production feeds, sends nothing
 python backend\run_lead_quote.py --instruments SUI-USDT --minutes 60 --confirm       # ...and mirror intents to DEMO as post_only orders
 python backend\run_lead_quote.py --summary data\SUI-USDT\lead_quote\<run>.jsonl      # read a run back
+python backend\analysis\lead_quote_universe.py --top 12                           # which pairs pass the 9ae gate, by BloFin volume; sends nothing
 ```
 
 `.env` at the repo root holds `API_KEY`/`SECRET`/`PASSPHRASE` and overrides such

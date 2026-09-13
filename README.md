@@ -3431,6 +3431,68 @@ un_carry_xs.py --flatten --confirm
    processes on the same box and triple the sample, and a week gives the
    standard error a chance to close.
 
+   **Four instruments on the EC2 box, first 5.6 hours (Sunday 2026-09-13,
+   ~09:30–15:10 UTC):**
+
+   | | posts | paper fills | net per fill | maker exits |
+   |---|---|---|---|---|
+   | SUI-USDT | 23 | 4 | −3.46 ±3.73 bps | 25% |
+   | DOGE-USDT | 14 | 2 | −0.43 ±5.17 | 50% |
+   | AVAX-USDT | 15 | 0 | | |
+   | BTC-USDT | 0 | 0 | | |
+
+   A losing window, and the first: three of SUI's four fills were crossed
+   out by the leader stop or the hold limit. SUI cumulative is now 143
+   posts, 23 fills, about **+3.2 bps per fill**; all instruments pooled 172
+   posts, 25 fills, about **+2.9**, still positive and still within a
+   standard error or two of zero. Sunday afternoon is the quietest tape of
+   the week, the backtest's three days were Wednesday to Friday, and the
+   post rate shows it: 4 an hour on SUI against 8 on the weekday-overlap
+   runs. BTC never posted at all — its tick is 0.01 bps of price and its
+   BloFin book follows Binance inside the 100 ms batch, so the 7 bps gap
+   with an empty level never appeared on a quiet day. Nothing is being
+   tuned on 25 fills; the rule set in 9ae stands until there are a hundred,
+   and the decision then is on the sign of the pooled net with its standard
+   error, per instrument and together.
+
+   **More pairs: the screen (`backend\analysis\lead_quote_universe.py`,
+   2026-09-13).** Noah asked to test more pairs. The backtest needed three
+   archived days per instrument; the paper quoter needs only production
+   feeds, so the question for a new pair is whether it passes the quoter's
+   own gate and has a BloFin tape to fill from. The screen reads BloFin's
+   instrument and ticker lists and Binance's 24h futures tickers (all
+   public, nothing sent) and applies: tick between 0.3 and 2.5 bps of price
+   (above: ADA; below: BTC, whose BloFin book never lags a whole edge),
+   median spread of at least two ticks over `--samples` reads (one read is
+   not enough — LINK read 1, 2 and 6 ticks in three reads a minute apart),
+   BloFin volume of at least $1M a day (AVAX at $0.5M gave 0 fills in
+   5.6 h), a Binance USDT-M future of the same name with at least $20M a
+   day. The six 9ae instruments carry their backtest verdict as a note.
+
+   Of 464 USDT swaps, ten passed on Sunday afternoon, by BloFin volume:
+
+   | | tick bps | spread ticks (room) | BloFin $M/day | Binance $M/day |
+   |---|---|---|---|---|
+   | XRP | 0.74 | 3 (80%) | 12.2 | 422 |
+   | LINK | 0.87 | 3 (67%) | 3.8 | 89 |
+   | DOGE | 1.19 | 3 (100%) | 3.4 | 235 |
+   | SUI | 1.39 | 3 (87%) | 2.7 | 152 |
+   | FLOCK | 1.44 | 7 (100%) | 1.7 | 161 |
+   | BCH | 0.45 | 3 (87%) | 1.7 | 46 |
+   | USELESS | 0.46 | 17 (80%) | 1.1 | 63 |
+   | INJ | 1.63 | 8 (100%) | 1.1 | 39 |
+   | UAI | 2.00 | 3 (67%) | 1.1 | 59 |
+   | IOST | 1.29 | 3 (93%) | 1.0 | 46 |
+
+   Notable failures: ETH and SOL (tick 0.04 bps; SOL's spread is one tick),
+   WLD (tick 2.55), AVAX (volume), BNB (tick and volume). XRP is the one
+   to watch: four times SUI's BloFin tape at half the tick. The wide-spread
+   names (FLOCK, USELESS, INJ) are a different animal — a bid one tick
+   under an ask that sits 8–17 ticks off the bid is far from fair, and the
+   exit at Binance fair may be many ticks away; they are in the list because
+   they pass the gate, not because the study says anything about them. The
+   screen ranks; the week of `--summary` decides.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's
