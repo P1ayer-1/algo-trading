@@ -23,6 +23,14 @@ trip is logged beside the paper event it came from, and the private orders
 channel is logged as it arrives. Without a broker (the default) nothing is
 sent and the same log is written minus those rows.
 
+A reprice - the paper side cancelling an entry and posting the same side in
+one decision - is mirrored as one `amend-order` (checked on demo 2026-09-13:
+a post_only amends in place, same order id), and not at all when the new
+price rounds to the demo price the order already rests at. On 2026-09-13
+nine processes on one key hit the demo host's post limit (~4 accepted a
+second) in a market-wide move; a reprice was 10% of posts, so this trims the
+request count rather than solving the limit.
+
 Latency is the point. Every leader message carries Binance's event time and
 every follower message BloFin's `ts`; receive time minus those, sampled once
 a second, is the lag `plan_quote` gates on. The first `warmup_seconds` only
@@ -64,6 +72,8 @@ class Broker(Protocol):
 
     def cancel(self, *, inst_id: str, order_id: str) -> Dict[str, Any]: ...
 
+    def amend(self, *, inst_id: str, order_id: str, price: str) -> Dict[str, Any]: ...
+
     def positions(self) -> List[Dict[str, Any]]: ...
 
 
@@ -88,6 +98,11 @@ class BlofinQuoteBroker:
 
     def cancel(self, *, inst_id, order_id):
         return self.trading.cancelOrder(orderId=order_id, instId=inst_id)
+
+    def amend(self, *, inst_id, order_id, price):
+        # Not wrapped by the SDK's TradingAPI; the client signs it like any other POST.
+        return self.client.post("/api/v1/trade/amend-order",
+                                data={"instId": inst_id, "orderId": order_id, "newPrice": price})
 
     def positions(self):
         payload = self.client.get("/api/v1/account/positions", params={}, sign=True)
@@ -141,6 +156,7 @@ class DemoOrder:
     state: str = "sent"
     filled: bool = False
     filled_size: Decimal = Decimal("0")
+    price: str = ""                         # as sent to the venue, on its tick
 
 
 @dataclass
@@ -155,6 +171,7 @@ class LeadQuoteRunner:
     on_log: Callable[[str], None] = print
     private_feed: Optional[Callable[[], Any]] = None    # factory for the demo orders channel
     demo_tick: Optional[Decimal] = None     # the order host's tick; None = the quote's own (see _fmt)
+    amend: bool = True                      # mirror a same-decision cancel + post as one amend
     quoter: Quoter = field(init=False)
     plan: Optional[QuotePlan] = None
     leader_lags: List[float] = field(default_factory=list)
@@ -165,6 +182,9 @@ class LeadQuoteRunner:
     demo_net: Decimal = Decimal("0")        # contracts this run's demo fills have left open, signed
     warm_every_s: float = 15.0              # keep the REST connection open between orders
     _mirror_queue: "asyncio.Queue[Intent]" = field(init=False, repr=False)
+    _wake_handle: Any = field(default=None, repr=False)
+    _wake_at: Optional[int] = None
+    _wake_tasks: set = field(default_factory=set, repr=False)
     _seen_fills: int = 0
     _closed: int = 0
     _bid: float = 0.0
@@ -318,8 +338,10 @@ class LeadQuoteRunner:
                     self.log.write(event="quoter_stats", **self.quoter_stats())
 
     def quoter_stats(self) -> Dict[str, Any]:
-        return {"posts": self.quoter.posts, "gap_episodes": self.quoter.gap_episodes,
-                "gap_blocked": self.quoter.gap_blocked, "max_gap_bps": round(self.quoter.max_gap_bps, 2)}
+        q = self.quoter
+        return {"posts": q.posts, "gap_episodes": q.gap_episodes, "gap_blocked": q.gap_blocked,
+                "max_gap_bps": round(q.max_gap_bps, 2), "flickers": q.flickers,
+                "trade_cancels": q.trade_cancels, "trade_blocked": q.trade_blocked}
 
     # ---- intents ----------------------------------------------------------
 
@@ -379,12 +401,28 @@ class LeadQuoteRunner:
         Tokyo, p99 258), so the leader feed read nothing while its own post was
         in flight - exactly the moment the market was moving. One worker task
         drains the queue in order, so a post still precedes its cancel.
+
+        The paper log keeps every intent as the quoter made it; only the mirror
+        folds a cancel and a later post of the same side in this one decision
+        into an `amend` intent, in the cancel's place.
         """
+        outgoing: List[Intent] = []
+        cancel_at: Dict[int, int] = {}          # side -> index in outgoing of a cancel still foldable
         for intent in intents:
             self.log.write(event="intent", kind=intent.kind, side=intent.side,
                            price=intent.price, reason=intent.reason, inst_id=self.inst_id)
-            if self.broker is not None:
-                self._mirror_queue.put_nowait(intent)
+            if self.broker is None:
+                continue
+            index = cancel_at.pop(intent.side, None)
+            if self.amend and intent.kind == "post" and index is not None:
+                outgoing[index] = Intent("amend", intent.side, intent.price, intent.reason)
+                continue
+            if intent.kind == "cancel":
+                cancel_at[intent.side] = len(outgoing)
+            outgoing.append(intent)
+        for intent in outgoing:
+            self._mirror_queue.put_nowait(intent)
+        self._schedule_wake()
         # Paper fills the quoter recorded since the last look.
         fills = self.quoter.fills
         while self._seen_fills < len(fills):
@@ -403,6 +441,29 @@ class LeadQuoteRunner:
             self.on_log("paper exit: {} {:+.2f} bps ({}, held {:.1f}s)".format(
                 "bid" if fill.side == 1 else "ask", fill.net_bps,
                 "maker" if fill.passive_exit else "crossed", fill.hold_ms / 1000.0))
+
+    def _schedule_wake(self) -> None:
+        """Re-decide when a flicker confirmation falls due, even if no message arrives.
+
+        The quoter has no clock; with `flicker_ms` it says when it next needs
+        one (`wake_at`). The 250 ms clock task is far too coarse for a 5 ms
+        confirmation, so the loop is asked for a callback at that moment.
+        """
+        due = self.quoter.wake_at
+        if due is None or not self.quoting or (self._wake_at is not None and self._wake_at <= due):
+            return
+        if self._wake_handle is not None:
+            self._wake_handle.cancel()
+        self._wake_at = due
+        delay = max(0.001, (due - now_ms()) / 1000.0)
+        self._wake_handle = asyncio.get_running_loop().call_later(delay, self._wake)
+
+    def _wake(self) -> None:
+        self._wake_handle, self._wake_at = None, None
+        if self.quoting:
+            task = asyncio.ensure_future(self.handle(self.quoter.on_clock(now_ms())))
+            self._wake_tasks.add(task)
+            task.add_done_callback(self._wake_tasks.discard)
 
     async def mirror_worker(self) -> None:
         """Send queued intents to the demo account one at a time, in order."""
@@ -447,18 +508,36 @@ class LeadQuoteRunner:
         side = intent.side
         if intent.kind == "post":
             cid = "lq" + secrets.token_hex(6)
-            order = DemoOrder(cid, "post", side)
+            price = self._fmt(intent.price, buy=side == 1)
+            order = DemoOrder(cid, "post", side, price=price)
             self.demo_orders[cid] = order
             self.entry_order[side] = order
             await self._send("post", order, lambda: self.broker.place_limit(
                 inst_id=self.inst_id, side="buy" if side == 1 else "sell", size=self.size,
-                price=self._fmt(intent.price, buy=side == 1), client_order_id=cid, reduce_only=False))
+                price=price, client_order_id=cid, reduce_only=False))
+        elif intent.kind == "amend":
+            order = self.entry_order.get(side)
+            price = self._fmt(intent.price, buy=side == 1)
+            if order is not None and order.order_id and not order.filled and order.state not in ("canceled", "filled"):
+                if order.price == price:
+                    self.log.write(event="demo_skip", kind="amend", side=side,
+                                   reason="reprice lands on the demo price the order already rests at")
+                    return
+                if await self._send("amend", order, lambda: self.broker.amend(
+                        inst_id=self.inst_id, order_id=order.order_id, price=price)):
+                    order.price = price
+                    return
+            # Nothing live to move (unacked, filled, gone) or the amend was refused: the long way.
+            await self.mirror(Intent("cancel", side, intent.price, intent.reason))
+            await self.mirror(Intent("post", side, intent.price, intent.reason))
         elif intent.kind == "cancel":
             order = self.entry_order.get(side)
             self.entry_order[side] = None
             if order is not None and order.filled:
                 await self.flatten_orphan(order, "demo book filled what the tape did not")
-            elif order is not None and order.order_id:
+            elif order is not None and order.order_id and order.state != "canceled":
+                # A post_only the venue already cancelled on arrival needs no cancel (it
+                # would only come back 102068 and spend a request against the limit).
                 await self._send("cancel", order, lambda: self.broker.cancel(
                     inst_id=self.inst_id, order_id=order.order_id))
         elif intent.kind in ("exit_post", "exit_cross"):
@@ -487,7 +566,8 @@ class LeadQuoteRunner:
                     inst_id=self.inst_id, side=exit_side, size=self.size,
                     client_order_id=cid, reduce_only=True))
 
-    async def _send(self, kind: str, order: DemoOrder, call: Callable[[], Dict[str, Any]]) -> None:
+    async def _send(self, kind: str, order: DemoOrder, call: Callable[[], Dict[str, Any]]) -> bool:
+        """Send, time and log one order call; True when the venue accepted it."""
         started = now_ms()
         try:
             response = await self._call(call)
@@ -495,7 +575,7 @@ class LeadQuoteRunner:
             self.log.write(event="demo_ack", kind=kind, cid=order.cid, ok=False, msg=str(exc),
                            rtt_ms=now_ms() - started)
             self.on_log("demo {} failed: {}".format(kind, exc))
-            return
+            return False
         rtt = now_ms() - started
         rows = response.get("data") if isinstance(response, dict) else None
         row = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else {})
@@ -512,6 +592,7 @@ class LeadQuoteRunner:
                        ok=ok, code=code, msg=msg, rtt_ms=rtt)
         if not ok:
             self.on_log("demo {} rejected: code {} {}".format(kind, code, msg))
+        return ok
 
     async def _call(self, call: Callable[[], Any]) -> Any:
         """An async broker's call is awaited on the loop; a blocking one runs in a thread."""
@@ -555,7 +636,7 @@ class LeadQuoteRunner:
     async def run(self, *, minutes: float, measure_only: bool = False, probe_cycles: int = 0) -> QuotePlan:
         self.log.write(event="start", inst_id=self.inst_id, dry_run=self.dry_run,
                        config=self.config.__dict__, size=str(self.size),
-                       demo_tick=None if self.demo_tick is None else str(self.demo_tick))
+                       demo_tick=None if self.demo_tick is None else str(self.demo_tick), amend=self.amend)
         tasks = [asyncio.create_task(self.leader_feed()), asyncio.create_task(self.follower_feed()),
                  asyncio.create_task(self.clock())]
         if self.broker is not None:
@@ -582,9 +663,11 @@ class LeadQuoteRunner:
             await asyncio.sleep(minutes * 60.0)
         finally:
             self.quoting = False
-            for task in tasks:
+            if self._wake_handle is not None:
+                self._wake_handle.cancel()
+            for task in tasks + list(self._wake_tasks):
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, *self._wake_tasks, return_exceptions=True)
             if self.broker is not None:
                 try:
                     await self.drain_mirror()

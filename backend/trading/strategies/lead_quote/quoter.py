@@ -29,6 +29,23 @@ mirrors so the two can be compared after the fact.
 
 Floats throughout, like the feature engine: this is a description of a
 quote, not the margin arithmetic `risk.py` guards with Decimal.
+
+Two live refinements, off by default
+------------------------------------
+With `QuoteConfig` at its defaults this is exactly the backtest's rule set.
+Two switches, added 2026-09-13 and turned on by `run_lead_quote.py`, are not
+yet in `venue_lag_passive.py`, so a run with them on is a different strategy
+from the one 9ae scored and its start row says so:
+
+  flicker_ms   the leader must stay `edge` past the level this long before a
+               post. 17 of the first 137 "leader came back" cancels came
+               within 2 ms of their post: Binance quote flickers, not moves.
+  trade_watch  BloFin's book arrives in 100 ms batches but its trades push per
+               print. A sell print above a resting bid proves a better bid
+               stood there, so the bid is no longer first and is cancelled
+               without waiting for the batch; a print at or through the level
+               since the last batch also withholds a post there. Exits are
+               unchanged.
 """
 
 from __future__ import annotations
@@ -47,6 +64,8 @@ class QuoteConfig:
     hold_ms: int = 120_000
     maker_bps: float = 0.6
     taker_bps: float = 5.0
+    flicker_ms: int = 0            # flicker filter; 0 = post on the first leader tick past the edge
+    trade_watch: bool = False      # let prints cancel and withhold entries before the next book batch
 
 
 @dataclass(frozen=True)
@@ -112,7 +131,15 @@ class Quoter:
     gap_episodes: int = 0          # times the leader moved >= edge past the post price, either side
     gap_blocked: int = 0           # ...with size already at that level, so nothing was posted
     max_gap_bps: float = 0.0
+    flickers: int = 0              # edge episodes over within flicker_ms, so never posted
+    trade_cancels: int = 0         # resting entries a print showed were no longer first
+    trade_blocked: int = 0         # edge episodes whose post a print withheld at least once
+    wake_at: Optional[int] = None  # when a pending confirmation needs a decision with no event due
     _in_gap: dict = field(default_factory=lambda: {+1: False, -1: False})
+    _gap_start: dict = field(default_factory=lambda: {+1: 0, -1: 0})
+    _blocked_in_gap: dict = field(default_factory=lambda: {+1: False, -1: False})
+    _print_bid: Optional[float] = None   # highest sell-aggressor print since the last book: a bid stood there
+    _print_ask: Optional[float] = None   # lowest buy-aggressor print since the last book
 
     # ---- events ---------------------------------------------------------
 
@@ -122,6 +149,7 @@ class Quoter:
 
     def on_book(self, t: int, bid: float, ask: float) -> List[Intent]:
         self.bid, self.ask = bid, ask
+        self._print_bid = self._print_ask = None       # the book is authoritative again
         out: List[Intent] = []
         for side in (+1, -1):
             order = self.orders[side]
@@ -141,6 +169,12 @@ class Quoter:
 
     def on_trade(self, t: int, price: float, taker_side: str) -> List[Intent]:
         """`taker_side` is the aggressor, as BloFin's trades channel reports it."""
+        out: List[Intent] = []
+        watch = self.config.trade_watch
+        if watch and taker_side == "sell":
+            self._print_bid = price if self._print_bid is None else max(self._print_bid, price)
+        elif watch and taker_side == "buy":
+            self._print_ask = price if self._print_ask is None else min(self._print_ask, price)
         for side in (+1, -1):
             order = self.orders[side]
             if order is not None:
@@ -148,6 +182,12 @@ class Quoter:
                     self._fill(side, t, order.price)
                 elif side == -1 and taker_side == "buy" and price >= order.price - 1e-12:
                     self._fill(side, t, order.price)
+                elif watch and (side == +1 and taker_side == "sell" or side == -1 and taker_side == "buy"):
+                    # Not a fill, so the print was beyond the order: someone rested a better price.
+                    self.orders[side] = None
+                    self.cancels += 1
+                    self.trade_cancels += 1
+                    out.append(Intent("cancel", side, order.price, "print beyond the level"))
             pos = self.positions[side]
             if pos is not None and pos.exit_price is not None and self.bid is not None:
                 # Pessimistic queue: a print only fills an exit that is strictly
@@ -158,7 +198,8 @@ class Quoter:
                         self._close(side, t, pos.exit_price, passive=True)
                     elif side == -1 and taker_side == "sell" and price <= pos.exit_price + 1e-12:
                         self._close(side, t, pos.exit_price, passive=True)
-        return self._decide(t)
+        out.extend(self._decide(t))
+        return out
 
     def on_clock(self, t: int) -> List[Intent]:
         return self._decide(t)
@@ -167,6 +208,7 @@ class Quoter:
 
     def _decide(self, t: int) -> List[Intent]:
         out: List[Intent] = []
+        self.wake_at = None
         if self.bid is None or self.ask is None or self.leader_mid is None:
             return out
         cfg, mid = self.config, self.leader_mid
@@ -201,17 +243,32 @@ class Quoter:
             gap = side * (mid - price) / price * 1e4
             if gap > self.max_gap_bps:
                 self.max_gap_bps = gap
-            if gap >= cfg.edge_bps and not self._in_gap[side]:
+            in_gap = gap >= cfg.edge_bps
+            if in_gap and not self._in_gap[side]:
                 self.gap_episodes += 1
+                self._gap_start[side] = t
+                self._blocked_in_gap[side] = False
                 if not alone:
                     self.gap_blocked += 1
-            self._in_gap[side] = gap >= cfg.edge_bps
-            if not alone:
+            elif not in_gap and self._in_gap[side] and t - self._gap_start[side] < cfg.flicker_ms:
+                self.flickers += 1
+            self._in_gap[side] = in_gap
+            if not alone or not in_gap:
                 continue
-            if gap >= cfg.edge_bps:
-                self.orders[side] = _Order(price, t)
-                self.posts += 1
-                out.append(Intent("post", side, price, "gap {:.1f} bps".format(gap)))
+            printed = self._print_bid if side == +1 else self._print_ask
+            if printed is not None and side * (printed - price) > -1e-12:
+                # A print at or through the level since the last book: it is taken.
+                if not self._blocked_in_gap[side]:
+                    self._blocked_in_gap[side] = True
+                    self.trade_blocked += 1
+                continue
+            if t - self._gap_start[side] < cfg.flicker_ms:
+                due = self._gap_start[side] + cfg.flicker_ms
+                self.wake_at = due if self.wake_at is None else min(self.wake_at, due)
+                continue
+            self.orders[side] = _Order(price, t)
+            self.posts += 1
+            out.append(Intent("post", side, price, "gap {:.1f} bps".format(gap)))
         return out
 
     # ---- bookkeeping ----------------------------------------------------

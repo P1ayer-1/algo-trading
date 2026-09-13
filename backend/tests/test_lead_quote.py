@@ -181,6 +181,49 @@ def test_the_quoter_counts_leader_moves_past_the_edge_whether_or_not_it_can_post
     assert [i.kind for i in out] == ["post"] and (q.gap_episodes, q.gap_blocked) == (3, 1)
 
 
+def test_a_leader_flicker_inside_flicker_ms_posts_nothing_and_a_held_move_posts_when_due():
+    """17 of the first 137 "leader came back" cancels (2026-09-13) came within 2 ms of their
+    post: a Binance quote that jumped and reverted. With flicker_ms 5, book 1.000/1.003:
+    leader 1.0030 at t=10 is 9.98 bps past 1.002 - pending, due at 15. Back to 1.0015 at
+    t=12, 2 ms in: one flicker, nothing sent. Past again at t=20: due 25; the clock at 24 is
+    early, at 25 it posts 1.002. Both moves were episodes."""
+    q = Quoter(QuoteConfig(tick=TICK, flicker_ms=5))
+    q.on_book(0, 1.000, 1.003)
+    assert q.on_leader(10, 1.0030) == [] and q.wake_at == 15 and q.posts == 0
+    assert q.on_leader(12, 1.0015) == [] and q.flickers == 1 and q.wake_at is None
+    assert q.on_leader(20, 1.0030) == [] and q.wake_at == 25
+    assert q.on_clock(24) == []
+    out = q.on_clock(25)
+    assert kinds(out) == [("post", 1)] and out[0].price == pytest.approx(1.002)
+    assert (q.flickers, q.gap_episodes, q.posts) == (1, 2, 1)
+
+
+def test_a_print_beyond_a_resting_entry_cancels_it_before_the_book_batch_and_withholds_the_repost():
+    """BloFin's book comes in 100 ms batches; its prints do not. Bid resting at 1.002 (book
+    1.000/1.003, leader 1.0030). A SELL print at 1.003 means a bid stood above ours, so ours
+    is no longer first: cancelled at once, and the repost at ask - tick = 1.002 is withheld
+    because the print is through that level. The next book clears the print. The ask side
+    mirrors it: ask resting at 1.001 (leader 0.9990), a BUY print at 1.000 cancels it. With
+    trade_watch off - the backtest's rule - the same print does nothing."""
+    q = Quoter(QuoteConfig(tick=TICK, trade_watch=True))
+    q.on_book(0, 1.000, 1.003)
+    q.on_leader(1, 1.0030)
+    out = q.on_trade(50, 1.003, "sell")
+    assert [(i.kind, i.side, i.reason) for i in out] == [("cancel", 1, "print beyond the level")]
+    assert q.orders[+1] is None and (q.trade_cancels, q.trade_blocked) == (1, 1) and q.fills == []
+    assert kinds(q.on_book(100, 1.000, 1.003)) == [("post", 1)]           # the batch disagrees: post again
+
+    asks = Quoter(QuoteConfig(tick=TICK, trade_watch=True))
+    asks.on_book(0, 1.000, 1.003)
+    assert kinds(asks.on_leader(1, 0.9990)) == [("post", -1)]
+    assert kinds(asks.on_trade(50, 1.000, "buy")) == [("cancel", -1)]
+
+    backtest = quoter()
+    backtest.on_book(0, 1.000, 1.003)
+    backtest.on_leader(1, 1.0030)
+    assert backtest.on_trade(50, 1.003, "sell") == [] and backtest.orders[+1].price == pytest.approx(1.002)
+
+
 def test_the_gate_lists_every_refusal():
     """ADA-shaped: a 0.0001 tick at 0.20 is 5 bps, and a 500 ms feed is what 9ae died at."""
     plan = plan_quote("ADA-USDT", tick=0.0001, bid=0.2000, ask=0.2001,
@@ -259,6 +302,11 @@ class _Broker:
     def cancel(self, **kw):
         self.calls.append(("cancel", kw))
         return {"code": "0", "data": [{"code": "0", "msg": ""}]}
+
+    def amend(self, **kw):
+        self.calls.append(("amend", kw))       # data is one object for amend-order, per BloFin's docs
+        return {"code": "0", "msg": "Order modified",
+                "data": {"orderId": kw["order_id"], "code": "0", "msg": "Order modified"}}
 
     def positions(self):
         return []
@@ -415,6 +463,85 @@ def test_the_start_row_names_the_demo_tick(tmp_path):
     start = json.loads((tmp_path / "run.jsonl").read_text().splitlines()[0])
     assert start["event"] == "start"
     assert (start["config"]["tick"], start["demo_tick"]) == (0.0001, "0.001")
+
+
+def test_a_reprice_is_one_amend_and_a_reprice_to_the_resting_price_sends_nothing(tmp_path):
+    """Nine processes on one key hit the demo post limit (2026-09-13). Book 1.000/1.004,
+    leader 1.0130: bid posted at 1.003. The book moves to 1.004/1.006: 1.004 > 1.003 cancels
+    it, and 1.005 is alone and (1.013 - 1.005) / 1.005 = 79.6 bps past - posted in the same
+    decision. On demo that is one amend of o1 to 1.005, not a cancel and a post. At the ttl
+    (posted t=100, 10 s) the paper side cancels and reposts 1.005: the demo order already
+    rests there, so nothing is sent. The paper log keeps all five intents."""
+    import asyncio
+    broker = _Broker()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker)
+    runner.quoter.on_book(0, 1.000, 1.004)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 1.0130))
+        await runner.drain_mirror()
+        await runner.handle(runner.quoter.on_book(100, 1.004, 1.006))
+        await runner.drain_mirror()
+        await runner.handle(runner.quoter.on_clock(100 + 10_001))
+        await runner.drain_mirror()
+    asyncio.run(go())
+    log.close()
+    assert [(c[0], c[1].get("price"), c[1].get("order_id")) for c in broker.calls] == [
+        ("limit", "1.003", None), ("amend", "1.005", "o1")]
+    rows = [json.loads(l) for l in (tmp_path / "run.jsonl").read_text().splitlines()]
+    assert [r["kind"] for r in rows if r["event"] == "intent"] == ["post", "cancel", "post", "cancel", "post"]
+    assert [r["kind"] for r in rows if r["event"] == "demo_skip"] == ["amend"]
+    report = summarise(tmp_path / "run.jsonl")
+    assert (report.demo_amends, report.amend_skips) == (1, 1)
+
+
+def test_a_refused_amend_falls_back_to_cancel_and_post(tmp_path):
+    """If the venue refuses the amend (the order just filled or was cancelled on arrival),
+    the resting order must still go and the new price must still be quoted."""
+    import asyncio
+
+    class _Refusing(_Broker):
+        def amend(self, **kw):
+            self.calls.append(("amend", kw))
+            return {"code": "1", "msg": "refused (test)", "data": {"code": "1", "msg": "refused (test)"}}
+
+    broker = _Refusing()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker)
+    runner.quoter.on_book(0, 1.000, 1.004)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 1.0130))
+        await runner.drain_mirror()
+        await runner.handle(runner.quoter.on_book(100, 1.004, 1.006))
+        await runner.drain_mirror()
+    asyncio.run(go())
+    log.close()
+    assert [(c[0], c[1].get("price")) for c in broker.calls] == [
+        ("limit", "1.003"), ("amend", "1.005"), ("cancel", None), ("limit", "1.005")]
+    assert broker.calls[2][1]["order_id"] == "o1"
+
+
+def test_the_runner_wakes_itself_to_post_a_move_that_outlasted_flicker_ms(tmp_path):
+    """The runner's clock ticks every 250 ms; a 5 ms confirmation must not wait for it or
+    for the next message. One leader tick past the edge, then silence: the post must still
+    be in the log a few ms later."""
+    import asyncio
+    from trading.strategies.lead_quote.execute import now_ms
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK, flicker_ms=5), log=log, on_log=lambda s: None)
+    runner.quoting = True
+
+    async def go():
+        runner.quoter.on_book(now_ms(), 1.000, 1.003)
+        await runner.handle(runner.quoter.on_leader(now_ms(), 1.0030))
+        assert runner.quoter.posts == 0
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    log.close()
+    rows = [json.loads(l) for l in (tmp_path / "run.jsonl").read_text().splitlines()]
+    assert [(r["kind"], r["price"]) for r in rows if r["event"] == "intent"] == [("post", pytest.approx(1.002))]
 
 
 def test_a_rejected_ack_keeps_the_envelope_message(tmp_path):

@@ -3600,6 +3600,70 @@ un_carry_xs.py --flatten --confirm
    they imported; each picks the fix up at its next start, and at one
    rejection in ~9,700 none needs restarting for it.
 
+   **The demo post limit, and why posts die young (2026-09-13, ~22:00–22:45
+   UTC).** From 22:00 the demo host refused posts with 429: 28 of 460, 23
+   of them in one market-wide move at 22:06:14–18, when all nine
+   `--confirm` pairs posted at once (27 posts in two seconds, 7 accepted).
+   No second in that burst had more than 4 accepted posts on the key, and
+   no cancel was refused. That is not BloFin's documented limit (30 trading
+   requests per 10 s per user, 500 per minute per IP): a 429 at 22:00:29
+   came with 16 trade requests in the previous 10 s. Inferred from demo
+   logs only; production's limit is unmeasured. Two paper fills came from
+   posts demo refused, both losers (−34 bps together) — too few to mean
+   anything, but it is the paper score counting what one account could not
+   have posted. Sub-accounts cannot use demo.
+
+   Where the posts go: of 1,163, 14% filled, 45% were cancelled within
+   250 ms and 23% within a second, nearly all "no longer first at level".
+   In the quoter that cancel can only mean BloFin's ask moved up and a bid
+   followed above ours — the book caught up with Binance before a seller
+   came. Measured from this box (AWS ap-northeast-1d): Binance futures
+   answers a warm request in 3.4 ms; BloFin sits behind Cloudflare's Tokyo
+   edge (5.8 ms warm) and its cheapest endpoint takes 16.7 ms (demo 14.5),
+   so its servers are ~9–11 ms behind that edge and in Japan — moving the
+   host would not help. Traceroute shows nothing past AWS. BloFin's docs
+   offer no websocket order entry (websocket ops are login and subscribe
+   only), no book faster than 100 ms batches (`books`, `books5`), and
+   per-print `trades`. A 4-minute read-only shadow of the post rule on
+   five pairs (Sunday night, 11 episodes, nearly all FIL) saw 4 stale
+   levels repriced 4–38 ms after Binance's move, never taken by a taker
+   first, and 7 Binance flickers that reverted in 0–6 ms (plus two slower
+   reversals). At decision time the book snapshot was 14–355 ms old. The
+   order reaches BloFin roughly 12–15 ms after the Binance event, so it is a
+   race — lost to the 4 and 9 ms repricings, won against 22 and 38 — and 4
+   episodes decide nothing.
+
+   Three changes, on Noah's call, with what the logs say each can buy:
+
+   - **Reprices are amended on demo.** A cancel and a post of the same side
+     in one decision go out as one `amend-order` (checked on demo first: a
+     post_only amends in place and keeps its order id), and not at all when
+     the new price rounds to the demo price already resting; a cancel of an
+     order the venue already cancelled on arrival is no longer sent. Only
+     149 of 1,499 posts came in the same decision as a cancel — most
+     wasted posts are cancelled with nothing to replace them — so this
+     trims ~10% of posts, not the limit.
+   - **Flicker filter, `--flicker-ms 5`.** The leader must stay past the
+     edge 5 ms before a post; the runner schedules its own wake-up for it.
+     17 of 137 "leader came back" cancels came within 2 ms of their post
+     and 21 within 10 ms. It costs 5 ms on every race. It forgoes only
+     paper fills that landed within 5 ms of the post (5 of 219), which a
+     real order ~12 ms from BloFin could not have had.
+   - **Trade watch.** A sell print above a resting bid proves a better bid
+     stood there: the bid is cancelled at once instead of at the next book
+     batch, and a print at or through a level since the last batch
+     withholds a post there. Mirror for asks; exits unchanged.
+
+   The last two change the strategy, and `venue_lag_passive.py` does not
+   have them yet, so runs with them on are not the rule set 9ae scored:
+   `QuoteConfig` defaults stay the backtest's rules, the runner turns both
+   on, the start row logs `flicker_ms`, `trade_watch` and `amend`, and the
+   paper score should be split at the restart that picks them up.
+   `quoter_stats` now counts flickers, print cancels and print-withheld
+   episodes, and the summary prints them. Five tests walk the cases by
+   hand. A two-minute paper run on FIL with the new code saw 7 edge
+   episodes: 3 flickers filtered, 2 withheld by a print, 3 posted.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

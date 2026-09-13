@@ -49,6 +49,11 @@ class MonitorReport:
     gap_episodes: Optional[int] = None
     gap_blocked: Optional[int] = None
     max_gap_bps: Optional[float] = None
+    flickers: Optional[int] = None        # runs from 2026-09-13 on; older logs have none
+    trade_cancels: Optional[int] = None
+    trade_blocked: Optional[int] = None
+    demo_amends: int = 0
+    amend_skips: int = 0                  # reprices that rounded to the demo price already resting
     problems: List[str] = field(default_factory=list)
     path: str = ""
     started_ms: Optional[int] = None      # from the file name, which the runner stamps at start
@@ -75,6 +80,9 @@ class MonitorReport:
         if self.gap_episodes is not None:
             out.append("  leader past the edge {} times (max gap {:.1f} bps), {} with the level occupied".format(
                 self.gap_episodes, self.max_gap_bps or 0.0, self.gap_blocked))
+        if self.flickers is not None:
+            out.append("  {} leader flickers not posted, {} entries cancelled and {} episodes withheld "
+                       "by a print".format(self.flickers, self.trade_cancels, self.trade_blocked))
         for name, stats in (("leader feed lag", self.leader_lag_ms),
                             ("follower feed lag", self.follower_lag_ms),
                             ("order ack round trip", self.ack_ms),
@@ -91,6 +99,9 @@ class MonitorReport:
             out.append("  demo: {} orders sent, {} reported filled, {} post_only cancelled on arrival "
                        "(would have crossed the demo book)".format(
                            self.demo_orders, self.demo_fills, self.demo_crossed))
+        if self.demo_amends or self.amend_skips:
+            out.append("  demo reprices: {} amended in place, {} left resting (same demo price)".format(
+                self.demo_amends, self.amend_skips))
         for problem in self.problems:
             out.append("  PROBLEM: " + problem)
         return out
@@ -165,6 +176,10 @@ def summarise(path: Path) -> MonitorReport:
         report.gap_episodes = int(stats[-1].get("gap_episodes", 0))
         report.gap_blocked = int(stats[-1].get("gap_blocked", 0))
         report.max_gap_bps = float(stats[-1].get("max_gap_bps", 0.0))
+        if "flickers" in stats[-1]:
+            report.flickers = int(stats[-1]["flickers"])
+            report.trade_cancels = int(stats[-1].get("trade_cancels", 0))
+            report.trade_blocked = int(stats[-1].get("trade_blocked", 0))
     report.leader_lag_ms = _stats([e["lag_ms"] for e in events if e.get("event") == "lag" and e.get("feed") == "leader"])
     report.follower_lag_ms = _stats([e["lag_ms"] for e in events if e.get("event") == "lag" and e.get("feed") == "follower"])
     report.ack_ms = _stats([e["rtt_ms"] for e in events if e.get("event") == "demo_ack" and "rtt_ms" in e])
@@ -182,6 +197,8 @@ def summarise(path: Path) -> MonitorReport:
             foreign[-1].get("contracts")))
     report.demo_orders = sum(1 for e in events if e.get("event") == "demo_ack")
     report.demo_fills = sum(1 for e in events if e.get("event") == "demo_order" and e.get("state") == "filled")
+    report.demo_amends = sum(1 for e in events if e.get("event") == "demo_ack" and e.get("kind") == "amend" and e.get("ok"))
+    report.amend_skips = sum(1 for e in events if e.get("event") == "demo_skip" and e.get("kind") == "amend")
     # A post_only that would cross is cancelled by the venue on arrival, and the
     # demo book's ask often sits under production's (it is a different book), so
     # our later cancel of it is refused with 102068. Both eight-hour Tokyo runs

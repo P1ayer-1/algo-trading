@@ -25,7 +25,14 @@ data feed here, never an account.
                    real `post_only` order, cancel, or reduce-only exit, timing
                    each acknowledgement and logging the demo order stream.
                    The demo book is not the market; this measures latency and
-                   the venue's order handling, not the edge.
+                   the venue's order handling, not the edge. A reprice is sent
+                   as one amend (--no-amend: cancel + post, as before).
+  --flicker-ms N   the leader must stay past the edge N ms before a post
+                   (default 5; 0 = the backtest's rule). Filters Binance
+                   quote flickers at N ms of race on every post.
+  --no-trade-watch let only the 100 ms book batches cancel and withhold
+                   entries (the backtest's rule); by default a BloFin print
+                   beyond the level does it first.
   --production     is refused together with --confirm. The strategy has
                    never quoted anywhere; production is a decision for after
                    the demo log agrees with the backtest, and it is asked for
@@ -88,6 +95,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--http", choices=("aiohttp", "requests"), default="aiohttp",
                         help="REST transport for demo orders: the SDK's aiohttp AsyncClient awaited "
                              "on the loop, or its requests Client in a worker thread")
+    parser.add_argument("--flicker-ms", type=int, default=5,
+                        help="leader must stay past the edge this long before a post; 0 = backtest rule")
+    parser.add_argument("--no-trade-watch", action="store_true",
+                        help="ignore prints for entry cancels (backtest rule)")
+    parser.add_argument("--no-amend", action="store_true", help="mirror reprices as cancel + post")
     parser.add_argument("--confirm", action="store_true", help="mirror intents to the demo account")
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--summary", help="summarise this run log and exit")
@@ -133,7 +145,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                       inst_id, demo_tick, environment, prod["tickSize"], environment))
     quote = QuoteConfig(tick=tick, edge_bps=args.edge_bps, stop_bps=args.stop_bps,
                         order_ttl_ms=int(args.order_ttl_s * 1000), hold_ms=int(args.hold_s * 1000),
-                        maker_bps=float(config.MAKER_FEE_BPS), taker_bps=float(config.TAKER_FEE_BPS))
+                        maker_bps=float(config.MAKER_FEE_BPS), taker_bps=float(config.TAKER_FEE_BPS),
+                        flicker_ms=args.flicker_ms, trade_watch=not args.no_trade_watch)
     # One file per run, not per day: a dry run and a demo run an hour apart are
     # different experiments and must not be summarised as one.
     log_path = Path("data") / inst_id / "lead_quote" / (
@@ -164,7 +177,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     runner = LeadQuoteRunner(inst_id, quote, log=log, broker=broker, size=size or Decimal("1"),
                              warmup_seconds=args.warmup_seconds, private_feed=private_feed,
-                             demo_tick=demo_tick)
+                             demo_tick=demo_tick, amend=not args.no_amend)
     print("log: " + str(log_path))
     try:                       # a faster event loop where it is installed (Linux: pip install uvloop)
         import uvloop
