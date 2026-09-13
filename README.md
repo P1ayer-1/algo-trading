@@ -6,8 +6,17 @@ comfortable distance to manage risk.
 
 ## Current state (be honest with yourself here)
 
-Right now this repo does **not** trade anything. It cannot: there is no code
-path that sends an order to an exchange. What exists is:
+**The per-strategy status board is [`STRATEGIES.md`](STRATEGIES.md)**: which
+strategies exist, what the evidence says about each, what is running on
+which account and host, what data is being recorded and which strategy
+consumes it, and the open problems. It is rewritten in place; the roadmap
+below is the history it points into.
+
+The description that follows is the original one from before any order path
+existed and is kept as the architecture overview. Order paths now exist for
+the carry strategies and the lead quoter (steps 9h, 9y, 9ae); all of them are
+dry unless `--confirm` and demo unless `--production`, and nothing has run
+against production. What exists is:
 
 **A live chart viewer for BloFin**
 - BTC-USDT candles and the live ticker from BloFin (REST + public websocket).

@@ -14,7 +14,12 @@ mirrors paper intents to demo as `post_only` orders); every one is dry unless
 together. `README.md`'s roadmap is the lab notebook: each step
 records what was built, what it measured, and the verdict. Read it before
 proposing strategy work — most obvious ideas have already been run and died on
-execution cost.
+execution cost. `STRATEGIES.md` is the status board on top of it: one row per
+strategy (verdict, what is running where, next step) and one row per dataset
+(writer, live or not, which strategy consumes it). When a roadmap step changes
+a row, update `STRATEGIES.md` in the same commit; its "live?" column is a
+measurement (process list plus newest file mtime), so re-check it rather than
+carrying it forward.
 
 ## Commands
 
