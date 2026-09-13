@@ -10,6 +10,10 @@ node_modules/
 data/
 *.csv
 
+
 # Trained models. Regenerable from data/ with analysis/train_model.py, and the
 # metadata.json alongside each records exactly how (features, params, seed).
 models/
+
+# Logs and other output files. These are machine-specific and not source.
+*.out
