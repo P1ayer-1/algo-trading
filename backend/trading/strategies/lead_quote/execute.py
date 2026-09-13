@@ -39,7 +39,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
@@ -154,6 +154,7 @@ class LeadQuoteRunner:
     stall_timeout_s: float = 30.0
     on_log: Callable[[str], None] = print
     private_feed: Optional[Callable[[], Any]] = None    # factory for the demo orders channel
+    demo_tick: Optional[Decimal] = None     # the order host's tick; None = the quote's own (see _fmt)
     quoter: Quoter = field(init=False)
     plan: Optional[QuotePlan] = None
     leader_lags: List[float] = field(default_factory=list)
@@ -451,7 +452,7 @@ class LeadQuoteRunner:
             self.entry_order[side] = order
             await self._send("post", order, lambda: self.broker.place_limit(
                 inst_id=self.inst_id, side="buy" if side == 1 else "sell", size=self.size,
-                price=self._fmt(intent.price), client_order_id=cid, reduce_only=False))
+                price=self._fmt(intent.price, buy=side == 1), client_order_id=cid, reduce_only=False))
         elif intent.kind == "cancel":
             order = self.entry_order.get(side)
             self.entry_order[side] = None
@@ -479,7 +480,8 @@ class LeadQuoteRunner:
             if intent.kind == "exit_post":
                 await self._send("exit_post", order, lambda: self.broker.place_limit(
                     inst_id=self.inst_id, side=exit_side, size=self.size,
-                    price=self._fmt(intent.price), client_order_id=cid, reduce_only=True))
+                    price=self._fmt(intent.price, buy=exit_side == "buy"), client_order_id=cid,
+                    reduce_only=True))
             else:
                 await self._send("exit_cross", order, lambda: self.broker.place_market(
                     inst_id=self.inst_id, side=exit_side, size=self.size,
@@ -517,9 +519,26 @@ class LeadQuoteRunner:
             return await call()
         return await asyncio.to_thread(call)
 
-    def _fmt(self, price: Optional[float]) -> str:
+    def _fmt(self, price: Optional[float], *, buy: bool) -> str:
+        """An order price on the ORDER host's grid, never more aggressive than the quote.
+
+        The quote lives on production's tick; the demo host does not always
+        list the same one. On 2026-09-13 it had FIL-USDT at 0.001 against
+        production's 0.0001, and 36 of the first 44 demo posts came back
+        102016 "Precision does not match" - every one off the coarser grid.
+        So the float is first snapped to the quote's own tick (it arrives as
+        0.9873999999999999), then taken to the demo tick in Decimal: a buy
+        down, a sell up. Rounding to nearest could put a post_only a whole
+        demo tick closer to the touch than the paper order it mirrors. Where
+        the two ticks differ, a demo order can sit behind the paper one, so
+        its fills say even less about the paper fills than usual; its ack
+        still times the order path.
+        """
         tick = Decimal(str(self.config.tick))
-        return str((Decimal(str(price)) / tick).quantize(Decimal(1)) * tick)
+        quoted = (Decimal(str(price)) / tick).quantize(Decimal(1)) * tick
+        grid = self.demo_tick or tick
+        steps = (quoted / grid).to_integral_value(rounding=ROUND_FLOOR if buy else ROUND_CEILING)
+        return str(steps * grid)
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -535,7 +554,8 @@ class LeadQuoteRunner:
 
     async def run(self, *, minutes: float, measure_only: bool = False, probe_cycles: int = 0) -> QuotePlan:
         self.log.write(event="start", inst_id=self.inst_id, dry_run=self.dry_run,
-                       config=self.config.__dict__, size=str(self.size))
+                       config=self.config.__dict__, size=str(self.size),
+                       demo_tick=None if self.demo_tick is None else str(self.demo_tick))
         tasks = [asyncio.create_task(self.leader_feed()), asyncio.create_task(self.follower_feed()),
                  asyncio.create_task(self.clock())]
         if self.broker is not None:
@@ -637,7 +657,7 @@ class LeadQuoteRunner:
             self.on_log("probe: no follower quote yet")
             return
         for _ in range(cycles):
-            price = self._fmt(self._bid * 0.95)
+            price = self._fmt(self._bid * 0.95, buy=True)
             cid = "lq" + secrets.token_hex(6)
             order = DemoOrder(cid, "probe", 1)
             self.demo_orders[cid] = order

@@ -3538,6 +3538,43 @@ un_carry_xs.py --flatten --confirm
      BTC run did not open (the carry book's, on the shared demo account);
      the run reported it and left it alone, as designed after 2026-09-12.
 
+   **The demo host's tick is not always production's (FIL-USDT,
+   2026-09-13).** The FIL run started under `--confirm` at 21:15 UTC had
+   36 of its first 44 demo posts rejected, code 102016 "Precision does not
+   match: 0.001". The runner priced demo orders on the tick it read from
+   production, and the two hosts' instrument lists disagree. Read from both
+   at 21:40 UTC for the nine pairs running with `--confirm`:
+
+   | | XRP | DOGE | LINK | SUI | LTC | BCH | FIL | UNI | INJ |
+   |---|---|---|---|---|---|---|---|---|---|
+   | production tick | 0.0001 | 0.00001 | 0.001 | 0.0001 | 0.01 | 0.01 | 0.0001 | 0.001 | 0.001 |
+   | demo tick | 0.0001 | 0.00001 | 0.001 | 0.0001 | 0.01 | 0.01 | **0.001** | 0.001 | 0.001 |
+
+   FIL is the only mismatch, and the 8 posts demo accepted were exactly the
+   8 whose price happened to be a multiple of 0.001. Lot sizes differ too
+   (demo lists XRP and DOGE at 0.1 against production's 0.01, LINK at 1
+   against 0.1), but that was already harmless: the runner has always
+   taken its order size from the demo host, and none of those logs has a
+   size rejection. The paper side never saw demo, so FIL's paper fills
+   stand; its demo mirror measured eight acks and nothing else.
+
+   The runner now reads the tick from the demo host along with the size,
+   logs it in the `start` row as `demo_tick`, prints a line when it differs
+   from production's, and prices every demo order on it. The paper price
+   is snapped to production's grid first (it arrives as
+   0.9873999999999999), then a buy is rounded down and a sell up to demo's,
+   so a `post_only` entry or maker exit never sits closer to the touch than
+   the quote it mirrors; rounding to nearest would have sent some of them a
+   whole demo tick more aggressive. The quoter itself stays on production's
+   tick. On FIL one demo tick is ~10 bps of price, so a demo bid can now
+   rest 0 to ~9 bps behind the paper bid: FIL's demo acks still time the
+   order path, but its demo fills and its count of `post_only` cancelled on
+   arrival are not comparable with the other pairs'. A test walks a
+   FIL-shaped bid, its exit and an ask by hand; it fails on the old code,
+   on nearest-rounding to the demo tick, and on rounding the exit the wrong
+   way. The FIL process was left running on the old code; it picks this up
+   only when restarted, and the other eight need nothing.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

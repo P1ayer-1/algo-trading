@@ -111,14 +111,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     base_url = PRODUCTION_BASE_URL if args.production else DEMO_BASE_URL
     environment = "production" if args.production else "demo"
     # Tick size from PRODUCTION: it is the price grid the paper quote lives on.
-    # Size rules from the host the demo orders go to, as the carry book learned.
+    # Size rules AND the tick orders are priced on from the host the demo orders
+    # go to, as the carry book learned: demo listed FIL-USDT at 0.001 against
+    # production's 0.0001 (2026-09-13) and rejected most posts for precision.
     prod = instrument_rules(inst_id, PRODUCTION_BASE_URL)
     tick = float(prod["tickSize"])
     size = args.size
+    demo_tick = None
     if args.confirm:
         rules = instrument_rules(inst_id, base_url)
+        demo_tick = Decimal(str(rules["tickSize"]))
         if size is None:
             size = Decimal(str(rules.get("minSize") or rules.get("lotSize") or "1"))
+        if demo_tick != Decimal(str(prod["tickSize"])):
+            print("{} tick is {} on {} but {} on production: the paper quote stays on production's "
+                  "grid, orders are rounded to {}'s (bids down, asks up) and can sit behind it".format(
+                      inst_id, demo_tick, environment, prod["tickSize"], environment))
     quote = QuoteConfig(tick=tick, edge_bps=args.edge_bps, stop_bps=args.stop_bps,
                         order_ttl_ms=int(args.order_ttl_s * 1000), hold_ms=int(args.hold_s * 1000),
                         maker_bps=float(config.MAKER_FEE_BPS), taker_bps=float(config.TAKER_FEE_BPS))
@@ -151,7 +159,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("dry run: paper fills from the production tape, nothing sent. --confirm mirrors to demo.")
 
     runner = LeadQuoteRunner(inst_id, quote, log=log, broker=broker, size=size or Decimal("1"),
-                             warmup_seconds=args.warmup_seconds, private_feed=private_feed)
+                             warmup_seconds=args.warmup_seconds, private_feed=private_feed,
+                             demo_tick=demo_tick)
     print("log: " + str(log_path))
     try:                       # a faster event loop where it is installed (Linux: pip install uvloop)
         import uvloop

@@ -349,6 +349,74 @@ def test_a_demo_entry_known_filled_before_the_paper_cancel_is_flattened_not_canc
     assert broker.calls[1][1]["reduce_only"] is True
 
 
+def test_demo_orders_are_priced_on_the_demo_hosts_tick_and_never_closer_to_the_touch(tmp_path):
+    """FIL-USDT, Tokyo, 2026-09-13: production's tick is 0.0001 and the demo host's 0.001, and
+    36 of the first 44 demo posts came back 102016 "Precision does not match: 0.001" - every
+    one whose price was off the 0.001 grid. The paper quote stays on production's grid; the
+    demo order goes on demo's, a buy rounded down and a sell up. Rounding to nearest would
+    have sent all three orders here one demo tick more aggressive than the quote.
+
+    Long: book 0.9850 / 0.9868, leader 0.9875 is (0.9875 - 0.9867) / 0.9867 = 8.11 bps past
+    ask - tick. Paper bid 0.9867 -> demo buy 0.986 (nearest 0.987). The demo book fills it,
+    the leader eases to 0.9872 (still above the bid, so it rests), the tape sells at 0.9867:
+    exit at max(entry + tick 0.9868, fair 0.9872) = 0.9872 -> demo sell 0.988 (nearest 0.987).
+    Short: book 0.9853 / 0.9870, leader 0.9845 is (0.9854 - 0.9845) / 0.9854 = 9.13 bps under
+    bid + tick. Paper ask 0.9854 -> demo sell 0.986 (nearest 0.985)."""
+    import asyncio
+    from decimal import Decimal
+    fil = QuoteConfig(tick=0.0001)
+
+    long_broker, short_broker = _Broker(), _Broker()
+    long_log, short_log = RunLog(tmp_path / "long.jsonl"), RunLog(tmp_path / "short.jsonl")
+    long_ = LeadQuoteRunner("FIL-USDT", fil, log=long_log, broker=long_broker, demo_tick=Decimal("0.001"))
+    short = LeadQuoteRunner("FIL-USDT", fil, log=short_log, broker=short_broker, demo_tick=Decimal("0.001"))
+    long_.quoter.on_book(0, 0.9850, 0.9868)
+    short.quoter.on_book(0, 0.9853, 0.9870)
+
+    async def go():
+        await long_.handle(long_.quoter.on_leader(1, 0.9875))            # post bid
+        await long_.drain_mirror()
+        cid = long_broker.calls[0][1]["client_order_id"]
+        await long_.on_demo_row({"clientOrderId": cid, "orderId": "o1", "state": "filled", "filledSize": "1"})
+        assert long_.quoter.on_leader(2, 0.9872) == []
+        await long_.handle(long_.quoter.on_trade(500, 0.9867, "sell"))  # paper fill -> exit_post
+        await long_.drain_mirror()
+        await short.handle(short.quoter.on_leader(1, 0.9845))            # post ask
+        await short.drain_mirror()
+    asyncio.run(go())
+    long_log.close()
+    short_log.close()
+
+    paper = [json.loads(l) for l in (tmp_path / "long.jsonl").read_text().splitlines()
+             if json.loads(l)["event"] == "intent"]
+    assert [(r["kind"], r["price"]) for r in paper] == [("post", pytest.approx(0.9867)),
+                                                        ("exit_post", pytest.approx(0.9872))]
+    assert [(c[0], c[1]["side"], c[1]["price"], c[1]["reduce_only"]) for c in long_broker.calls] == [
+        ("limit", "buy", "0.986", False), ("limit", "sell", "0.988", True)]
+    assert [(c[0], c[1]["side"], c[1]["price"]) for c in short_broker.calls] == [("limit", "sell", "0.986")]
+
+
+def test_the_start_row_names_the_demo_tick(tmp_path):
+    """A FIL demo log read back later must say its orders were on a coarser grid than its
+    paper quote, or its demo fills read as if they had rested at the paper price. Feeds are
+    stubbed; with no quote the plan refuses and the run ends at once."""
+    import asyncio
+    from decimal import Decimal
+
+    async def silent():
+        return None
+
+    runner = LeadQuoteRunner("FIL-USDT", QuoteConfig(tick=0.0001), log=RunLog(tmp_path / "run.jsonl"),
+                             broker=_Broker(), warmup_seconds=0, demo_tick=Decimal("0.001"),
+                             on_log=lambda line: None)
+    runner.leader_feed = runner.follower_feed = silent
+    asyncio.run(runner.run(minutes=0, measure_only=True))
+    runner.log.close()
+    start = json.loads((tmp_path / "run.jsonl").read_text().splitlines()[0])
+    assert start["event"] == "start"
+    assert (start["config"]["tick"], start["demo_tick"]) == (0.0001, "0.001")
+
+
 def test_a_rejected_ack_keeps_the_envelope_message(tmp_path):
     """The Tokyo run's summary printed a rejection with an empty message because the
     text sat on the response envelope, not the data row."""
