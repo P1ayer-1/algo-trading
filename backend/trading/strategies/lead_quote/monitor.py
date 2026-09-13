@@ -114,8 +114,14 @@ def summarise(path: Path) -> MonitorReport:
     report.demo_fills = sum(1 for e in events if e.get("event") == "demo_order" and e.get("state") == "filled")
     rejected = [e for e in events if e.get("event") == "demo_ack" and not e.get("ok", True)]
     if rejected:
-        report.problems.append("{} demo orders rejected, first: {}".format(
-            len(rejected), rejected[0].get("msg", "?")))
+        first = rejected[0]
+        report.problems.append("{} demo orders rejected, first: {} code {} {}".format(
+            len(rejected), first.get("kind", "?"), first.get("code", "?"),
+            first.get("msg") or "(no message)"))
+    orphans = [e for e in events if e.get("event") == "demo_orphan"]
+    if orphans:
+        report.problems.append("{} demo entries filled after the paper side cancelled (closed reduce-only)".format(
+            len(orphans)))
     open_paper = [e for e in events if e.get("event") == "paper_fill"]
     if len(open_paper) > len(fills):
         report.problems.append("{} paper fills never closed (run ended holding)".format(

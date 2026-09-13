@@ -258,6 +258,87 @@ def test_the_runner_mirrors_a_post_and_cancels_it_rather_than_exiting_an_unfille
     assert runner.dry_run is False
 
 
+def test_a_demo_entry_that_fills_after_the_paper_cancel_is_closed_at_once(tmp_path):
+    """Tokyo, 2026-09-13: the demo book filled a bid the tape never did, the paper
+    side cancelled, the cancel was rejected as already filled, and one contract sat
+    open for the rest of the run. Now: post, cancel (nothing filled yet), the fill
+    notice arrives late - and a reduce-only market sell of exactly the filled size
+    goes out, with a demo_orphan row in the log."""
+    import asyncio
+    from decimal import Decimal
+    broker = _Broker()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK, order_ttl_ms=1000), log=log, broker=broker)
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 1.0030))       # post at 1.002
+        await runner.handle(runner.quoter.on_leader(1400, 1.0015))    # leader back -> cancel
+        cid = broker.calls[0][1]["client_order_id"]
+        await runner.on_demo_row({"clientOrderId": cid, "orderId": "o1", "state": "filled",
+                                  "filledSize": "1"})
+    asyncio.run(go())
+    log.close()
+    assert [c[0] for c in broker.calls] == ["limit", "cancel", "market"]
+    close = broker.calls[2][1]
+    assert close["side"] == "sell" and close["size"] == Decimal("1") and close["reduce_only"] is True
+    assert runner.demo_net == Decimal("1")      # the flatten's own fill notice has not arrived yet
+    rows = [json.loads(l) for l in (tmp_path / "run.jsonl").read_text().splitlines()]
+    assert [r for r in rows if r["event"] == "demo_orphan"][0]["contracts"] == "1"
+    report = summarise(tmp_path / "run.jsonl")
+    assert any("filled after the paper side cancelled" in p for p in report.problems)
+
+
+def test_a_demo_entry_known_filled_before_the_paper_cancel_is_flattened_not_cancelled(tmp_path):
+    """The other ordering: the fill notice arrives while the demo entry is still the
+    live one, then the paper side cancels. No cancel is sent (it would be rejected);
+    a reduce-only close is."""
+    import asyncio
+    broker = _Broker()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK, order_ttl_ms=1000), log=log, broker=broker)
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 1.0030))
+        cid = broker.calls[0][1]["client_order_id"]
+        await runner.on_demo_row({"clientOrderId": cid, "orderId": "o1", "state": "filled",
+                                  "filledSize": "1"})
+        assert [c[0] for c in broker.calls] == ["limit"]          # live entry: nothing to close yet
+        await runner.handle(runner.quoter.on_leader(1400, 1.0015))
+    asyncio.run(go())
+    log.close()
+    assert [c[0] for c in broker.calls] == ["limit", "market"]
+    assert broker.calls[1][1]["reduce_only"] is True
+
+
+def test_a_rejected_ack_keeps_the_envelope_message(tmp_path):
+    """The Tokyo run's summary printed a rejection with an empty message because the
+    text sat on the response envelope, not the data row."""
+    import asyncio
+
+    class _Rejecting(_Broker):
+        def cancel(self, **kw):
+            self.calls.append(("cancel", kw))
+            return {"code": "152404", "msg": "Order has been filled", "data": []}
+
+    broker = _Rejecting()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK, order_ttl_ms=1000), log=log, broker=broker)
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 1.0030))
+        await runner.handle(runner.quoter.on_leader(1400, 1.0015))
+    asyncio.run(go())
+    log.close()
+    report = summarise(tmp_path / "run.jsonl")
+    assert report.problems == ["1 demo orders rejected, first: cancel code 152404 Order has been filled"]
+
+
 def test_shutdown_closes_only_what_this_run_filled_and_leaves_a_foreign_position_alone(tmp_path):
     """The first live run closed a 1,677-contract demo short it never opened. Now: the
     account holds -1677, this run's own fills net +3, and the only order sent is a

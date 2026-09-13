@@ -3328,6 +3328,22 @@ un_carry_xs.py --flatten --confirm
    compared with the backtest's 24–33% fill rate and +2 to +7 bps net per
    fill.
 
+   **The eight-hour Tokyo run, first 70 minutes (2026-09-13):** 9 posts,
+   1 paper fill at **+8.45 bps** (maker exit), feed lags unchanged, live
+   order acks p50 29 ms; 17 demo orders, 1 filled, 1 rejected. The fill and
+   the rejection are one story: the demo book filled a bid the production
+   tape never did, the paper side cancelled, and the cancel came back
+   rejected as already filled — leaving one contract open on demo for the
+   rest of the run (shutdown would have closed it, being this run's own
+   fill). The runner now closes such an orphan reduce-only the moment the
+   fill is known, in either ordering of fill notice and cancel, logs it as
+   `demo_orphan`, and the summary counts them; a rejected ack also keeps
+   the message from the response envelope, which is where BloFin puts it
+   (the summary had printed an empty one). Three tests hold the three
+   cases. A demo fill without a paper fill is expected, not a signal: the
+   demo book is thinner and stiller than production, so a resting bid one
+   tick under its ask is hit more often there than it would be for real.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

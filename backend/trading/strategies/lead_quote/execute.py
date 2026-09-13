@@ -140,6 +140,7 @@ class DemoOrder:
     order_id: str = ""
     state: str = "sent"
     filled: bool = False
+    filled_size: Decimal = Decimal("0")
 
 
 @dataclass
@@ -289,23 +290,7 @@ class LeadQuoteRunner:
                 backoff = 1.0
                 async for message in client.listen():
                     for row in (message.get("data") or []) if isinstance(message, dict) else []:
-                        cid = str(row.get("clientOrderId") or "")
-                        order = self.demo_orders.get(cid)
-                        if order is None:
-                            continue
-                        order.state = str(row.get("state") or "")
-                        order.order_id = str(row.get("orderId") or order.order_id)
-                        if order.state == "filled" and not order.filled:
-                            order.filled = True
-                            try:
-                                filled = Decimal(str(row.get("filledSize") or "0"))
-                            except Exception:          # noqa: BLE001
-                                filled = Decimal("0")
-                            sign = order.side if order.kind == "post" else -order.side
-                            self.demo_net += sign * filled
-                        self.log.write(event="demo_order", cid=cid, kind=order.kind, side=order.side,
-                                       state=order.state, filled_size=row.get("filledSize"),
-                                       avg_price=row.get("averagePrice"), fee=row.get("fee"))
+                        await self.on_demo_row(row)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:                       # noqa: BLE001
@@ -325,6 +310,54 @@ class LeadQuoteRunner:
                 await self.handle(self.quoter.on_clock(now_ms()))
 
     # ---- intents ----------------------------------------------------------
+
+    async def on_demo_row(self, row: Dict[str, Any]) -> None:
+        """One row of the demo account's order stream: track fills, and close an orphan.
+
+        An orphan is a demo entry the demo book filled after the paper side had
+        already cancelled it: the venue's fill notice can land after the cancel
+        was sent (the cancel is then rejected as already filled), or after the
+        paper order timed out with no tape fill. The first Tokyo run (2026-09-13)
+        made one and held it for the rest of the run; now it is closed
+        reduce-only the moment the fill is known, and the log says so.
+        """
+        cid = str(row.get("clientOrderId") or "")
+        order = self.demo_orders.get(cid)
+        if order is None:
+            return
+        order.state = str(row.get("state") or "")
+        order.order_id = str(row.get("orderId") or order.order_id)
+        if order.state == "filled" and not order.filled:
+            order.filled = True
+            try:
+                filled = Decimal(str(row.get("filledSize") or "0"))
+            except Exception:          # noqa: BLE001
+                filled = Decimal("0")
+            order.filled_size = filled
+            sign = order.side if order.kind == "post" else -order.side
+            self.demo_net += sign * filled
+        self.log.write(event="demo_order", cid=cid, kind=order.kind, side=order.side,
+                       state=order.state, filled_size=row.get("filledSize"),
+                       avg_price=row.get("averagePrice"), fee=row.get("fee"))
+        if (order.state == "filled" and order.kind == "post"
+                and self.entry_order.get(order.side) is not order):
+            await self.flatten_orphan(order, "filled after the paper side cancelled")
+
+    async def flatten_orphan(self, entry: DemoOrder, reason: str) -> None:
+        """Close one demo entry the paper quoter is no longer holding, reduce-only."""
+        if entry.filled_size <= 0:
+            return
+        cid = "lq" + secrets.token_hex(6)
+        order = DemoOrder(cid, "flatten", entry.side)
+        self.demo_orders[cid] = order
+        self.log.write(event="demo_orphan", cid=entry.cid, side=entry.side,
+                       contracts=str(entry.filled_size), reason=reason)
+        self.on_log("demo entry {} {}: {}; closing reduce_only".format(
+            "bid" if entry.side == 1 else "ask", entry.cid, reason))
+        await self._send("flatten", order, lambda: self.broker.place_market(
+            inst_id=self.inst_id, side="sell" if entry.side == 1 else "buy", size=entry.filled_size,
+            client_order_id=cid, reduce_only=True))
+        entry.filled_size = Decimal("0")
 
     async def handle(self, intents: List[Intent]) -> None:
         for intent in intents:
@@ -364,10 +397,12 @@ class LeadQuoteRunner:
                 price=self._fmt(intent.price), client_order_id=cid, reduce_only=False))
         elif intent.kind == "cancel":
             order = self.entry_order.get(side)
-            if order is not None and order.order_id and not order.filled:
+            self.entry_order[side] = None
+            if order is not None and order.filled:
+                await self.flatten_orphan(order, "demo book filled what the tape did not")
+            elif order is not None and order.order_id:
                 await self._send("cancel", order, lambda: self.broker.cancel(
                     inst_id=self.inst_id, order_id=order.order_id))
-            self.entry_order[side] = None
         elif intent.kind in ("exit_post", "exit_cross"):
             entry = self.entry_order.get(side)
             self.entry_order[side] = None
@@ -405,14 +440,19 @@ class LeadQuoteRunner:
         rtt = now_ms() - started
         rows = response.get("data") if isinstance(response, dict) else None
         row = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else {})
-        code = str((row or {}).get("code", response.get("code", "0") if isinstance(response, dict) else "0"))
-        ok = code in ("0", "")
+        top_code = str(response.get("code", "0")) if isinstance(response, dict) else "0"
+        code = str((row or {}).get("code") or top_code)
+        ok = code in ("0", "") and top_code in ("0", "")
+        # A rejection's text may sit on the row or on the envelope; keep whichever speaks.
+        msg = str((row or {}).get("msg") or (response.get("msg", "") if isinstance(response, dict) else ""))
         # probe_post was missing here until 2026-09-12: a probe then cancelled only
         # when the WS order stream beat the REST ack, so the probe mostly timed posts.
         if kind in ("post", "probe_post", "exit_post", "exit_cross", "flatten") and ok:
             order.order_id = str((row or {}).get("orderId") or "")
         self.log.write(event="demo_ack", kind=kind, cid=order.cid, order_id=order.order_id,
-                       ok=ok, msg=str((row or {}).get("msg", "")), rtt_ms=rtt)
+                       ok=ok, code=code, msg=msg, rtt_ms=rtt)
+        if not ok:
+            self.on_log("demo {} rejected: code {} {}".format(kind, code, msg))
 
     async def _call(self, call: Callable[[], Any]) -> Any:
         """An async broker's call is awaited on the loop; a blocking one runs in a thread."""
