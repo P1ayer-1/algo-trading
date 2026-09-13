@@ -34,6 +34,8 @@ class MonitorReport:
     follower_lag_ms: Dict[str, float] = field(default_factory=dict)
     ack_ms: Dict[str, float] = field(default_factory=dict)
     probe_ms: Dict[str, float] = field(default_factory=dict)
+    ack_by_kind: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    warm_ms: Dict[str, float] = field(default_factory=dict)
     demo_orders: int = 0
     demo_fills: int = 0
     problems: List[str] = field(default_factory=list)
@@ -55,10 +57,15 @@ class MonitorReport:
         for name, stats in (("leader feed lag", self.leader_lag_ms),
                             ("follower feed lag", self.follower_lag_ms),
                             ("order ack round trip", self.ack_ms),
-                            ("probe post+cancel round trip", self.probe_ms)):
+                            ("probe post+cancel round trip", self.probe_ms),
+                            ("keep-warm GET round trip", self.warm_ms)):
             if stats:
                 out.append("  {}: p50 {:.0f} ms, p90 {:.0f}, p99 {:.0f} (n {})".format(
                     name, stats["p50"], stats["p90"], stats["p99"], int(stats["n"])))
+        if self.ack_by_kind:
+            out.append("  ack by kind: " + ", ".join(
+                "{} p50 {:.0f} max {:.0f} (n {})".format(kind, st["p50"], st["max"], int(st["n"]))
+                for kind, st in self.ack_by_kind.items()))
         if self.demo_orders:
             out.append("  demo: {} orders sent, {} reported filled".format(self.demo_orders, self.demo_fills))
         for problem in self.problems:
@@ -71,7 +78,7 @@ def _stats(values: List[float]) -> Dict[str, float]:
         return {}
     arr = np.array(values, dtype=float)
     return {"p50": float(np.percentile(arr, 50)), "p90": float(np.percentile(arr, 90)),
-            "p99": float(np.percentile(arr, 99)), "n": float(len(arr))}
+            "p99": float(np.percentile(arr, 99)), "max": float(arr.max()), "n": float(len(arr))}
 
 
 def summarise(path: Path) -> MonitorReport:
@@ -106,6 +113,12 @@ def summarise(path: Path) -> MonitorReport:
     report.ack_ms = _stats([e["rtt_ms"] for e in events if e.get("event") == "demo_ack" and "rtt_ms" in e])
     report.probe_ms = _stats([e["rtt_ms"] for e in events if e.get("event") == "demo_ack"
                               and e.get("kind") in ("probe_post", "probe_cancel") and e.get("ok")])
+    kinds: Dict[str, List[float]] = {}
+    for e in events:
+        if e.get("event") == "demo_ack" and "rtt_ms" in e and not str(e.get("kind", "")).startswith("probe"):
+            kinds.setdefault(str(e.get("kind")), []).append(e["rtt_ms"])
+    report.ack_by_kind = {k: _stats(v) for k, v in kinds.items()}
+    report.warm_ms = _stats([e["rtt_ms"] for e in events if e.get("event") == "warm" and e.get("ok")])
     foreign = [e for e in events if e.get("event") == "foreign_position"]
     if foreign:
         report.problems.append("account held {} contracts this run did not open (left alone)".format(

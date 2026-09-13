@@ -162,6 +162,8 @@ class LeadQuoteRunner:
     entry_order: Dict[int, Optional[DemoOrder]] = field(default_factory=lambda: {+1: None, -1: None})
     quoting: bool = False
     demo_net: Decimal = Decimal("0")        # contracts this run's demo fills have left open, signed
+    warm_every_s: float = 15.0              # keep the REST connection open between orders
+    _mirror_queue: "asyncio.Queue[Intent]" = field(init=False, repr=False)
     _seen_fills: int = 0
     _closed: int = 0
     _bid: float = 0.0
@@ -169,6 +171,7 @@ class LeadQuoteRunner:
 
     def __post_init__(self) -> None:
         self.quoter = Quoter(self.config)
+        self._mirror_queue = asyncio.Queue()
 
     @property
     def dry_run(self) -> bool:
@@ -360,11 +363,19 @@ class LeadQuoteRunner:
         entry.filled_size = Decimal("0")
 
     async def handle(self, intents: List[Intent]) -> None:
+        """Log intents, queue them for the demo mirror, and book paper fills.
+
+        The mirror is queued, not awaited: until 2026-09-13 the feed task that
+        produced an intent awaited the venue's acknowledgement (p50 28 ms from
+        Tokyo, p99 258), so the leader feed read nothing while its own post was
+        in flight - exactly the moment the market was moving. One worker task
+        drains the queue in order, so a post still precedes its cancel.
+        """
         for intent in intents:
             self.log.write(event="intent", kind=intent.kind, side=intent.side,
                            price=intent.price, reason=intent.reason, inst_id=self.inst_id)
             if self.broker is not None:
-                await self.mirror(intent)
+                self._mirror_queue.put_nowait(intent)
         # Paper fills the quoter recorded since the last look.
         fills = self.quoter.fills
         while self._seen_fills < len(fills):
@@ -384,8 +395,46 @@ class LeadQuoteRunner:
                 "bid" if fill.side == 1 else "ask", fill.net_bps,
                 "maker" if fill.passive_exit else "crossed", fill.hold_ms / 1000.0))
 
+    async def mirror_worker(self) -> None:
+        """Send queued intents to the demo account one at a time, in order."""
+        while True:
+            intent = await self._mirror_queue.get()
+            try:
+                await self.mirror(intent)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                        # noqa: BLE001
+                self.on_log("demo mirror {} failed: {}".format(intent.kind, exc))
+
+    async def drain_mirror(self) -> None:
+        """Send whatever is still queued (shutdown, and the tests)."""
+        while not self._mirror_queue.empty():
+            await self.mirror(self._mirror_queue.get_nowait())
+
+    async def keep_warm(self) -> None:
+        """A cheap signed GET every `warm_every_s`, so an order never pays a TLS handshake.
+
+        Posts come minutes apart; an idle HTTPS connection is closed by the
+        venue or the client long before that, and the next order then opens
+        one - two or three round trips before the request even leaves. The
+        ping's own round trip is logged as `warm`, which is also a running
+        measure of the REST path without an order in it.
+        """
+        if self.broker is None:
+            return
+        while True:
+            await asyncio.sleep(self.warm_every_s)
+            started = now_ms()
+            try:
+                await self._call(self.broker.positions)
+                self.log.write(event="warm", rtt_ms=now_ms() - started, ok=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                        # noqa: BLE001
+                self.log.write(event="warm", rtt_ms=now_ms() - started, ok=False, msg=str(exc))
+
     async def mirror(self, intent: Intent) -> None:
-        """One demo order per intent, acknowledged and timed. Never blocks the feeds."""
+        """One demo order per intent, acknowledged and timed."""
         side = intent.side
         if intent.kind == "post":
             cid = "lq" + secrets.token_hex(6)
@@ -483,6 +532,8 @@ class LeadQuoteRunner:
                  asyncio.create_task(self.clock())]
         if self.broker is not None:
             tasks.append(asyncio.create_task(self.demo_orders_feed()))
+            tasks.append(asyncio.create_task(self.mirror_worker()))
+            tasks.append(asyncio.create_task(self.keep_warm()))
         try:
             await asyncio.sleep(self.warmup_seconds)
             self.plan = self.measured_plan()
@@ -508,6 +559,7 @@ class LeadQuoteRunner:
             await asyncio.gather(*tasks, return_exceptions=True)
             if self.broker is not None:
                 try:
+                    await self.drain_mirror()
                     await self.shutdown_demo()
                 finally:
                     aclose = getattr(self.broker, "aclose", None)

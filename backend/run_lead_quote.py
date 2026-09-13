@@ -153,6 +153,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     runner = LeadQuoteRunner(inst_id, quote, log=log, broker=broker, size=size or Decimal("1"),
                              warmup_seconds=args.warmup_seconds, private_feed=private_feed)
     print("log: " + str(log_path))
+    try:                       # a faster event loop where it is installed (Linux: pip install uvloop)
+        import uvloop
+        uvloop.install()
+        print("event loop: uvloop")
+    except ImportError:
+        print("event loop: asyncio default (pip install uvloop on Linux for a faster one)")
     try:
         plan = asyncio.run(runner.run(minutes=args.minutes, measure_only=args.measure_only,
                                       probe_cycles=args.probe))

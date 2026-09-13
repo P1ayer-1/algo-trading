@@ -3344,6 +3344,42 @@ un_carry_xs.py --flatten --confirm
    demo book is thinner and stiller than production, so a resting bid one
    tick under its ask is hit more often there than it would be for real.
 
+   **Where the remaining latency is, and what was done about it
+   (2026-09-13).** Noah asked what could still be cut. Reading the code
+   against the Tokyo log:
+
+   - *The feed that produced an intent awaited the venue's acknowledgement.*
+     `handle()` called `mirror()` inline, so the leader task read nothing
+     for the 28 ms (p99 258) a post took to acknowledge - the moment the
+     market was moving. Intents now go on a queue drained in order by one
+     worker task; a feed never waits on REST. A test pins `handle()` to
+     touch no broker.
+   - *Most posts paid a TLS handshake.* Orders came ~3.6 minutes apart and
+     an idle HTTPS connection does not live that long, so the p90 67 / p99
+     258 tail is consistent with connection setup before the request even
+     left (inferred from the spacing, not decomposed). A `keep_warm` task
+     now sends a signed positions GET every 15 s on the same session and
+     logs its round trip as `warm`; the summary reports it beside the acks,
+     and splits acks by kind (post / cancel / exit), so a cold-post tail is
+     visible rather than averaged away.
+   - *The follower book is batched by the venue.* The SDK documents the
+     `books` channel as incremental updates every 100 ms, so the 11-12 ms
+     follower lag is receipt minus the batch stamp and the book itself is up
+     to 100 ms behind the matching engine. Nothing on our side cuts that;
+     `trades` push per print and are what the paper fill uses.
+   - *The spikes in the follower lag* (28-44 ms among 11s in Noah's excerpt)
+     are on the Python side or the host: a Lightsail instance is burstable
+     with shared cores. Two cheap levers remain untested: `uvloop` (the
+     runner installs it when present) and a dedicated-core EC2 instance in
+     the same region.
+   - Not available as far as known: order entry over the private websocket
+     (BloFin documents REST only; unverified beyond the SDK) and anything
+     below the venue's own matching latency.
+
+   These change the demo mirror's timing and the paper quoter's feed
+   handling, not the strategy; the running eight-hour log was left on the
+   old code.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

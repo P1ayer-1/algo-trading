@@ -247,7 +247,9 @@ def test_the_runner_mirrors_a_post_and_cancels_it_rather_than_exiting_an_unfille
 
     async def go():
         await runner.handle(runner.quoter.on_leader(1, 1.0030))       # post
+        await runner.drain_mirror()
         await runner.handle(runner.quoter.on_trade(500, 1.002, "sell"))  # paper fill -> exit_post
+        await runner.drain_mirror()
     asyncio.run(go())
     kinds_sent = [c[0] for c in broker.calls]
     assert kinds_sent == ["limit", "cancel"]
@@ -274,7 +276,9 @@ def test_a_demo_entry_that_fills_after_the_paper_cancel_is_closed_at_once(tmp_pa
 
     async def go():
         await runner.handle(runner.quoter.on_leader(1, 1.0030))       # post at 1.002
+        await runner.drain_mirror()
         await runner.handle(runner.quoter.on_leader(1400, 1.0015))    # leader back -> cancel
+        await runner.drain_mirror()
         cid = broker.calls[0][1]["client_order_id"]
         await runner.on_demo_row({"clientOrderId": cid, "orderId": "o1", "state": "filled",
                                   "filledSize": "1"})
@@ -303,11 +307,13 @@ def test_a_demo_entry_known_filled_before_the_paper_cancel_is_flattened_not_canc
 
     async def go():
         await runner.handle(runner.quoter.on_leader(1, 1.0030))
+        await runner.drain_mirror()
         cid = broker.calls[0][1]["client_order_id"]
         await runner.on_demo_row({"clientOrderId": cid, "orderId": "o1", "state": "filled",
                                   "filledSize": "1"})
         assert [c[0] for c in broker.calls] == ["limit"]          # live entry: nothing to close yet
         await runner.handle(runner.quoter.on_leader(1400, 1.0015))
+        await runner.drain_mirror()
     asyncio.run(go())
     log.close()
     assert [c[0] for c in broker.calls] == ["limit", "market"]
@@ -332,11 +338,36 @@ def test_a_rejected_ack_keeps_the_envelope_message(tmp_path):
 
     async def go():
         await runner.handle(runner.quoter.on_leader(1, 1.0030))
+        await runner.drain_mirror()
         await runner.handle(runner.quoter.on_leader(1400, 1.0015))
+        await runner.drain_mirror()
     asyncio.run(go())
     log.close()
     report = summarise(tmp_path / "run.jsonl")
     assert report.problems == ["1 demo orders rejected, first: cancel code 152404 Order has been filled"]
+
+
+def test_the_mirror_is_queued_so_a_feed_never_waits_on_the_venue(tmp_path):
+    """handle() must return without touching the broker; the worker sends in order."""
+    import asyncio
+    broker = _Broker()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker)
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 1.0030))          # post
+        await runner.handle(runner.quoter.on_leader(1400, 1.0015))       # cancel
+        assert broker.calls == []                                        # nothing sent yet
+        worker = asyncio.create_task(runner.mirror_worker())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+    asyncio.run(go())
+    log.close()
+    assert [c[0] for c in broker.calls] == ["limit", "cancel"]
 
 
 def test_shutdown_closes_only_what_this_run_filled_and_leaves_a_foreign_position_alone(tmp_path):
