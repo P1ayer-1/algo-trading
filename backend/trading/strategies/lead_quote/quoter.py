@@ -105,6 +105,14 @@ class Quoter:
     fills: List[Fill] = field(default_factory=list)
     posts: int = 0
     cancels: int = 0
+    # Why a pair posts nothing: XRP, the biggest BloFin tape that passes the
+    # screen, posted 0 times in its first 1.55 h (2026-09-13). Either the
+    # leader never got `edge` past the post price (the BloFin book keeps up),
+    # or it did and the level was occupied. These tell the two apart.
+    gap_episodes: int = 0          # times the leader moved >= edge past the post price, either side
+    gap_blocked: int = 0           # ...with size already at that level, so nothing was posted
+    max_gap_bps: float = 0.0
+    _in_gap: dict = field(default_factory=lambda: {+1: False, -1: False})
 
     # ---- events ---------------------------------------------------------
 
@@ -190,9 +198,16 @@ class Quoter:
                 continue
             price = self.ask - cfg.tick if side == +1 else self.bid + cfg.tick
             alone = (price > self.bid + 1e-12) if side == +1 else (price < self.ask - 1e-12)
+            gap = side * (mid - price) / price * 1e4
+            if gap > self.max_gap_bps:
+                self.max_gap_bps = gap
+            if gap >= cfg.edge_bps and not self._in_gap[side]:
+                self.gap_episodes += 1
+                if not alone:
+                    self.gap_blocked += 1
+            self._in_gap[side] = gap >= cfg.edge_bps
             if not alone:
                 continue
-            gap = side * (mid - price) / price * 1e4
             if gap >= cfg.edge_bps:
                 self.orders[side] = _Order(price, t)
                 self.posts += 1

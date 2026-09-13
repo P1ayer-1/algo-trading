@@ -39,6 +39,11 @@ futures with the dash removed (`1000BONK-USDT` -> `1000BONKUSDT`; checked
 2026-09-13: 39 of 488 unmatched, all BTC-USD-style coin-margined or not on
 Binance). Unmatched ones are listed as such, never guessed.
 
+The demo host lists 87 of production's 488 swaps (2026-09-13), so a pair
+can be paper-quoted from production feeds but not mirrored with `--confirm`
+(FLOCK and USELESS started and exited before writing a log that day). The
+`demo` column says which, and the launch lines are split accordingly.
+
 The six instruments 9ae studied carry their backtest verdict as a note, so
 a screen pass is never read as overriding a measured loss (LTC: zero fills;
 ADA: negative every day).
@@ -64,6 +69,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from trading.strategies.lead_quote.plan import MAX_TICK_BPS  # noqa: E402
 
 BLOFIN = "https://openapi.blofin.com"
+BLOFIN_DEMO = "https://demo-trading-openapi.blofin.com"   # lists 87 of production's 488 swaps (2026-09-13)
 BINANCE = "https://fapi.binance.com"
 MIN_TICK_BPS = 0.3        # below this the BloFin book never lags a whole edge behind (BTC, 2026-09-13)
 MIN_SPREAD_TICKS = 2.0    # a bid at ask - tick must be above the bid
@@ -92,6 +98,7 @@ class Candidate:
     binance_usd: Optional[float]
     binance_trades: Optional[int]
     room_share: float = float("nan")     # share of ticker samples with spread >= MIN_SPREAD_TICKS
+    on_demo: bool = False                # listed on the demo host, so --confirm can mirror it
     note: str = ""
     reasons: List[str] = field(default_factory=list)
 
@@ -118,7 +125,8 @@ def screen(instruments: List[Dict[str, Any]], tickers: List[Dict[str, Any]],
            binance: List[Dict[str, Any]], *, min_blofin_usd: float, min_binance_usd: float,
            max_tick_bps: float = MAX_TICK_BPS, min_tick_bps: float = MIN_TICK_BPS,
            min_spread_ticks: float = MIN_SPREAD_TICKS,
-           spreads: Optional[Dict[str, List[float]]] = None) -> List[Candidate]:
+           spreads: Optional[Dict[str, List[float]]] = None,
+           demo_instruments: Optional[List[Dict[str, Any]]] = None) -> List[Candidate]:
     """Every USDT swap with its numbers and every reason it fails, sorted by BloFin volume.
 
     `spreads` (instrument -> sampled ask - bid values) overrides the single
@@ -127,6 +135,7 @@ def screen(instruments: List[Dict[str, Any]], tickers: List[Dict[str, Any]],
     """
     rules = {row["instId"]: row for row in instruments}
     leader = {row["symbol"]: row for row in binance}
+    demo = {row.get("instId") for row in (demo_instruments or [])}
     out: List[Candidate] = []
     for ticker in tickers:
         inst_id = str(ticker.get("instId") or "")
@@ -157,7 +166,7 @@ def screen(instruments: List[Dict[str, Any]], tickers: List[Dict[str, Any]],
             blofin_usd=vol * contract * price,
             binance_usd=float(lead["quoteVolume"]) if lead else None,
             binance_trades=int(lead["count"]) if lead and "count" in lead else None,
-            room_share=room, note=STUDIED.get(inst_id, ""))
+            room_share=room, on_demo=inst_id in demo, note=STUDIED.get(inst_id, ""))
         if str(rule.get("state", "live")) != "live":
             cand.reasons.append("not live on BloFin")
         if cand.tick_bps > max_tick_bps:
@@ -182,8 +191,8 @@ def screen(instruments: List[Dict[str, Any]], tickers: List[Dict[str, Any]],
 
 
 def lines(cands: List[Candidate], *, show_all: bool, top: int) -> List[str]:
-    out = ["{:<16} {:>10} {:>8} {:>9} {:>7} {:>5} {:>10} {:>10} {:>8}  {}".format(
-        "instrument", "price", "tick bps", "sprd bps", "ticks", "room", "BloFin $M", "Binance$M", "trades/d", "")]
+    out = ["{:<16} {:>10} {:>8} {:>9} {:>7} {:>5} {:>10} {:>10} {:>8} {:>5}  {}".format(
+        "instrument", "price", "tick bps", "sprd bps", "ticks", "room", "BloFin $M", "Binance$M", "trades/d", "demo", "")]
     shown = 0
     for cand in cands:
         if not show_all and not cand.ok:
@@ -194,11 +203,11 @@ def lines(cands: List[Candidate], *, show_all: bool, top: int) -> List[str]:
         verdict = "OK" if cand.ok else "; ".join(cand.reasons)
         if cand.note:
             verdict += "  [" + cand.note + "]"
-        out.append("{:<16} {:>10.5g} {:>8.2f} {:>9.2f} {:>7.1f} {:>4.0%} {:>10.2f} {:>10.0f} {:>8}  {}".format(
+        out.append("{:<16} {:>10.5g} {:>8.2f} {:>9.2f} {:>7.1f} {:>4.0%} {:>10.2f} {:>10.0f} {:>8} {:>5}  {}".format(
             cand.inst_id, cand.price, cand.tick_bps, cand.spread_bps, cand.spread_ticks, cand.room_share,
             cand.blofin_usd / 1e6, (cand.binance_usd or 0) / 1e6,
             "{:,}".format(cand.binance_trades // 1000) + "k" if cand.binance_trades else "-",
-            verdict))
+            "yes" if cand.on_demo else "no", verdict))
     return out
 
 
@@ -215,6 +224,7 @@ def main(argv: Optional[List[str]] = None, fetch: Callable[[str], Any] = _fetch,
     args = parser.parse_args(argv)
 
     instruments = fetch(BLOFIN + "/api/v1/market/instruments?instType=SWAP").get("data") or []
+    demo_instruments = fetch(BLOFIN_DEMO + "/api/v1/market/instruments?instType=SWAP").get("data") or []
     snapshots = []
     for i in range(max(1, args.samples)):
         if i:
@@ -223,7 +233,8 @@ def main(argv: Optional[List[str]] = None, fetch: Callable[[str], Any] = _fetch,
     tickers = snapshots[-1]
     binance = fetch(BINANCE + "/fapi/v1/ticker/24hr")
     cands = screen(instruments, tickers, binance, min_blofin_usd=args.min_blofin_usd,
-                   min_binance_usd=args.min_binance_usd, spreads=spread_samples(snapshots))
+                   min_binance_usd=args.min_binance_usd, spreads=spread_samples(snapshots),
+                   demo_instruments=demo_instruments)
     passing = [c for c in cands if c.ok]
     print("{} USDT swaps on BloFin, {} pass the 9ae gate at tick {:.1f}-{:.1f} bps, median spread >= {:.0f} ticks "
           "over {} samples, BloFin >= ${:.1f}M/day, Binance >= ${:.0f}M/day".format(
@@ -232,12 +243,19 @@ def main(argv: Optional[List[str]] = None, fetch: Callable[[str], Any] = _fetch,
     print()
     for line in lines(cands, show_all=args.all, top=args.top if not args.all else len(cands)):
         print(line)
-    chosen = [c.inst_id for c in passing[:args.top]]
-    if chosen:
+    chosen = passing[:args.top]
+    mirrored = [c.inst_id for c in chosen if c.on_demo]
+    paper_only = [c.inst_id for c in chosen if not c.on_demo]
+    if mirrored:
         print()
-        print("one process each, on the Tokyo box (sends nothing without --confirm):")
+        print("one process each, on the Tokyo box; these are on the demo host, so --confirm mirrors them:")
         print("for i in {}; do nohup python backend/run_lead_quote.py --instruments $i --minutes {} --confirm "
-              "> lq_$i.out 2>&1 & done".format(" ".join(chosen), args.minutes))
+              "> lq_$i.out 2>&1 & done".format(" ".join(mirrored), args.minutes))
+    if paper_only:
+        print()
+        print("these are NOT on the demo host (--confirm would exit before writing a log); paper only:")
+        print("for i in {}; do nohup python backend/run_lead_quote.py --instruments $i --minutes {} "
+              "> lq_$i.out 2>&1 & done".format(" ".join(paper_only), args.minutes))
     print()
     print("volume is one 24h window and spread a few seconds of samples; the tick gate is the only hard one. "
           "A pair is evidence only after a week of --summary.")

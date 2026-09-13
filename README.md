@@ -3493,6 +3493,51 @@ un_carry_xs.py --flatten --confirm
    they pass the gate, not because the study says anything about them. The
    screen ranks; the week of `--summary` decides.
 
+   **Sunday evening, 2026-09-13 (~21:00 UTC): the first hours of the wider
+   set, and the SUI/DOGE runs to 7.5 h.**
+
+   | | hours | posts | paper fills | net per fill | maker exits |
+   |---|---|---|---|---|---|
+   | SUI-USDT (13:31 run) | 7.5 | 29 | 6 | −1.82 ±2.96 | 33% |
+   | DOGE-USDT | 7.5 | 16 | 2 | −0.43 ±5.17 | 50% |
+   | BTC-USDT | 6.0 | 0 | 0 | | |
+   | INJ-USDT | 1.55 | 14 | 3 | −3.04 ±5.22 | 33% |
+   | LINK-USDT | 1.55 | 4 | 1 | −5.60 | 0% |
+   | BCH-USDT | 1.55 | 1 | 0 | | |
+   | XRP-USDT | 1.55 | **0** | 0 | | |
+   | FLOCK, USELESS | | | | no log: not on the demo host | |
+
+   Cumulative, every run so far: **SUI 149 posts, 25 fills, +3.1 bps per
+   fill; all instruments 199 posts, 31 fills, +2.0 bps per fill**, standard
+   error about 2. The two Saturday-night-to-Sunday-morning runs were the
+   positive ones (+4.65 on 19 fills); every window since, Sunday afternoon
+   and evening, has been negative, and the maker-exit share has fallen from
+   two thirds to one third — the fills that do happen are the ones the
+   market keeps running through. 31 fills cannot separate "small positive
+   edge, noisy" from "zero edge and a good first sample"; the weekday
+   sessions the backtest was measured on are what will.
+
+   Three things learned about the machinery rather than the edge:
+
+   - **XRP posted zero times** from the biggest BloFin tape on the list,
+     and the runner could not say why: the leader never 7 bps past the
+     post price, or it was and the level was occupied. `Quoter` now counts
+     episodes of the leader beyond the edge and how many began with the
+     level occupied, the runner writes them every minute (`quoter_stats`,
+     so a killed run still has its last minute), and the summary prints
+     "leader past the edge N times (max gap X), M with the level occupied".
+     A test walks the three cases by hand.
+   - **The demo host lists 87 of production's 488 swaps.** FLOCK and
+     USELESS passed the screen, started under `--confirm`, and exited on the
+     demo instrument lookup before a log existed. The screen now fetches the
+     demo list, shows a `demo` column, and prints two launch lines: one with
+     `--confirm` for pairs the demo mirror can take, one paper-only for the
+     rest (FLOCK, USELESS, UAI tonight; LTC and FIL joined the passing list
+     as the evening's spreads widened).
+   - **A BTC position of 15.7 contracts** sat on the demo account that the
+     BTC run did not open (the carry book's, on the shared demo account);
+     the run reported it and left it alone, as designed after 2026-09-12.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

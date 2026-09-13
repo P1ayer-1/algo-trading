@@ -155,6 +155,32 @@ def test_the_ask_side_mirrors_the_bid_side():
     assert exit_intents[0].price == pytest.approx(0.999)   # min(entry - tick = 1.000, floor(fair) = 0.999)
 
 
+def test_the_quoter_counts_leader_moves_past_the_edge_whether_or_not_it_can_post():
+    """XRP posted 0 times in 1.55 h (2026-09-13). Two explanations, told apart here: the
+    leader never got 7 bps past ask - tick, or it did while the level was occupied.
+    Book 1.000/1.003, leader 1.0030: gap (1.003 - 1.002)/1.002 = 9.98 bps, alone -> one
+    episode, posted. Leader 1.0015: cancelled, flag clears. Leader 1.0025 is 4.99 bps over
+    1.002, under the edge on both sides (the ask side's price is bid + tick). The bid then
+    rises to 1.002 (one-tick spread) - both sides still 4.99 bps - and the leader returns to
+    1.0030: a second episode, blocked because ask - tick == bid; the ask side's gap is 0.
+    Leader 1.0025 clears it; book back to 1.000/1.003; leader 1.0030: a third, posted."""
+    q = Quoter(QuoteConfig(tick=TICK))
+    q.on_book(0, 1.000, 1.003)
+    out = q.on_leader(1, 1.0030)
+    assert [i.kind for i in out] == ["post"]
+    assert (q.gap_episodes, q.gap_blocked) == (1, 0) and q.max_gap_bps == pytest.approx(9.98, abs=0.01)
+    out = q.on_leader(2, 1.0015)
+    assert [i.kind for i in out] == ["cancel"]
+    assert q.on_leader(3, 1.0025) == [] and q.gap_episodes == 1
+    assert q.on_book(4, 1.002, 1.003) == [] and q.gap_episodes == 1
+    out = q.on_leader(5, 1.0030)
+    assert out == [] and (q.gap_episodes, q.gap_blocked) == (2, 1) and q.posts == 1
+    assert q.on_leader(6, 1.0025) == []
+    assert q.on_book(7, 1.000, 1.003) == []
+    out = q.on_leader(8, 1.0030)
+    assert [i.kind for i in out] == ["post"] and (q.gap_episodes, q.gap_blocked) == (3, 1)
+
+
 def test_the_gate_lists_every_refusal():
     """ADA-shaped: a 0.0001 tick at 0.20 is 5 bps, and a 500 ms feed is what 9ae died at."""
     plan = plan_quote("ADA-USDT", tick=0.0001, bid=0.2000, ask=0.2001,
@@ -198,6 +224,7 @@ def test_the_monitor_reads_a_run_back(tmp_path):
         {"t": 6000, "event": "paper_fill", "side": -1, "entry": 1.0},
         {"t": 7000, "event": "paper_fill_closed", "side": -1, "net_bps": -2.0, "passive_exit": False},
         {"t": 7200, "event": "demo_ack", "kind": "post", "cid": "x", "ok": False, "msg": "152002", "rtt_ms": 90.0},
+        {"t": 3_599_000, "event": "quoter_stats", "posts": 2, "gap_episodes": 5, "gap_blocked": 3, "max_gap_bps": 11.4},
         {"t": 3_600_000, "event": "stop"},
     ]
     with path.open("w", encoding="utf-8") as handle:
@@ -211,6 +238,8 @@ def test_the_monitor_reads_a_run_back(tmp_path):
     assert report.leader_lag_ms["p50"] == pytest.approx(150.0)
     assert report.fills_per_day == pytest.approx(48.0)
     assert report.problems and "rejected" in report.problems[0]
+    assert (report.gap_episodes, report.gap_blocked, report.max_gap_bps) == (5, 3, 11.4)
+    assert "  leader past the edge 5 times (max gap 11.4 bps), 3 with the level occupied" in report.lines()
 
 
 class _Broker:

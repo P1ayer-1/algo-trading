@@ -307,10 +307,18 @@ class LeadQuoteRunner:
             backoff = min(backoff * 2, 30.0)
 
     async def clock(self) -> None:
+        last_stats = now_ms()
         while True:
             await asyncio.sleep(0.25)
             if self.quoting:
                 await self.handle(self.quoter.on_clock(now_ms()))
+                if now_ms() - last_stats >= 60_000:     # survives a kill: the last row is the total
+                    last_stats = now_ms()
+                    self.log.write(event="quoter_stats", **self.quoter_stats())
+
+    def quoter_stats(self) -> Dict[str, Any]:
+        return {"posts": self.quoter.posts, "gap_episodes": self.quoter.gap_episodes,
+                "gap_blocked": self.quoter.gap_blocked, "max_gap_bps": round(self.quoter.max_gap_bps, 2)}
 
     # ---- intents ----------------------------------------------------------
 
@@ -565,6 +573,7 @@ class LeadQuoteRunner:
                     aclose = getattr(self.broker, "aclose", None)
                     if aclose is not None:
                         await aclose()
+            self.log.write(event="quoter_stats", **self.quoter_stats())
             self.log.write(event="stop", posts=self.quoter.posts, cancels=self.quoter.cancels,
                            paper_fills=len(self.quoter.fills), closed=len(self.quoter.closed_fills()))
         return self.plan

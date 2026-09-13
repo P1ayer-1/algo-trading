@@ -93,8 +93,20 @@ def test_studied_instruments_carry_their_9ae_verdict():
                                            if l.startswith("ADA")][0]
 
 
+def test_the_demo_column_splits_the_launch_lines():
+    """FLOCK and USELESS passed the screen and then exited under --confirm without a log:
+    the demo host does not list them. A pair not on demo is paper-only."""
+    demo = [{"instId": "SUI-USDT"}]
+    got = {c.inst_id: c for c in screen(INSTRUMENTS, TICKERS, BINANCE, min_blofin_usd=1e6,
+                                        min_binance_usd=2e7, demo_instruments=demo)}
+    assert got["SUI-USDT"].on_demo is True and got["ADA-USDT"].on_demo is False
+    row = [l for l in lines(list(got.values()), show_all=True, top=9) if l.startswith("ADA")][0]
+    assert "  no  " in row
+
+
 def test_main_prints_the_command_line_for_the_passing_set(capsys):
     payloads = {
+        "https://demo-trading-openapi.blofin.com/api/v1/market/instruments?instType=SWAP": {"data": []},
         "https://openapi.blofin.com/api/v1/market/instruments?instType=SWAP": {"data": INSTRUMENTS},
         "https://openapi.blofin.com/api/v1/market/tickers?instType=SWAP": {"data": TICKERS},
         "https://fapi.binance.com/fapi/v1/ticker/24hr": BINANCE,
@@ -105,5 +117,7 @@ def test_main_prints_the_command_line_for_the_passing_set(capsys):
     assert slept == [0.5, 0.5]
     out = capsys.readouterr().out
     assert "1 pass the 9ae gate" in out and "over 3 samples" in out
-    assert "--instruments $i --minutes 1440 --confirm" in out and "for i in SUI-USDT;" in out
+    assert "NOT on the demo host" in out and "for i in SUI-USDT; do" in out
+    launch = out.split("paper only:\n")[1].splitlines()[0]
+    assert launch.startswith("for i in SUI-USDT; do") and "--confirm" not in launch
     assert MIN_SPREAD_TICKS == 2.0

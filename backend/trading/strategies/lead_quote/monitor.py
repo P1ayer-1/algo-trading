@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -39,6 +39,9 @@ class MonitorReport:
     demo_orders: int = 0
     demo_fills: int = 0
     demo_crossed: int = 0          # post_only bids the demo book cancelled on arrival
+    gap_episodes: Optional[int] = None
+    gap_blocked: Optional[int] = None
+    max_gap_bps: Optional[float] = None
     problems: List[str] = field(default_factory=list)
 
     @property
@@ -55,6 +58,9 @@ class MonitorReport:
         if self.paper_fills:
             out.append("  net {:+.2f} ±{:.2f} bps per paper fill, passive exits {:.0%}".format(
                 self.net_bps, self.net_se, self.passive_share))
+        if self.gap_episodes is not None:
+            out.append("  leader past the edge {} times (max gap {:.1f} bps), {} with the level occupied".format(
+                self.gap_episodes, self.max_gap_bps or 0.0, self.gap_blocked))
         for name, stats in (("leader feed lag", self.leader_lag_ms),
                             ("follower feed lag", self.follower_lag_ms),
                             ("order ack round trip", self.ack_ms),
@@ -111,6 +117,11 @@ def summarise(path: Path) -> MonitorReport:
         report.net_se = float(nets.std(ddof=1) / np.sqrt(len(nets))) if len(nets) > 1 else float("nan")
         report.passive_share = float(np.mean([1.0 if e.get("passive_exit") else 0.0 for e in fills]))
         report.fills_per_day = len(fills) / max(report.hours, 1e-9) * 24.0
+    stats = [e for e in events if e.get("event") == "quoter_stats"]
+    if stats:
+        report.gap_episodes = int(stats[-1].get("gap_episodes", 0))
+        report.gap_blocked = int(stats[-1].get("gap_blocked", 0))
+        report.max_gap_bps = float(stats[-1].get("max_gap_bps", 0.0))
     report.leader_lag_ms = _stats([e["lag_ms"] for e in events if e.get("event") == "lag" and e.get("feed") == "leader"])
     report.follower_lag_ms = _stats([e["lag_ms"] for e in events if e.get("event") == "lag" and e.get("feed") == "follower"])
     report.ack_ms = _stats([e["rtt_ms"] for e in events if e.get("event") == "demo_ack" and "rtt_ms" in e])
