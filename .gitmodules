@@ -1,0 +1,3 @@
+[submodule "blofin-sdk-python"]
+	path = blofin-sdk-python
+	url = https://github.com/P1ayer-1/blofin-sdk-python.git
