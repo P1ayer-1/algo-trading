@@ -718,3 +718,297 @@ def test_the_runner_without_a_broker_sends_nothing_and_is_a_dry_run(tmp_path):
     log.close()
     rows = [json.loads(l) for l in (tmp_path / "run.jsonl").read_text().splitlines()]
     assert [r["event"] for r in rows] == ["intent"] and rows[0]["kind"] == "post"
+
+
+def _demo_rows(path):
+    return [json.loads(l) for l in Path(path).read_text().splitlines()]
+
+
+def test_a_live_row_after_canceled_does_not_revive_the_order_and_shutdown_cancels_nothing(tmp_path):
+    """FIL-USDT, Tokyo, 2026-09-13, cid lqf954433497e4: post acked, `live`, `live`, cancel
+    acked ok, `canceled` - then `live` again 39 ms and 390 ms later. The runner took the last
+    row at its word, so at shutdown it cancelled the order a second time and the venue refused
+    102068. Replayed in that order: the order stays canceled, the two late rows are logged as
+    received and marked stale, shutdown sends nothing, and the run reports no problem."""
+    import asyncio
+    broker = _Broker()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("FIL-USDT", QuoteConfig(tick=TICK), log=log, broker=broker)
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 1.0030))        # post at 1.002
+        await runner.drain_mirror()
+        row = {"clientOrderId": broker.calls[0][1]["client_order_id"], "orderId": "o1", "filledSize": "0"}
+        await runner.on_demo_row(dict(row, state="live", averagePrice="0.000000000000000000"))
+        await runner.on_demo_row(dict(row, state="live", averagePrice="0"))
+        await runner.handle(runner.quoter.on_leader(1400, 1.0015))     # leader back -> cancel, acked ok
+        await runner.drain_mirror()
+        await runner.on_demo_row(dict(row, state="canceled", averagePrice="0.000000000000000000"))
+        await runner.on_demo_row(dict(row, state="live", averagePrice="0"))
+        await runner.on_demo_row(dict(row, state="live", averagePrice="0"))
+        await runner.shutdown_demo()
+        return row["clientOrderId"]
+    cid = asyncio.run(go())
+    log.close()
+    assert runner.demo_orders[cid].state == "canceled"
+    assert [c[0] for c in broker.calls] == ["limit", "cancel"]
+    assert [(r["state"], r.get("stale", False)) for r in _demo_rows(tmp_path / "run.jsonl")
+            if r["event"] == "demo_order"] == [
+        ("live", False), ("live", False), ("canceled", False), ("live", True), ("live", True)]
+    assert summarise(tmp_path / "run.jsonl").problems == []
+
+
+def test_a_late_live_row_sends_no_amend_and_no_cancel_to_an_order_the_venue_already_cancelled(tmp_path):
+    """The amend path and the skip-cancel rule both read `order.state`. Book 1.000/1.004,
+    leader 1.0130: a bid is posted at 1.003 and the demo book cancels it on arrival, then a
+    late `live` row follows. Book 1.004/1.006: the paper side reprices to 1.005, folded into
+    an amend. With the order revived, that amend went to an order that no longer exists and,
+    refused, fell back to a cancel of it and a post: four requests against the post limit
+    instead of two. Kept canceled: no amend, no cancel, one post at 1.005."""
+    import asyncio
+
+    class _Refusing(_Broker):
+        def amend(self, **kw):
+            self.calls.append(("amend", kw))
+            return {"code": "1", "msg": "refused (test)", "data": {"code": "1", "msg": "refused (test)"}}
+
+    broker = _Refusing()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker)
+    runner.quoter.on_book(0, 1.000, 1.004)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 1.0130))
+        await runner.drain_mirror()
+        row = {"clientOrderId": broker.calls[0][1]["client_order_id"], "orderId": "o1", "filledSize": "0"}
+        await runner.on_demo_row(dict(row, state="canceled"))
+        await runner.on_demo_row(dict(row, state="live"))
+        await runner.handle(runner.quoter.on_book(100, 1.004, 1.006))
+        await runner.drain_mirror()
+    asyncio.run(go())
+    log.close()
+    assert [(c[0], c[1].get("price")) for c in broker.calls] == [("limit", "1.003"), ("limit", "1.005")]
+
+
+def test_an_accepted_cancel_is_terminal_before_the_stream_says_so_but_a_later_fill_still_lands(tmp_path):
+    """Two orderings. (1) The cancel is acknowledged and a late `live` row arrives before any
+    `canceled` row: the order is gone, so shutdown must not cancel it again. (2) UNI-USDT,
+    2026-09-13 22:08 UTC, cid lqb51783dfb7ca: the cancel was acknowledged ok and 27 ms later
+    the stream reported the ask filled, 0.1 contracts, and the short was real. A terminal rule
+    that swallowed that fill would lose it from demo_net and never close it. Ask side, book
+    1.000/1.003: leader 0.9990 posts 1.001, leader 1.0015 cancels it, twice. The second
+    entry's fill (-0.1) is closed by a reduce-only buy of 0.1; that close's own fill brings
+    demo_net back to 0, and shutdown then sends nothing."""
+    import asyncio
+    from decimal import Decimal
+    broker = _Broker()
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("UNI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker, on_log=lambda s: None)
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 0.9990))
+        await runner.drain_mirror()
+        await runner.handle(runner.quoter.on_leader(1400, 1.0015))
+        await runner.drain_mirror()
+        first = broker.calls[0][1]["client_order_id"]
+        await runner.on_demo_row({"clientOrderId": first, "orderId": "o1", "state": "live", "filledSize": "0"})
+        await runner.handle(runner.quoter.on_leader(1500, 0.9990))
+        await runner.drain_mirror()
+        await runner.handle(runner.quoter.on_leader(1600, 1.0015))
+        await runner.drain_mirror()
+        second = broker.calls[2][1]["client_order_id"]
+        await runner.on_demo_row({"clientOrderId": second, "orderId": "o3", "state": "filled", "filledSize": "0.1"})
+        assert runner.demo_net == Decimal("-0.1")
+        close = broker.calls[4][1]
+        await runner.on_demo_row({"clientOrderId": close["client_order_id"], "orderId": "o5",
+                                  "state": "filled", "filledSize": "0.1"})
+        await runner.shutdown_demo()
+        return first, second
+    first, second = asyncio.run(go())
+    log.close()
+    assert (runner.demo_orders[first].state, runner.demo_orders[second].state) == ("canceled", "filled")
+    assert [c[0] for c in broker.calls] == ["limit", "cancel", "limit", "cancel", "market"]
+    assert (broker.calls[4][1]["side"], broker.calls[4][1]["size"], broker.calls[4][1]["reduce_only"]) == (
+        "buy", Decimal("0.1"), True)
+    assert runner.demo_net == Decimal("0")
+
+
+class _ApiError(Exception):
+    """The SDK's `BlofinAPIException` as the requests transport raises a refused call."""
+
+    def __init__(self, message, code=None, status_code=None):
+        super().__init__(message)
+        self.code, self.status_code = code, status_code
+
+
+class _RateLimited(_Broker):
+    """Refuses the first `refusals[kind]` calls of each kind with 429, as the demo host did
+    at ~4 posts a second across nine processes on one key. `raise_cancel` refuses cancels the
+    way the requests transport does: an exception carrying the code."""
+
+    def __init__(self, raise_cancel=False, **refusals):
+        super().__init__()
+        self.refusals, self.raise_cancel = dict(refusals), raise_cancel
+
+    def _refused(self, kind, kw):
+        if self.refusals.get(kind, 0) <= 0:
+            return False
+        self.refusals[kind] -= 1
+        self.calls.append((kind, kw))
+        return True
+
+    def place_limit(self, **kw):
+        if self._refused("limit", kw):
+            return {"code": "429", "msg": "rate limit exceeded"}
+        return _Broker.place_limit(self, **kw)
+
+    def place_market(self, **kw):
+        if self._refused("market", kw):
+            return {"code": "429", "msg": "rate limit exceeded"}
+        return _Broker.place_market(self, **kw)
+
+    def cancel(self, **kw):
+        if self._refused("cancel", kw):
+            if self.raise_cancel:
+                raise _ApiError("API request failed: rate limit exceeded", code="429", status_code=200)
+            return {"code": "429", "msg": "rate limit exceeded"}
+        return _Broker.cancel(self, **kw)
+
+
+def _acks(path, kind):
+    return [(r["ok"], r.get("code"), r.get("retry_in_ms"), r.get("attempt"))
+            for r in _demo_rows(path) if r["event"] == "demo_ack" and r["kind"] == kind]
+
+
+def test_a_flatten_refused_429_is_sent_again_and_closes_the_orphan(tmp_path):
+    """UNI-USDT, Tokyo, 2026-09-13 22:08 UTC, cid lq4874c03e39b6: an ask filled after the
+    paper cancel, the reduce-only market buy that should have closed it came back 429 "rate
+    limit exceeded", nothing sent it again, and a 0.1 contract short stayed open. Replayed
+    with the first flatten refused: the same order goes again, same clientOrderId (the
+    refused one does not exist), one demo_ack row per attempt, and its fill takes demo_net
+    from -0.1 back to 0. The report counts one retry and no rejection."""
+    import asyncio
+    from decimal import Decimal
+    broker = _RateLimited(market=1)
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("UNI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker,
+                             on_log=lambda s: None, retry_429_s=(0, 0, 0))
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 0.9990))
+        await runner.drain_mirror()
+        await runner.handle(runner.quoter.on_leader(1400, 1.0015))
+        await runner.drain_mirror()
+        entry = broker.calls[0][1]["client_order_id"]
+        await runner.on_demo_row({"clientOrderId": entry, "orderId": "o1", "state": "filled", "filledSize": "0.1"})
+        await runner.on_demo_row({"clientOrderId": broker.calls[3][1]["client_order_id"], "orderId": "o4",
+                                  "state": "filled", "filledSize": "0.1"})
+    asyncio.run(go())
+    log.close()
+    assert [c[0] for c in broker.calls] == ["limit", "cancel", "market", "market"]
+    assert broker.calls[2][1] == broker.calls[3][1]
+    assert (broker.calls[3][1]["side"], broker.calls[3][1]["size"], broker.calls[3][1]["reduce_only"]) == (
+        "buy", Decimal("0.1"), True)
+    assert _acks(tmp_path / "run.jsonl", "flatten") == [(False, "429", 0, None), (True, "0", None, 2)]
+    assert runner.demo_net == Decimal("0")
+    report = summarise(tmp_path / "run.jsonl")
+    assert report.demo_retried == 1
+    assert report.problems == ["1 demo entries filled after the paper side cancelled (closed reduce-only)"]
+    assert "  demo rate limit: 1 closes/cancels refused 429 and sent again" in report.lines()
+
+
+def test_cancel_and_exit_cross_are_retried_on_429_and_an_entry_post_is_not(tmp_path):
+    """A late entry is stale: the gap it was priced on is gone by the time a slot frees up,
+    so a refused post is logged and dropped. A cancel and a crossing exit take risk off and go
+    again. hold_ms 0 makes the paper fill cross out in the same decision (hold limit), so the
+    exit is an exit_cross with no exit_post before it. Book 1.000/1.003, leader 1.0030 posts
+    1.002 and 1.0015 cancels it: post refused (nothing to cancel after); post accepted, its
+    cancel refused - raised, the requests transport's shape - and accepted; post accepted,
+    the demo book fills it, the tape sells at 1.002, exit_cross refused and accepted."""
+    import asyncio
+    from decimal import Decimal
+    broker = _RateLimited(raise_cancel=True, limit=1, cancel=1, market=1)
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("SUI-USDT", QuoteConfig(tick=TICK, hold_ms=0), log=log, broker=broker,
+                             on_log=lambda s: None, retry_429_s=(0, 0, 0))
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        for t, leader in ((1, 1.0030), (1400, 1.0015), (1500, 1.0030), (1600, 1.0015), (1700, 1.0030)):
+            await runner.handle(runner.quoter.on_leader(t, leader))
+            await runner.drain_mirror()
+        assert [c[0] for c in broker.calls] == ["limit", "limit", "cancel", "cancel", "limit"]
+        await runner.on_demo_row({"clientOrderId": broker.calls[4][1]["client_order_id"], "orderId": "o5",
+                                  "state": "filled", "filledSize": "1"})
+        intents = runner.quoter.on_trade(2000, 1.002, "sell")
+        assert kinds(intents) == [("exit_cross", 1)]
+        await runner.handle(intents)
+        await runner.drain_mirror()
+    asyncio.run(go())
+    log.close()
+    assert [c[0] for c in broker.calls] == ["limit", "limit", "cancel", "cancel", "limit", "market", "market"]
+    assert broker.calls[2][1] == broker.calls[3][1] and broker.calls[3][1]["order_id"] == "o2"
+    assert broker.calls[5][1] == broker.calls[6][1] and broker.calls[6][1]["reduce_only"] is True
+    path = tmp_path / "run.jsonl"
+    assert _acks(path, "post") == [(False, "429", None, None), (True, "0", None, None), (True, "0", None, None)]
+    assert _acks(path, "cancel") == [(False, None, 0, None), (True, "0", None, 2)]
+    assert _acks(path, "exit_cross") == [(False, "429", 0, None), (True, "0", None, 2)]
+    assert runner.demo_net == Decimal("1")          # the exit's fill notice has not arrived
+    report = summarise(path)
+    assert report.demo_retried == 2
+    assert report.problems == ["1 demo orders rejected, first: post code 429 rate limit exceeded"]
+
+
+def test_a_close_refused_on_every_attempt_waits_250_500_1000_ms_and_is_left_to_shutdown(tmp_path, monkeypatch):
+    """Bounded: at the defaults a close is tried four times with 0.25, 0.5 and 1.0 s between,
+    1.75 s in all. If all four come back 429 the orphan stays open, but demo_net - which only
+    fill rows move - still holds it, and the entry's filled_size was zeroed before the first
+    attempt so a duplicate fill row cannot start a second close. Shutdown then closes it
+    (its 5th market call is accepted), and the last refusal is reported as a rejection."""
+    import asyncio
+    from decimal import Decimal
+    from trading.strategies.lead_quote import execute
+
+    waits, duplicate = [], {}
+
+    async def no_wait(seconds):
+        waits.append(seconds)
+        if len(waits) == 1:                             # the stream repeats the fill during the backoff
+            await runner.on_demo_row(duplicate)
+
+    monkeypatch.setattr(execute.asyncio, "sleep", no_wait)
+    broker = _RateLimited(market=4)
+    broker.positions = lambda: [{"instId": "UNI-USDT", "positions": "-0.1"}]
+    log = RunLog(tmp_path / "run.jsonl")
+    runner = LeadQuoteRunner("UNI-USDT", QuoteConfig(tick=TICK), log=log, broker=broker, on_log=lambda s: None)
+    runner.quoting = True
+    runner.quoter.on_book(0, 1.000, 1.003)
+
+    async def go():
+        await runner.handle(runner.quoter.on_leader(1, 0.9990))
+        await runner.drain_mirror()
+        await runner.handle(runner.quoter.on_leader(1400, 1.0015))
+        await runner.drain_mirror()
+        duplicate.update(clientOrderId=broker.calls[0][1]["client_order_id"], orderId="o1",
+                         state="filled", filledSize="0.1")
+        await runner.on_demo_row(dict(duplicate))
+        assert [c[0] for c in broker.calls] == ["limit", "cancel", "market", "market", "market", "market"]
+        assert runner.demo_net == Decimal("-0.1") and waits == [0.25, 0.5, 1.0]
+        await runner.shutdown_demo()
+    asyncio.run(go())
+    log.close()
+    assert [c[0] for c in broker.calls] == ["limit", "cancel"] + ["market"] * 5
+    assert (broker.calls[6][1]["side"], broker.calls[6][1]["size"]) == ("buy", Decimal("0.1"))
+    assert _acks(tmp_path / "run.jsonl", "flatten") == [
+        (False, "429", 250, None), (False, "429", 500, 2), (False, "429", 1000, 3), (False, "429", None, 4),
+        (True, "0", None, None)]
+    report = summarise(tmp_path / "run.jsonl")
+    assert report.demo_retried == 3
+    assert report.problems[0] == "1 demo orders rejected, first: flatten code 429 rate limit exceeded"

@@ -3675,6 +3675,65 @@ un_carry_xs.py --flatten --confirm
    account had no positions and no resting orders after the restart, where
    at ~22:05 it held 7 positions.
 
+   **Both fixed in code (2026-09-14); the running processes do not have
+   it.** Stale rows first. By 02:15 UTC six demo orders had a `live` row
+   39 to 1,075 ms after their `canceled` one: FIL 2 and SUI 1 in the runs
+   stopped at 22:53-22:55, SUI 1 in the first eight-hour run, and LINK 1
+   and SUI 1 in runs still going. Every late row printed `averagePrice` as
+   "0" where prompt rows print "0.000000000000000000", which looks like a
+   second, slower publisher (not verified). Those rows caused four refused
+   shutdown cancels, not three: the first SUI run's 10:10 shutdown had one
+   too. A row's state is now applied only if it does not step back:
+   nothing leaves `filled`, and only `filled` leaves `canceled`. An
+   accepted cancel counts as `canceled` before the stream says so. A late
+   row is still logged as received, with `stale` and the `kept` state.
+   `filled` has to land after a cancel ack. At 22:08:27 UNI's cancel of
+   lqb51783dfb7ca was acknowledged ok, the stream reported the fill 27 ms
+   later, and that fill was the short that stayed open.
+
+   Then the 429. On 2026-09-13 the limit refused 62 entry posts, one close
+   and no cancel. A flatten, an `exit_cross` or a cancel refused 429 is now
+   sent again after 0.25, 0.5 and 1.0 s: four attempts over 1.75 s, with
+   the same clientOrderId, since the refused order does not exist. Each
+   attempt is its own `demo_ack` row. A refused attempt that will be sent
+   again carries `retry_in_ms`, and later attempts carry `attempt`. Entry
+   posts are not retried: a slot that frees up in 250 ms comes after the
+   gap the post was priced on has closed. The backoff is awaited in place,
+   so the mirror queue (or the order stream, for an orphan flatten a fill
+   row started) waits up to 1.75 s behind it. An orphan's filled size is
+   now zeroed before the send, so a duplicate fill row that arrives during
+   the backoff cannot start a second close. A close refused on all four
+   attempts stays in `demo_net`, which only fill rows move, so shutdown
+   closes it with its own retries. The summary counts retried refusals on
+   their own line, and only a final refusal is a rejection. The board says
+   nothing about retried ones.
+
+   Six tests replay the logged orderings: the FIL sequence through
+   shutdown, a late `live` after a cancel-on-arrival followed by a reprice
+   (no amend, no cancel, one post), the ack-then-`live` and ack-then-fill
+   orderings, the UNI flatten refused once, cancel and `exit_cross` retried
+   but a post not, and a close refused four times. All six fail on the old
+   `execute.py`. Four single mutations are each caught by the test meant
+   for them: dropping the ack rule, keeping `filled` from leaving
+   `canceled`, zeroing the orphan's size after the send, and retrying
+   posts.
+
+   Found while tracing `exit_cross`, not fixed here: a crossing exit is
+   never mirrored once a maker exit has been. `exit_post` clears the
+   runner's entry slot, so the `exit_cross` that follows finds none and
+   logs "demo entry not filled", even when the demo entry did fill. Of 101
+   such skips in the logs, one had a filled demo entry: FIL at 22:06:22,
+   where the resting demo exit happened to fill 3.8 s later. So the
+   `exit_cross` retry covers a path that almost never sends today.
+
+   Not restarted. At 02:15 UTC the Tokyo box ran 12 lead-quote processes:
+   the nine `--confirm` pairs plus FLOCK, UAI and IOST paper, every log
+   written that second. USELESS's paper run ended on its own `stop` row at
+   02:03:30, not through this change. Each process keeps the old code until
+   its next start. Until then, the LINK and SUI orders above will each draw
+   one refused cancel at shutdown, and a 429 on a close is still not
+   retried.
+
 10. **Regime detection** — replace the percentile-based `vol_regime`
    placeholder with a fitted model.
 11. **Execution engine** — adaptive limit orders, wired to the risk engine's

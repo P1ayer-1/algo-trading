@@ -31,6 +31,30 @@ nine processes on one key hit the demo host's post limit (~4 accepted a
 second) in a market-wide move; a reprice was 10% of posts, so this trims the
 request count rather than solving the limit.
 
+On 2026-09-13 that limit refused 62 entry posts and one close (no cancel),
+and the close was the one that mattered: UNI's orphan flatten came back 429
+at 22:08 UTC and a 0.1 contract short stayed open. So a call that takes risk
+OFF - flatten, exit_cross, cancel - is sent again after each of
+`retry_429_s` while the venue answers 429, with the same clientOrderId (a
+refused order does not exist). An entry post is not: by the time a slot
+frees up, the gap it was priced on is gone. The backoff is awaited where the
+call was made, so whatever is queued behind it waits too - the mirror
+worker's intents, or the order stream for a flatten a fill row started - at
+most 1.75 s at the defaults.
+
+The order stream is not in order. By 2026-09-14 02:15 UTC six demo orders
+had got a `live` row 39 to 1,075 ms after their `canceled` one (FIL
+lqf954433497e4 and lqdbc7b1b50ee8, SUI lq8c56af4cec38 among them). Every
+such late row wrote `averagePrice` as "0" where prompt rows write
+"0.000000000000000000", so a second, slower publisher is likely (not
+verified). Taken at its word the row revived the order, and three runs'
+shutdowns sent four cancels the venue refused 102068. A row's state is now
+applied only if it is not a step back (`DemoOrder.apply_state`), and an
+accepted cancel counts as `canceled` before the stream says so - except
+that `filled` still lands after either: at 22:08 UNI's cancel was
+acknowledged 27 ms before the stream reported that order filled, and the
+fill was real.
+
 Latency is the point. Every leader message carries Binance's event time and
 every follower message BloFin's `ts`; receive time minus those, sampled once
 a second, is the lag `plan_quote` gates on. The first `warmup_seconds` only
@@ -49,16 +73,36 @@ import time
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from .plan import QuotePlan, plan_quote
 from .quoter import Intent, QuoteConfig, Quoter
 
 BINANCE_WS = "wss://fstream.binance.com/ws/"
+TERMINAL_STATES = ("canceled", "filled")
+RETRY_ON_429 = ("flatten", "exit_cross", "cancel")      # calls that take risk off; never an entry post
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _is_429(response_or_exc: Any) -> bool:
+    """The venue's rate-limit refusal, in each shape it arrives.
+
+    Observed (2026-09-13, aiohttp transport): HTTP 200 with `{"code": "429",
+    "msg": "rate limit exceeded"}`. The requests transport raises that as a
+    `BlofinAPIException` with `code="429"`; an HTTP 429 status raises one with
+    `status_code=429` on either. The last two are read off the SDK, not seen.
+    """
+    if isinstance(response_or_exc, BaseException):
+        return "429" in (str(getattr(response_or_exc, "code", "")),
+                         str(getattr(response_or_exc, "status_code", "")))
+    if not isinstance(response_or_exc, dict):
+        return False
+    rows = response_or_exc.get("data")
+    row = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else {})
+    return "429" in (str(response_or_exc.get("code", "")), str((row or {}).get("code", "")))
 
 
 class Broker(Protocol):
@@ -158,6 +202,19 @@ class DemoOrder:
     filled_size: Decimal = Decimal("0")
     price: str = ""                         # as sent to the venue, on its tick
 
+    def apply_state(self, state: str) -> bool:
+        """Take a reported state unless it steps back; False when it was stale and ignored.
+
+        Nothing leaves `filled`, and only `filled` leaves `canceled`: a live
+        or partially_filled row after either is a late echo (see the module
+        docstring), while a fill after a cancel ack is money that moved.
+        """
+        if (self.state == "filled" and state != "filled") or (
+                self.state == "canceled" and state not in TERMINAL_STATES):
+            return False
+        self.state = state
+        return True
+
 
 @dataclass
 class LeadQuoteRunner:
@@ -181,6 +238,7 @@ class LeadQuoteRunner:
     quoting: bool = False
     demo_net: Decimal = Decimal("0")        # contracts this run's demo fills have left open, signed
     warm_every_s: float = 15.0              # keep the REST connection open between orders
+    retry_429_s: Tuple[float, ...] = (0.25, 0.5, 1.0)   # waits before each resend of a RETRY_ON_429 call
     _mirror_queue: "asyncio.Queue[Intent]" = field(init=False, repr=False)
     _wake_handle: Any = field(default=None, repr=False)
     _wake_at: Optional[int] = None
@@ -354,12 +412,16 @@ class LeadQuoteRunner:
         paper order timed out with no tape fill. The first Tokyo run (2026-09-13)
         made one and held it for the rest of the run; now it is closed
         reduce-only the moment the fill is known, and the log says so.
+
+        A row that would step the order back from `canceled` or `filled` is
+        logged as received, marked `stale`, and changes nothing.
         """
         cid = str(row.get("clientOrderId") or "")
         order = self.demo_orders.get(cid)
         if order is None:
             return
-        order.state = str(row.get("state") or "")
+        reported = str(row.get("state") or "")
+        applied = order.apply_state(reported)
         order.order_id = str(row.get("orderId") or order.order_id)
         if order.state == "filled" and not order.filled:
             order.filled = True
@@ -370,9 +432,12 @@ class LeadQuoteRunner:
             order.filled_size = filled
             sign = order.side if order.kind == "post" else -order.side
             self.demo_net += sign * filled
+        extra = {} if applied else {"stale": True, "kept": order.state}
         self.log.write(event="demo_order", cid=cid, kind=order.kind, side=order.side,
-                       state=order.state, filled_size=row.get("filledSize"),
-                       avg_price=row.get("averagePrice"), fee=row.get("fee"))
+                       state=reported, filled_size=row.get("filledSize"),
+                       avg_price=row.get("averagePrice"), fee=row.get("fee"), **extra)
+        if not applied:
+            return
         if (order.state == "filled" and order.kind == "post"
                 and self.entry_order.get(order.side) is not order):
             await self.flatten_orphan(order, "filled after the paper side cancelled")
@@ -381,17 +446,21 @@ class LeadQuoteRunner:
         """Close one demo entry the paper quoter is no longer holding, reduce-only."""
         if entry.filled_size <= 0:
             return
+        # Taken before the send, which can now wait out a 429 backoff: a duplicate
+        # fill row arriving meanwhile must find nothing left to close.
+        size, entry.filled_size = entry.filled_size, Decimal("0")
         cid = "lq" + secrets.token_hex(6)
         order = DemoOrder(cid, "flatten", entry.side)
         self.demo_orders[cid] = order
         self.log.write(event="demo_orphan", cid=entry.cid, side=entry.side,
-                       contracts=str(entry.filled_size), reason=reason)
+                       contracts=str(size), reason=reason)
         self.on_log("demo entry {} {}: {}; closing reduce_only".format(
             "bid" if entry.side == 1 else "ask", entry.cid, reason))
+        # Refused even after the retries: `demo_net` still holds these contracts
+        # (it moves only on fill rows), so shutdown closes them.
         await self._send("flatten", order, lambda: self.broker.place_market(
-            inst_id=self.inst_id, side="sell" if entry.side == 1 else "buy", size=entry.filled_size,
+            inst_id=self.inst_id, side="sell" if entry.side == 1 else "buy", size=size,
             client_order_id=cid, reduce_only=True))
-        entry.filled_size = Decimal("0")
 
     async def handle(self, intents: List[Intent]) -> None:
         """Log intents, queue them for the demo mirror, and book paper fills.
@@ -518,7 +587,7 @@ class LeadQuoteRunner:
         elif intent.kind == "amend":
             order = self.entry_order.get(side)
             price = self._fmt(intent.price, buy=side == 1)
-            if order is not None and order.order_id and not order.filled and order.state not in ("canceled", "filled"):
+            if order is not None and order.order_id and not order.filled and order.state not in TERMINAL_STATES:
                 if order.price == price:
                     self.log.write(event="demo_skip", kind="amend", side=side,
                                    reason="reprice lands on the demo price the order already rests at")
@@ -535,7 +604,7 @@ class LeadQuoteRunner:
             self.entry_order[side] = None
             if order is not None and order.filled:
                 await self.flatten_orphan(order, "demo book filled what the tape did not")
-            elif order is not None and order.order_id and order.state != "canceled":
+            elif order is not None and order.order_id and order.state not in TERMINAL_STATES:
                 # A post_only the venue already cancelled on arrival needs no cancel (it
                 # would only come back 102068 and spend a request against the limit).
                 await self._send("cancel", order, lambda: self.broker.cancel(
@@ -546,7 +615,7 @@ class LeadQuoteRunner:
             if entry is None or not entry.filled:
                 # The tape filled the paper order; the demo book did not fill
                 # the real one. Nothing to exit on demo, and the entry must go.
-                if entry is not None and entry.order_id and entry.state not in ("canceled", "filled"):
+                if entry is not None and entry.order_id and entry.state not in TERMINAL_STATES:
                     await self._send("cancel", entry, lambda: self.broker.cancel(
                         inst_id=self.inst_id, order_id=entry.order_id))
                 self.log.write(event="demo_skip", kind=intent.kind, side=side,
@@ -567,32 +636,62 @@ class LeadQuoteRunner:
                     client_order_id=cid, reduce_only=True))
 
     async def _send(self, kind: str, order: DemoOrder, call: Callable[[], Dict[str, Any]]) -> bool:
-        """Send, time and log one order call; True when the venue accepted it."""
-        started = now_ms()
-        try:
-            response = await self._call(call)
-        except Exception as exc:                            # noqa: BLE001
-            self.log.write(event="demo_ack", kind=kind, cid=order.cid, ok=False, msg=str(exc),
-                           rtt_ms=now_ms() - started)
-            self.on_log("demo {} failed: {}".format(kind, exc))
-            return False
-        rtt = now_ms() - started
-        rows = response.get("data") if isinstance(response, dict) else None
-        row = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else {})
-        top_code = str(response.get("code", "0")) if isinstance(response, dict) else "0"
-        code = str((row or {}).get("code") or top_code)
-        ok = code in ("0", "") and top_code in ("0", "")
-        # A rejection's text may sit on the row or on the envelope; keep whichever speaks.
-        msg = str((row or {}).get("msg") or (response.get("msg", "") if isinstance(response, dict) else ""))
-        # probe_post was missing here until 2026-09-12: a probe then cancelled only
-        # when the WS order stream beat the REST ack, so the probe mostly timed posts.
-        if kind in ("post", "probe_post", "exit_post", "exit_cross", "flatten") and ok:
-            order.order_id = str((row or {}).get("orderId") or "")
-        self.log.write(event="demo_ack", kind=kind, cid=order.cid, order_id=order.order_id,
-                       ok=ok, code=code, msg=msg, rtt_ms=rtt)
-        if not ok:
-            self.on_log("demo {} rejected: code {} {}".format(kind, code, msg))
-        return ok
+        """Send, time and log one order call; True when the venue accepted it.
+
+        A RETRY_ON_429 call refused 429 is sent again after each wait in
+        `retry_429_s`. Every attempt is its own `demo_ack` row; one that will be
+        retried carries `retry_in_ms`, and attempts after the first carry
+        `attempt`. A cancel is not resent if the stream reported the order
+        cancelled or filled while it waited.
+        """
+        delays = self.retry_429_s if kind in RETRY_ON_429 else ()
+        attempt = 0
+        while True:
+            attempt += 1
+            extra: Dict[str, Any] = {} if attempt == 1 else {"attempt": attempt}
+            wait = delays[attempt - 1] if attempt <= len(delays) else None
+            started = now_ms()
+            try:
+                response = await self._call(call)
+            except Exception as exc:                        # noqa: BLE001
+                retry = wait is not None and _is_429(exc)
+                if retry:
+                    extra["retry_in_ms"] = int(wait * 1000)
+                self.log.write(event="demo_ack", kind=kind, cid=order.cid, ok=False, msg=str(exc),
+                               rtt_ms=now_ms() - started, **extra)
+                self.on_log("demo {} failed{}: {}".format(kind, ", retrying" if retry else "", exc))
+                if not retry:
+                    return False
+            else:
+                rtt = now_ms() - started
+                rows = response.get("data") if isinstance(response, dict) else None
+                row = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else {})
+                top_code = str(response.get("code", "0")) if isinstance(response, dict) else "0"
+                code = str((row or {}).get("code") or top_code)
+                ok = code in ("0", "") and top_code in ("0", "")
+                # A rejection's text may sit on the row or on the envelope; keep whichever speaks.
+                msg = str((row or {}).get("msg") or (response.get("msg", "") if isinstance(response, dict) else ""))
+                # probe_post was missing here until 2026-09-12: a probe then cancelled only
+                # when the WS order stream beat the REST ack, so the probe mostly timed posts.
+                if kind in ("post", "probe_post", "exit_post", "exit_cross", "flatten") and ok:
+                    order.order_id = str((row or {}).get("orderId") or "")
+                if kind == "cancel" and ok:
+                    order.apply_state("canceled")       # a fill reported after this still lands
+                retry = not ok and wait is not None and _is_429(response)
+                if retry:
+                    extra["retry_in_ms"] = int(wait * 1000)
+                self.log.write(event="demo_ack", kind=kind, cid=order.cid, order_id=order.order_id,
+                               ok=ok, code=code, msg=msg, rtt_ms=rtt, **extra)
+                if not ok:
+                    self.on_log("demo {} rejected{}: code {} {}".format(
+                        kind, ", retrying" if retry else "", code, msg))
+                if not retry:
+                    return ok
+            await asyncio.sleep(wait)
+            if kind == "cancel" and order.state in TERMINAL_STATES:
+                self.log.write(event="demo_skip", kind="cancel", side=order.side, cid=order.cid,
+                               reason="order {} while the cancel waited out a 429".format(order.state))
+                return False
 
     async def _call(self, call: Callable[[], Any]) -> Any:
         """An async broker's call is awaited on the loop; a blocking one runs in a thread."""
@@ -695,7 +794,7 @@ class LeadQuoteRunner:
         is reported and left alone.
         """
         for order in list(self.demo_orders.values()):
-            if order.order_id and order.state not in ("filled", "canceled"):
+            if order.order_id and order.state not in TERMINAL_STATES:
                 await self._send("cancel", order, lambda o=order: self.broker.cancel(
                     inst_id=self.inst_id, order_id=o.order_id))
         try:

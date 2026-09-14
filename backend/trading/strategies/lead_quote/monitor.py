@@ -54,6 +54,7 @@ class MonitorReport:
     trade_blocked: Optional[int] = None
     demo_amends: int = 0
     amend_skips: int = 0                  # reprices that rounded to the demo price already resting
+    demo_retried: int = 0                 # attempts refused 429 and sent again (runs from 2026-09-14)
     problems: List[str] = field(default_factory=list)
     path: str = ""
     started_ms: Optional[int] = None      # from the file name, which the runner stamps at start
@@ -102,6 +103,8 @@ class MonitorReport:
         if self.demo_amends or self.amend_skips:
             out.append("  demo reprices: {} amended in place, {} left resting (same demo price)".format(
                 self.demo_amends, self.amend_skips))
+        if self.demo_retried:
+            out.append("  demo rate limit: {} closes/cancels refused 429 and sent again".format(self.demo_retried))
         for problem in self.problems:
             out.append("  PROBLEM: " + problem)
         return out
@@ -209,7 +212,10 @@ def summarise(path: Path) -> MonitorReport:
     crossed = {e.get("cid") for e in events if e.get("event") == "demo_order" and e.get("kind") == "post"
                and e.get("state") == "canceled" and e.get("cid") not in cancelled_ok}
     report.demo_crossed = len(crossed)
+    # A refusal the runner sent again is not the outcome; the attempt after it is.
+    report.demo_retried = sum(1 for e in events if e.get("event") == "demo_ack" and "retry_in_ms" in e)
     rejected = [e for e in events if e.get("event") == "demo_ack" and not e.get("ok", True)
+                and "retry_in_ms" not in e
                 and not (e.get("kind") == "cancel" and e.get("cid") in crossed)]
     if rejected:
         first = rejected[0]
@@ -465,7 +471,9 @@ class Narrator:
                     "entry" if row.get("kind") == "post" else row.get("kind"), row.get("filled_size"),
                     _price(row.get("avg_price")), _price(row.get("fee"))))
         elif event == "demo_ack" and not row.get("ok", True):
-            if row.get("kind") == "cancel" and str(row.get("cid")) in run.crossed:
+            if "retry_in_ms" in row:
+                pass            # refused 429 and sent again: the next attempt's row is the outcome
+            elif row.get("kind") == "cancel" and str(row.get("cid")) in run.crossed:
                 pass            # the venue already cancelled a post_only that would cross the demo book
             else:
                 key = (str(row.get("kind")), str(row.get("code")))
